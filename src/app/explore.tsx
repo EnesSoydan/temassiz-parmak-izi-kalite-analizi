@@ -1,27 +1,62 @@
 import { Image } from 'expo-image';
-import { SymbolView } from 'expo-symbols';
-import { Platform, Pressable, ScrollView, StyleSheet } from 'react-native';
+import { useFocusEffect } from 'expo-router';
+import { useCallback, useState } from 'react';
+import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { ExternalLink } from '@/components/external-link';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Collapsible } from '@/components/ui/collapsible';
 import { WebBadge } from '@/components/web-badge';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { deleteCaptureSample, loadCaptureSamples } from '@/lib/capture-storage';
+import { formatQualityStatus } from '@/lib/quality';
 import { useTheme } from '@/hooks/use-theme';
+import type { CaptureSample } from '@/types/biometrics';
 
-export default function TabTwoScreen() {
+export default function RecordsScreen() {
+  const [samples, setSamples] = useState<CaptureSample[]>([]);
+  const [feedback, setFeedback] = useState('Kayıtlar yükleniyor...');
   const safeAreaInsets = useSafeAreaInsets();
+  const theme = useTheme();
   const insets = {
     ...safeAreaInsets,
     bottom: safeAreaInsets.bottom + BottomTabInset + Spacing.three,
   };
-  const theme = useTheme();
+
+  const loadSamples = useCallback(() => {
+    loadCaptureSamples()
+      .then((storedSamples) => {
+        setSamples(storedSamples);
+        setFeedback(
+          storedSamples.length === 0
+            ? 'Henüz kayıt yok. Ana ekrandan kare yakalayabilirsin.'
+            : `${storedSamples.length} kayıt cihaz içinde saklanıyor.`
+        );
+      })
+      .catch(() => {
+        setFeedback('Kayıtlar okunamadı.');
+      });
+  }, []);
+
+  useFocusEffect(loadSamples);
+
+  async function handleDelete(sampleId: string) {
+    try {
+      const nextSamples = await deleteCaptureSample(sampleId);
+      setSamples(nextSamples);
+      setFeedback(
+        nextSamples.length === 0
+          ? 'Kayıt silindi. Henüz kayıt yok.'
+          : `Kayıt silindi. ${nextSamples.length} kayıt kaldı.`
+      );
+    } catch {
+      setFeedback('Kayıt silinemedi.');
+    }
+  }
 
   const contentPlatformStyle = Platform.select({
     android: {
-      paddingTop: insets.top,
+      paddingTop: insets.top + Spacing.four,
       paddingLeft: insets.left,
       paddingRight: insets.right,
       paddingBottom: insets.bottom,
@@ -38,90 +73,66 @@ export default function TabTwoScreen() {
       contentInset={insets}
       contentContainerStyle={[styles.contentContainer, contentPlatformStyle]}>
       <ThemedView style={styles.container}>
-        <ThemedView style={styles.titleContainer}>
-          <ThemedText type="subtitle">Explore</ThemedText>
-          <ThemedText style={styles.centerText} themeColor="textSecondary">
-            This starter app includes example{'\n'}code to help you get started.
+        <ThemedView style={styles.header}>
+          <ThemedText type="code" style={styles.eyebrow}>
+            yerel capture arşivi
           </ThemedText>
+          <ThemedText type="subtitle">Kayıtlar</ThemedText>
+          <ThemedText themeColor="textSecondary">{feedback}</ThemedText>
+        </ThemedView>
 
-          <ExternalLink href="https://docs.expo.dev" asChild>
-            <Pressable style={({ pressed }) => pressed && styles.pressed}>
-              <ThemedView type="backgroundElement" style={styles.linkButton}>
-                <ThemedText type="link">Expo documentation</ThemedText>
-                <SymbolView
-                  tintColor={theme.text}
-                  name={{ ios: 'arrow.up.right.square', android: 'link', web: 'link' }}
-                  size={12}
+        <View style={styles.list}>
+          {samples.map((sample) => (
+            <ThemedView key={sample.id} type="backgroundElement" style={styles.card}>
+              <View style={styles.imageGrid}>
+                <View style={styles.imageColumn}>
+                  <ThemedText type="smallBold">Ham görüntü</ThemedText>
+                  <Image source={{ uri: sample.rawImageUri }} style={styles.rawImage} contentFit="cover" />
+                </View>
+                <View style={styles.imageColumn}>
+                  <ThemedText type="smallBold">ROI</ThemedText>
+                  <Image source={{ uri: sample.roiImageUri }} style={styles.roiImage} contentFit="contain" />
+                </View>
+              </View>
+
+              <View style={styles.metaGrid}>
+                <Metric label="Tarih" value={new Date(sample.createdAt).toLocaleString('tr-TR')} />
+                <Metric label="Cihaz" value={sample.deviceModel ?? 'Bilinmeyen cihaz'} />
+                <Metric label="Netlik" value={`${sample.qualityMetrics?.blurScore ?? 0}/100`} />
+                <Metric
+                  label="Parlama"
+                  value={`%${Math.round((sample.qualityMetrics?.glareRatio ?? 0) * 100)}`}
                 />
-              </ThemedView>
-            </Pressable>
-          </ExternalLink>
-        </ThemedView>
+                <Metric label="Işık" value={`${sample.qualityMetrics?.brightnessMean ?? 0}/255`} />
+                <Metric
+                  label="Kalite"
+                  value={sample.qualityMetrics ? formatQualityStatus(sample.qualityMetrics.status) : 'ölçülmedi'}
+                />
+              </View>
 
-        <ThemedView style={styles.sectionsWrapper}>
-          <Collapsible title="File-based routing">
-            <ThemedText type="small">
-              This app has two screens: <ThemedText type="code">src/app/index.tsx</ThemedText> and{' '}
-              <ThemedText type="code">src/app/explore.tsx</ThemedText>
-            </ThemedText>
-            <ThemedText type="small">
-              The layout file in <ThemedText type="code">src/app/_layout.tsx</ThemedText> sets up
-              the tab navigator.
-            </ThemedText>
-            <ExternalLink href="https://docs.expo.dev/router/introduction">
-              <ThemedText type="linkPrimary">Learn more</ThemedText>
-            </ExternalLink>
-          </Collapsible>
-
-          <Collapsible title="Android, iOS, and web support">
-            <ThemedView type="backgroundElement" style={styles.collapsibleContent}>
-              <ThemedText type="small">
-                You can open this project on Android, iOS, and the web. To open the web version,
-                press <ThemedText type="smallBold">w</ThemedText> in the terminal running this
-                project.
-              </ThemedText>
-              <Image
-                source={require('@/assets/images/tutorial-web.png')}
-                style={styles.imageTutorial}
-              />
+              <Pressable style={styles.deleteButton} onPress={() => handleDelete(sample.id)}>
+                <ThemedText type="smallBold" style={styles.deleteText}>
+                  Kaydı sil
+                </ThemedText>
+              </Pressable>
             </ThemedView>
-          </Collapsible>
+          ))}
+        </View>
 
-          <Collapsible title="Images">
-            <ThemedText type="small">
-              For static images, you can use the <ThemedText type="code">@2x</ThemedText> and{' '}
-              <ThemedText type="code">@3x</ThemedText> suffixes to provide files for different
-              screen densities.
-            </ThemedText>
-            <Image source={require('@/assets/images/react-logo.png')} style={styles.imageReact} />
-            <ExternalLink href="https://reactnative.dev/docs/images">
-              <ThemedText type="linkPrimary">Learn more</ThemedText>
-            </ExternalLink>
-          </Collapsible>
-
-          <Collapsible title="Light and dark mode components">
-            <ThemedText type="small">
-              This template has light and dark mode support. The{' '}
-              <ThemedText type="code">useColorScheme()</ThemedText> hook lets you inspect what the
-              user&apos;s current color scheme is, and so you can adjust UI colors accordingly.
-            </ThemedText>
-            <ExternalLink href="https://docs.expo.dev/develop/user-interface/color-themes/">
-              <ThemedText type="linkPrimary">Learn more</ThemedText>
-            </ExternalLink>
-          </Collapsible>
-
-          <Collapsible title="Animations">
-            <ThemedText type="small">
-              This template includes an example of an animated component. The{' '}
-              <ThemedText type="code">src/components/ui/collapsible.tsx</ThemedText> component uses
-              the powerful <ThemedText type="code">react-native-reanimated</ThemedText> library to
-              animate opening this hint.
-            </ThemedText>
-          </Collapsible>
-        </ThemedView>
         {Platform.OS === 'web' && <WebBadge />}
       </ThemedView>
     </ScrollView>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <ThemedView type="backgroundSelected" style={styles.metricRow}>
+      <ThemedText type="smallBold">{label}</ThemedText>
+      <ThemedText type="small" themeColor="textSecondary" style={styles.metricValue}>
+        {value}
+      </ThemedText>
+    </ThemedView>
   );
 }
 
@@ -136,45 +147,67 @@ const styles = StyleSheet.create({
   container: {
     maxWidth: MaxContentWidth,
     flexGrow: 1,
-  },
-  titleContainer: {
     gap: Spacing.three,
-    alignItems: 'center',
     paddingHorizontal: Spacing.four,
-    paddingVertical: Spacing.six,
   },
-  centerText: {
-    textAlign: 'center',
+  header: {
+    gap: Spacing.two,
   },
-  pressed: {
-    opacity: 0.7,
+  eyebrow: {
+    textTransform: 'uppercase',
   },
-  linkButton: {
+  list: {
+    gap: Spacing.three,
+  },
+  card: {
+    gap: Spacing.three,
+    padding: Spacing.three,
+    borderRadius: Spacing.four,
+  },
+  imageGrid: {
     flexDirection: 'row',
-    paddingHorizontal: Spacing.four,
-    paddingVertical: Spacing.two,
-    borderRadius: Spacing.five,
-    justifyContent: 'center',
-    gap: Spacing.one,
-    alignItems: 'center',
+    gap: Spacing.two,
   },
-  sectionsWrapper: {
-    gap: Spacing.five,
-    paddingHorizontal: Spacing.four,
-    paddingTop: Spacing.three,
+  imageColumn: {
+    flex: 1,
+    gap: Spacing.two,
   },
-  collapsibleContent: {
-    alignItems: 'center',
-  },
-  imageTutorial: {
+  rawImage: {
     width: '100%',
-    aspectRatio: 296 / 171,
+    height: 180,
     borderRadius: Spacing.three,
-    marginTop: Spacing.two,
+    backgroundColor: '#000000',
   },
-  imageReact: {
-    width: 100,
-    height: 100,
-    alignSelf: 'center',
+  roiImage: {
+    width: '100%',
+    height: 180,
+    borderRadius: Spacing.three,
+    backgroundColor: '#000000',
+  },
+  metaGrid: {
+    gap: Spacing.two,
+  },
+  metricRow: {
+    minHeight: 40,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+    borderRadius: Spacing.two,
+    paddingHorizontal: Spacing.three,
+  },
+  metricValue: {
+    flex: 1,
+    textAlign: 'right',
+  },
+  deleteButton: {
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: Spacing.two,
+    backgroundColor: '#B42318',
+  },
+  deleteText: {
+    color: '#ffffff',
   },
 });
