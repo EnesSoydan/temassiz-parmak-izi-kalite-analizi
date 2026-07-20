@@ -41,3 +41,12 @@ example
 # generated native folders
 /ios
 /android
+
+# local assistant/tool files
+.codex-remote-attachments/
+.claude/
+CLAUDE.md
+
+# local research/source documents
+/*.pdf
+/AKADEMIK_MAKALE_TEKNIK_INCELEME.md
