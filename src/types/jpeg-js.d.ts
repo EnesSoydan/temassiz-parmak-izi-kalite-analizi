@@ -6,4 +6,5 @@ declare module 'jpeg-js' {
   };
 
   export function decode(buffer: Uint8Array, options?: { useTArray?: boolean }): RawImageData;
+  export function encode(image: RawImageData, quality?: number): { data: Uint8Array; width: number; height: number };
 }

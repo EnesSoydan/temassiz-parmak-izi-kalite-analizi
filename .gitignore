@@ -44,9 +44,28 @@ example
 
 # local assistant/tool files
 .codex-remote-attachments/
+.codex-ui-stage/
+.agents/
 .claude/
 CLAUDE.md
 
 # local research/source documents
 /*.pdf
 /AKADEMIK_MAKALE_TEKNIK_INCELEME.md
+
+# local Python environments
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+
+# local datasets and training outputs
+/final_hands_yolo11n_obb/
+/runs/
+/YOLO/test_images/
+/YOLO/datasets/
+/YOLO/scripts/*.pt
+*.pt
+
+# local mobile inference models
+/assets/models/*.onnx

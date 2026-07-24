@@ -1,21 +1,34 @@
-import { Image } from 'expo-image';
+import * as Device from 'expo-device';
+import * as ImagePicker from 'expo-image-picker';
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { DetectionImage } from '@/components/detection-image';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { WebBadge } from '@/components/web-badge';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
-import { deleteCaptureSample, loadCaptureSamples } from '@/lib/capture-storage';
-import { formatQualityStatus } from '@/lib/quality';
 import { useTheme } from '@/hooks/use-theme';
+import {
+  appendCaptureSample,
+  deleteCaptureSample,
+  loadCaptureSamples,
+  saveRawImage,
+} from '@/lib/capture-storage';
+import { detectFingertipObbBoxes } from '@/lib/fingertip-detection';
 import type { CaptureSample } from '@/types/biometrics';
+
+// Galeriden eklenen kayıtlar için kısa ve çakışma ihtimali düşük kimlik üretir.
+function createId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 export default function RecordsScreen() {
   const [samples, setSamples] = useState<CaptureSample[]>([]);
   const [feedback, setFeedback] = useState('Kayıtlar yükleniyor...');
+  const [isPickingImage, setIsPickingImage] = useState(false);
   const safeAreaInsets = useSafeAreaInsets();
   const theme = useTheme();
   const insets = {
@@ -23,14 +36,13 @@ export default function RecordsScreen() {
     bottom: safeAreaInsets.bottom + BottomTabInset + Spacing.three,
   };
 
+  // Kayıtlar sekmesi açıldığında cihaz içindeki fotoğraf listesini yeniden okur.
   const loadSamples = useCallback(() => {
     loadCaptureSamples()
       .then((storedSamples) => {
         setSamples(storedSamples);
         setFeedback(
-          storedSamples.length === 0
-            ? 'Henüz kayıt yok. Ana ekrandan kare yakalayabilirsin.'
-            : `${storedSamples.length} kayıt cihaz içinde saklanıyor.`
+          storedSamples.length === 0 ? 'Henüz kayıt yok.' : `${storedSamples.length} fotoğraf`
         );
       })
       .catch(() => {
@@ -40,17 +52,86 @@ export default function RecordsScreen() {
 
   useFocusEffect(loadSamples);
 
+  // Kaydı önce ekrandan kaldırır, dosya silme başarısız olursa eski listeyi geri yükler.
   async function handleDelete(sampleId: string) {
+    const previousSamples = samples;
+    const nextVisibleSamples = samples.filter((sample) => sample.id !== sampleId);
+
+    // İyimser güncelleme silme sonucunu uygulama yeniden açılmadan gösterir.
+    setSamples(nextVisibleSamples);
+    setFeedback(
+      nextVisibleSamples.length === 0 ? 'Henüz kayıt yok.' : `${nextVisibleSamples.length} fotoğraf`
+    );
+
     try {
       const nextSamples = await deleteCaptureSample(sampleId);
       setSamples(nextSamples);
-      setFeedback(
-        nextSamples.length === 0
-          ? 'Kayıt silindi. Henüz kayıt yok.'
-          : `Kayıt silindi. ${nextSamples.length} kayıt kaldı.`
-      );
     } catch {
+      setSamples(previousSamples);
       setFeedback('Kayıt silinemedi.');
+    }
+  }
+
+  // Galeriden seçilen el görselini modelden geçirip kutu verileriyle kayıt listesine ekler.
+  async function handlePickImage() {
+    if (isPickingImage) return;
+
+    setIsPickingImage(true);
+    setFeedback('Galeri açılıyor...');
+
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+      // Galeri izni yoksa sistem seçicisini açmadan kullanıcıyı bilgilendirir.
+      if (!permission.granted) {
+        setFeedback('Galeriden seçmek için fotoğraf izni vermelisin.');
+        return;
+      }
+
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ['images'],
+        allowsEditing: false,
+        quality: 1,
+        selectionLimit: 1,
+      });
+
+      // Kullanıcı seçim ekranını kapattığında mevcut kayıtları değiştirmez.
+      if (result.canceled || !result.assets[0]) {
+        setFeedback(samples.length === 0 ? 'Henüz kayıt yok.' : `${samples.length} fotoğraf`);
+        return;
+      }
+
+      const asset = result.assets[0];
+      setFeedback('Görsel işleniyor...');
+      const sampleId = createId('gallery');
+      const rawImageUri = await saveRawImage(asset.uri, sampleId);
+      const detections = await detectFingertipObbBoxes(rawImageUri);
+
+      // Model kutularını ham görselden ayrı metadata olarak saklar, ekranda üst üste çizer.
+      const sample: CaptureSample = {
+        id: sampleId,
+        createdAt: new Date().toISOString(),
+        rawImageUri,
+        rawImageSize: {
+          width: asset.width,
+          height: asset.height,
+        },
+        detections,
+        deviceModel: `${Device.modelName ?? 'Bilinmeyen cihaz'} · Galeri`,
+        fingerLabel: 'unknown',
+        sessionId: createId('gallery-session'),
+        qualityStatus: 'unknown',
+        accepted: false,
+      };
+
+      const nextSamples = await appendCaptureSample(sample);
+      setSamples(nextSamples);
+      setFeedback(`${nextSamples.length} fotoğraf`);
+    } catch (error) {
+      console.warn('Galeri görseli işlenemedi.', error);
+      setFeedback('Görsel işlenemedi.');
+    } finally {
+      setIsPickingImage(false);
     }
   }
 
@@ -71,50 +152,46 @@ export default function RecordsScreen() {
     <ScrollView
       style={[styles.scrollView, { backgroundColor: theme.background }]}
       contentInset={insets}
-      contentContainerStyle={[styles.contentContainer, contentPlatformStyle]}>
+      contentContainerStyle={[styles.contentContainer, contentPlatformStyle]}
+      showsVerticalScrollIndicator={false}>
       <ThemedView style={styles.container}>
-        <ThemedView style={styles.header}>
-          <ThemedText type="code" style={styles.eyebrow}>
-            yerel capture arşivi
-          </ThemedText>
-          <ThemedText type="subtitle">Kayıtlar</ThemedText>
-          <ThemedText themeColor="textSecondary">{feedback}</ThemedText>
-        </ThemedView>
+        <View style={styles.header}>
+          <View style={styles.headerText}>
+            <ThemedText type="subtitle">Kayıtlar</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">
+              {feedback}
+            </ThemedText>
+          </View>
+
+          <Pressable
+            style={[styles.galleryButton, isPickingImage && styles.disabledButton]}
+            disabled={isPickingImage}
+            onPress={handlePickImage}>
+            <ThemedText type="smallBold">
+              {isPickingImage ? 'İşleniyor...' : 'Galeriden seç'}
+            </ThemedText>
+          </Pressable>
+        </View>
 
         <View style={styles.list}>
           {samples.map((sample) => (
             <ThemedView key={sample.id} type="backgroundElement" style={styles.card}>
-              <View style={styles.imageGrid}>
-                <View style={styles.imageColumn}>
-                  <ThemedText type="smallBold">Ham görüntü</ThemedText>
-                  <Image source={{ uri: sample.rawImageUri }} style={styles.rawImage} contentFit="cover" />
-                </View>
-                <View style={styles.imageColumn}>
-                  <ThemedText type="smallBold">ROI</ThemedText>
-                  <Image source={{ uri: sample.roiImageUri }} style={styles.roiImage} contentFit="contain" />
-                </View>
-              </View>
+              <DetectionImage
+                imageUri={sample.rawImageUri}
+                imageSize={sample.rawImageSize}
+                detections={sample.detections}
+              />
 
-              <View style={styles.metaGrid}>
-                <Metric label="Tarih" value={new Date(sample.createdAt).toLocaleString('tr-TR')} />
-                <Metric label="Cihaz" value={sample.deviceModel ?? 'Bilinmeyen cihaz'} />
-                <Metric label="Netlik" value={`${sample.qualityMetrics?.blurScore ?? 0}/100`} />
-                <Metric
-                  label="Parlama"
-                  value={`%${Math.round((sample.qualityMetrics?.glareRatio ?? 0) * 100)}`}
-                />
-                <Metric label="Işık" value={`${sample.qualityMetrics?.brightnessMean ?? 0}/255`} />
-                <Metric
-                  label="Kalite"
-                  value={sample.qualityMetrics ? formatQualityStatus(sample.qualityMetrics.status) : 'ölçülmedi'}
-                />
-              </View>
-
-              <Pressable style={styles.deleteButton} onPress={() => handleDelete(sample.id)}>
-                <ThemedText type="smallBold" style={styles.deleteText}>
-                  Kaydı sil
+              <View style={styles.cardFooter}>
+                <ThemedText type="small" themeColor="textSecondary">
+                  {new Date(sample.createdAt).toLocaleString('tr-TR')}
                 </ThemedText>
-              </Pressable>
+                <Pressable hitSlop={12} onPress={() => handleDelete(sample.id)}>
+                  <ThemedText type="smallBold" style={styles.deleteText}>
+                    Sil
+                  </ThemedText>
+                </Pressable>
+              </View>
             </ThemedView>
           ))}
         </View>
@@ -122,17 +199,6 @@ export default function RecordsScreen() {
         {Platform.OS === 'web' && <WebBadge />}
       </ThemedView>
     </ScrollView>
-  );
-}
-
-function Metric({ label, value }: { label: string; value: string }) {
-  return (
-    <ThemedView type="backgroundSelected" style={styles.metricRow}>
-      <ThemedText type="smallBold">{label}</ThemedText>
-      <ThemedText type="small" themeColor="textSecondary" style={styles.metricValue}>
-        {value}
-      </ThemedText>
-    </ThemedView>
   );
 }
 
@@ -145,69 +211,52 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   container: {
+    width: '100%',
     maxWidth: MaxContentWidth,
     flexGrow: 1,
-    gap: Spacing.three,
+    gap: Spacing.four,
     paddingHorizontal: Spacing.four,
   },
   header: {
-    gap: Spacing.two,
+    minHeight: 52,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.three,
   },
-  eyebrow: {
-    textTransform: 'uppercase',
+  headerText: {
+    flex: 1,
+    gap: Spacing.half,
+  },
+  galleryButton: {
+    minHeight: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    backgroundColor: 'rgba(127, 127, 127, 0.18)',
+    paddingHorizontal: Spacing.three,
   },
   list: {
     gap: Spacing.three,
   },
   card: {
-    gap: Spacing.three,
-    padding: Spacing.three,
-    borderRadius: Spacing.four,
-  },
-  imageGrid: {
-    flexDirection: 'row',
+    overflow: 'hidden',
     gap: Spacing.two,
+    borderRadius: 6,
+    padding: Spacing.two,
   },
-  imageColumn: {
-    flex: 1,
-    gap: Spacing.two,
-  },
-  rawImage: {
-    width: '100%',
-    height: 180,
-    borderRadius: Spacing.three,
-    backgroundColor: '#000000',
-  },
-  roiImage: {
-    width: '100%',
-    height: 180,
-    borderRadius: Spacing.three,
-    backgroundColor: '#000000',
-  },
-  metaGrid: {
-    gap: Spacing.two,
-  },
-  metricRow: {
-    minHeight: 40,
+  cardFooter: {
+    minHeight: 36,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: Spacing.two,
-    borderRadius: Spacing.two,
-    paddingHorizontal: Spacing.three,
-  },
-  metricValue: {
-    flex: 1,
-    textAlign: 'right',
-  },
-  deleteButton: {
-    minHeight: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: Spacing.two,
-    backgroundColor: '#B42318',
+    paddingHorizontal: Spacing.one,
   },
   deleteText: {
-    color: '#ffffff',
+    color: '#E5484D',
+  },
+  disabledButton: {
+    opacity: 0.5,
   },
 });

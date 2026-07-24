@@ -1,593 +1,692 @@
-import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Device from 'expo-device';
-import { Image } from 'expo-image';
+import { useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { LayoutChangeEvent, Pressable, StyleSheet, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import Svg, { G, Rect, Text as SvgText } from 'react-native-svg';
+import {
+  Camera as VisionCamera,
+  HybridFrameConverter,
+  type CameraRef as VisionCameraRef,
+  useCameraPermission,
+  useFrameOutput,
+  usePhotoOutput,
+} from 'react-native-vision-camera';
+import { scheduleOnRN } from 'react-native-worklets';
 
-import { HintRow } from '@/components/hint-row';
 import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { WebBadge } from '@/components/web-badge';
-import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
-import { appendCaptureSample, loadCaptureSamples, saveRawImage, saveRoiImage } from '@/lib/capture-storage';
-import { cropFingerRoi } from '@/lib/image-processing';
-import { analyzeFrameQuality, estimateInitialQuality, formatQualityStatus } from '@/lib/quality';
-import type { CaptureSample, QualityMetrics } from '@/types/biometrics';
+import { BottomTabInset, Spacing } from '@/constants/theme';
+import { appendCaptureSample, saveRawImage } from '@/lib/capture-storage';
+import {
+  detectFingertipObbBoxes,
+  detectFingertipObbBoxesFromRawPixels,
+  FINGERTIP_MODEL_SIZE,
+  type ModelPixelFormat,
+} from '@/lib/fingertip-detection';
+import { loadFingertipObbSession } from '@/lib/onnx-model';
+import type { CaptureSample, DetectedObbBox } from '@/types/biometrics';
 
-type CheckStatus = 'idle' | 'watching' | 'good' | 'warning' | 'bad';
+type CaptureMode = 'photo' | 'realtime';
 
-type QualityCheckProps = {
-  label: string;
-  value: string;
-  status: CheckStatus;
+// Canlı model kutularını kamera önizlemesine taşırken kaynak frame oranını korur.
+type LiveDetectionFrame = {
+  width: number;
+  height: number;
 };
 
-function QualityCheck({ label, value, status }: QualityCheckProps) {
+// Kamera üstündeki canlı kutu katmanının ihtiyaç duyduğu verileri taşır.
+type LiveDetectionOverlayProps = {
+  detections: DetectedObbBox[];
+  imageSize: LiveDetectionFrame | null;
+};
+
+// Canlı model sonucunu kareler arasında kısa süre koruyan takip kaydını tanımlar.
+type LiveDetectionTrack = {
+  detection: DetectedObbBox;
+  missedUpdates: number;
+};
+
+// Mobil model için yeterli ayrıntıyı koruyan canlı kamera çözünürlüğü.
+const LIVE_FRAME_RESOLUTION = { width: 640, height: 480 };
+
+// Canlı model yükünü sınırlandırmak için her altıncı frame'i inference adayı yapar.
+const LIVE_MODEL_FRAME_INTERVAL = 6;
+
+// Güncel kutuya daha yüksek ağırlık vererek gecikmeyi artırmadan titreşimi azaltır.
+const LIVE_TRACK_CURRENT_WEIGHT = 0.9;
+
+// Bir tur kaçırılan parmak kutusunu kısa süre ekranda tutar.
+const LIVE_TRACK_MAX_MISSED_UPDATES = 1;
+
+// Güncel model sonuçlarını sınıf kimliğiyle önceki kutulara bağlar.
+function updateLiveDetectionTracks(
+  previousTracks: Map<DetectedObbBox['className'], LiveDetectionTrack>,
+  currentDetections: DetectedObbBox[]
+) {
+  const nextTracks = new Map<DetectedObbBox['className'], LiveDetectionTrack>();
+
+  // Her parmak sınıfını önceki konumuyla yumuşatıp kararlı bir çizim kimliği üretir.
+  for (const currentDetection of currentDetections) {
+    const previousTrack = previousTracks.get(currentDetection.className);
+    const detection = previousTrack
+      ? interpolateDetection(previousTrack.detection, currentDetection, LIVE_TRACK_CURRENT_WEIGHT)
+      : {
+          ...currentDetection,
+          id: `live-${currentDetection.className}`,
+        };
+
+    nextTracks.set(currentDetection.className, {
+      detection,
+      missedUpdates: 0,
+    });
+  }
+
+  // Modelin anlık kaçırdığı kutuları sınırlı sayıda güncelleme boyunca korur.
+  for (const [className, previousTrack] of previousTracks) {
+    if (nextTracks.has(className)) continue;
+
+    const missedUpdates = previousTrack.missedUpdates + 1;
+    if (missedUpdates <= LIVE_TRACK_MAX_MISSED_UPDATES) {
+      nextTracks.set(className, {
+        detection: previousTrack.detection,
+        missedUpdates,
+      });
+    }
+  }
+
+  return nextTracks;
+}
+
+// Aynı parmağa ait eski ve yeni kutunun koordinatlarını birbirine yaklaştırır.
+function interpolateDetection(
+  previous: DetectedObbBox,
+  current: DetectedObbBox,
+  currentWeight: number
+): DetectedObbBox {
+  const previousWeight = 1 - currentWeight;
+
+  return {
+    ...current,
+    id: `live-${current.className}`,
+    confidence: previous.confidence * previousWeight + current.confidence * currentWeight,
+    center: {
+      x: previous.center.x * previousWeight + current.center.x * currentWeight,
+      y: previous.center.y * previousWeight + current.center.y * currentWeight,
+    },
+    size: {
+      width: previous.size.width * previousWeight + current.size.width * currentWeight,
+      height: previous.size.height * previousWeight + current.size.height * currentWeight,
+    },
+    angle: previous.angle * previousWeight + current.angle * currentWeight,
+    points: current.points.map((point, index) => ({
+      x: (previous.points[index]?.x ?? point.x) * previousWeight + point.x * currentWeight,
+      y: (previous.points[index]?.y ?? point.y) * previousWeight + point.y * currentWeight,
+    })),
+  };
+}
+
+// Canlı sonuçları kamera görüntüsü üzerinde eksene hizalı kutular olarak çizer.
+function LiveDetectionOverlay({ detections, imageSize }: LiveDetectionOverlayProps) {
+  const [layout, setLayout] = useState({ width: 0, height: 0 });
+  const imageFrame = getCoveredImageFrame(layout, imageSize);
+
+  // Kamera önizlemesinin gerçek boyutunu kutu koordinat hesabı için saklar.
+  function handleLayout(event: LayoutChangeEvent) {
+    setLayout({
+      width: event.nativeEvent.layout.width,
+      height: event.nativeEvent.layout.height,
+    });
+  }
+
   return (
-    <ThemedView type="backgroundSelected" style={styles.qualityRow}>
-      <View
-        style={[
-          styles.statusDot,
-          status === 'good' && styles.statusDotGood,
-          status === 'watching' && styles.statusDotActive,
-          status === 'warning' && styles.statusDotWarning,
-          status === 'bad' && styles.statusDotBad,
-          status === 'idle' && styles.statusDotIdle,
-        ]}
-      />
-      <ThemedText type="smallBold" style={styles.qualityLabel}>
-        {label}
-      </ThemedText>
-      <ThemedText type="small" themeColor="textSecondary" style={styles.qualityValue}>
-        {value}
-      </ThemedText>
-    </ThemedView>
+    <View pointerEvents="none" style={styles.liveDetectionOverlay} onLayout={handleLayout}>
+      {layout.width > 0 && layout.height > 0 && (
+        <Svg width={layout.width} height={layout.height}>
+          {detections.map((detection) => {
+            const box = getAxisAlignedScreenBox(detection, imageFrame);
+
+            return (
+              <G key={detection.id}>
+                <Rect
+                  x={box.x}
+                  y={box.y}
+                  width={box.width}
+                  height={box.height}
+                  fill="rgba(47, 209, 107, 0.10)"
+                  stroke="#2FD16B"
+                  strokeWidth={2}
+                />
+                <SvgText
+                  x={box.x + box.width / 2}
+                  y={Math.max(box.y - 4, 12)}
+                  fill="#ffffff"
+                  fontSize={9}
+                  fontWeight="700"
+                  textAnchor="middle">
+                  {`${formatDetectionClass(detection.className)} ${Math.round(detection.confidence * 100)}%`}
+                </SvgText>
+              </G>
+            );
+          })}
+        </Svg>
+      )}
+    </View>
   );
 }
 
+// Normalize kutu noktalarını kamera alanındaki eksene hizalı koordinatlara çevirir.
+function getAxisAlignedScreenBox(
+  detection: DetectedObbBox,
+  imageFrame: { x: number; y: number; width: number; height: number }
+) {
+  const screenPoints = detection.points.map((point) => ({
+    x: imageFrame.x + point.x * imageFrame.width,
+    y: imageFrame.y + point.y * imageFrame.height,
+  }));
+  const xValues = screenPoints.map((point) => point.x);
+  const yValues = screenPoints.map((point) => point.y);
+  const left = Math.min(...xValues);
+  const top = Math.min(...yValues);
+  const right = Math.max(...xValues);
+  const bottom = Math.max(...yValues);
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+// resizeMode="cover" ile taşan kamera görüntüsünün gerçek çizim alanını hesaplar.
+function getCoveredImageFrame(
+  layout: { width: number; height: number },
+  imageSize: LiveDetectionFrame | null
+) {
+  if (!imageSize || layout.width === 0 || layout.height === 0) {
+    return { x: 0, y: 0, width: layout.width, height: layout.height };
+  }
+
+  const imageRatio = imageSize.width / imageSize.height;
+  const layoutRatio = layout.width / layout.height;
+
+  // Yatay taşmada kameranın ekran dışında kalan sağ ve sol bölümünü hesaba katar.
+  if (imageRatio > layoutRatio) {
+    const width = layout.height * imageRatio;
+    return {
+      x: (layout.width - width) / 2,
+      y: 0,
+      width,
+      height: layout.height,
+    };
+  }
+
+  const height = layout.width / imageRatio;
+  return {
+    x: 0,
+    y: (layout.height - height) / 2,
+    width: layout.width,
+    height,
+  };
+}
+
+// Model sınıf adlarını kamera üzerinde kısa Türkçe etiketlere çevirir.
+function formatDetectionClass(className: DetectedObbBox['className']) {
+  if (className === 'index') return 'işaret';
+  if (className === 'middle') return 'orta';
+  if (className === 'pinky') return 'serçe';
+  if (className === 'ring') return 'yüzük';
+  return 'tespit';
+}
+
+// Yerel capture kayıtları için kısa ve çakışma ihtimali düşük kimlik üretir.
 function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number) {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => {
-      setTimeout(() => reject(new Error('timeout')), timeoutMs);
-    }),
-  ]);
+// Model hatasının fotoğraf dosyasının kaydedilmesini engellememesi için inference'ı güvenli çalıştırır.
+async function tryDetectFingertips(imageUri: string) {
+  try {
+    return await detectFingertipObbBoxes(imageUri);
+  } catch (error) {
+    console.warn('Parmak ucu modeli çalıştırılamadı.', error);
+    return [];
+  }
 }
 
-function getMetricStatus(metrics: QualityMetrics | null, field: 'blur' | 'glare' | 'brightness'): CheckStatus {
-  if (!metrics) {
-    return 'idle';
-  }
-
-  if (field === 'blur') {
-    if (metrics.blurScore < 18) return 'bad';
-    if (metrics.blurScore < 35) return 'warning';
-    return 'good';
-  }
-
-  if (field === 'glare') {
-    if (metrics.glareRatio > 0.08) return 'bad';
-    if (metrics.glareRatio > 0.035) return 'warning';
-    return 'good';
-  }
-
-  if (metrics.brightnessMean < 45 || metrics.brightnessMean > 225) return 'bad';
-  if (metrics.brightnessMean < 75 || metrics.brightnessMean > 205) return 'warning';
-  return 'good';
-}
-
-function getQualityDotStatus(metrics: QualityMetrics | null): CheckStatus {
-  if (!metrics) return 'idle';
-  if (metrics.status === 'good') return 'good';
-  if (metrics.status === 'usable') return 'warning';
-  if (metrics.status === 'poor') return 'bad';
-  return 'idle';
-}
-
-export default function HomeScreen() {
-  const cameraRef = useRef<CameraView>(null);
-  const isAnalyzingRef = useRef(false);
-  const [isCaptureReady, setIsCaptureReady] = useState(false);
+export default function CameraScreen() {
+  const cameraRef = useRef<VisionCameraRef>(null);
+  const permissionRequestedRef = useRef(false);
+  const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const liveDetectionBusyRef = useRef(false);
+  const liveDetectionPausedRef = useRef(true);
+  const liveDetectionTracksRef = useRef(
+    new Map<DetectedObbBox['className'], LiveDetectionTrack>()
+  );
+  const [captureMode, setCaptureMode] = useState<CaptureMode>('photo');
+  const [isScreenFocused, setIsScreenFocused] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
-  const [samples, setSamples] = useState<CaptureSample[]>([]);
-  const [selectedSample, setSelectedSample] = useState<CaptureSample | null>(null);
-  const [liveMetrics, setLiveMetrics] = useState<QualityMetrics | null>(null);
-  const [analysisStatus, setAnalysisStatus] = useState('Ölçüm bekleniyor.');
-  const [feedback, setFeedback] = useState('Kamerayı açınca önce parmak ROI kadrajını kontrol edeceğiz.');
-  const [permission, requestPermission] = useCameraPermissions();
-  const insets = useSafeAreaInsets();
+  const [liveDetections, setLiveDetections] = useState<DetectedObbBox[]>([]);
+  const [liveDetectionFrame, setLiveDetectionFrame] = useState<LiveDetectionFrame | null>(null);
+  const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [feedback, setFeedback] = useState('');
+  const { hasPermission, requestPermission } = useCameraPermission();
+  const photoOutput = usePhotoOutput({ quality: 0.95, qualityPrioritization: 'speed' });
+  const isRealtimeMode = captureMode === 'realtime';
+  const canUseCamera = hasPermission && isScreenFocused;
 
-  const canShowCamera = isCaptureReady && permission?.granted;
-  const canAnalyzeCamera = canShowCamera && isCameraReady;
-  const visibleMetrics = canShowCamera ? liveMetrics : null;
+  // Kısa durum mesajını gösterip başarılı işlemlerde otomatik olarak temizler.
+  const showFeedback = useCallback((message: string, autoClear = true) => {
+    if (feedbackTimerRef.current) {
+      clearTimeout(feedbackTimerRef.current);
+    }
 
-  useEffect(() => {
-    loadCaptureSamples()
-      .then((storedSamples) => {
-        setSamples(storedSamples);
-        setSelectedSample(storedSamples[0] ?? null);
-      })
-      .catch(() => {
-        setFeedback('Yerel kayıtlar okunamadı.');
-      });
+    setFeedback(message);
+    if (autoClear) {
+      feedbackTimerRef.current = setTimeout(() => setFeedback(''), 1800);
+    }
   }, []);
 
-  const analyzeLiveFrame = useCallback(async () => {
-    if (!cameraRef.current || !canAnalyzeCamera || isTakingPhoto || isAnalyzingRef.current) {
-      return;
-    }
-
-    isAnalyzingRef.current = true;
-    setAnalysisStatus('Örnek kare alınıyor...');
-
-    try {
-      const picture = await withTimeout(
-        cameraRef.current.takePictureAsync({
-          base64: true,
-          quality: 0.2,
-          exif: false,
-          skipProcessing: false,
-          shutterSound: false,
-        }),
-        5000
-      );
-
-      if (picture.base64) {
-        const metrics = analyzeFrameQuality({ base64: picture.base64 });
-        setLiveMetrics(metrics);
-        setAnalysisStatus(`Son ölçüm: ${new Date().toLocaleTimeString('tr-TR')}`);
-      } else {
-        setAnalysisStatus('Örnek kare alındı ama analiz verisi gelmedi.');
+  // Worklet'ten gelen mobil boyutlu görüntüyü ONNX modelinde tek sefer çalıştırır.
+  const processLiveModelFrame = useCallback(
+    (
+      buffer: ArrayBuffer,
+      width: number,
+      height: number,
+      pixelFormat: ModelPixelFormat,
+      sourceWidth: number,
+      sourceHeight: number
+    ) => {
+      if (liveDetectionBusyRef.current || liveDetectionPausedRef.current) {
+        return;
       }
-    } catch {
-      setAnalysisStatus('Canlı ölçüm zaman aşımına düştü.');
-    } finally {
-      isAnalyzingRef.current = false;
-    }
-  }, [canAnalyzeCamera, isTakingPhoto]);
 
+      liveDetectionBusyRef.current = true;
+      detectFingertipObbBoxesFromRawPixels(buffer, width, height, pixelFormat)
+        .then((detections) => {
+          const nextTracks = updateLiveDetectionTracks(liveDetectionTracksRef.current, detections);
+          liveDetectionTracksRef.current = nextTracks;
+          setLiveDetections([...nextTracks.values()].map((track) => track.detection));
+          setLiveDetectionFrame({ width: sourceWidth, height: sourceHeight });
+        })
+        .catch((error) => {
+          liveDetectionPausedRef.current = true;
+          console.warn('Canlı parmak ucu modeli çalıştırılamadı.', error);
+        })
+        .finally(() => {
+          liveDetectionBusyRef.current = false;
+        });
+    },
+    []
+  );
+
+  // Frame dönüşüm hatasında canlı modeli durdurup tekrar eden uyarıları engeller.
+  const reportLiveFrameError = useCallback((message: string) => {
+    liveDetectionPausedRef.current = true;
+    console.warn('Canlı kamera frame’i hazırlanamadı.', message);
+  }, []);
+
+  const frameOutput = useFrameOutput({
+    targetResolution: LIVE_FRAME_RESOLUTION,
+    pixelFormat: 'yuv',
+    dropFramesWhileBusy: true,
+    enablePreviewSizedOutputBuffers: true,
+    enablePhysicalBufferRotation: true,
+    onFrame(frame) {
+      'worklet';
+
+      // Canlı takip sayacını ve kalıcı dönüşüm hatasını worklet tarafında saklar.
+      const globalFrameState = globalThis as typeof globalThis & {
+        __fingerFrameCounter?: number;
+        __fingerLiveFrameFailed?: boolean;
+      };
+      const nextCount = (globalFrameState.__fingerFrameCounter ?? 0) + 1;
+      globalFrameState.__fingerFrameCounter = nextCount;
+
+      try {
+        // Belirlenen aralıktaki frame'i model boyutuna getirip JavaScript tarafına yollar.
+        if (nextCount % LIVE_MODEL_FRAME_INTERVAL === 0 && !globalFrameState.__fingerLiveFrameFailed) {
+          const sourceWidth = frame.width;
+          const sourceHeight = frame.height;
+          const image = HybridFrameConverter.convertFrameToImage(frame);
+
+          try {
+            const resizedImage = image.resize(FINGERTIP_MODEL_SIZE, FINGERTIP_MODEL_SIZE);
+
+            try {
+              const rawPixels = resizedImage.toRawPixelData();
+              scheduleOnRN(
+                processLiveModelFrame,
+                rawPixels.buffer,
+                rawPixels.width,
+                rawPixels.height,
+                rawPixels.pixelFormat as ModelPixelFormat,
+                sourceWidth,
+                sourceHeight
+              );
+            } finally {
+              resizedImage.dispose();
+            }
+          } finally {
+            image.dispose();
+          }
+        }
+      } catch (error) {
+        globalFrameState.__fingerLiveFrameFailed = true;
+        scheduleOnRN(reportLiveFrameError, String(error));
+      } finally {
+        // GPU tampon havuzunun dolmaması için her frame'i mutlaka serbest bırakır.
+        frame.dispose();
+      }
+    },
+  });
+
+  // Uygulama ilk açıldığında kamera iznini bir kez otomatik ister.
   useEffect(() => {
-    if (!canAnalyzeCamera) {
-      return;
-    }
+    if (hasPermission || permissionRequestedRef.current) return;
 
-    void analyzeLiveFrame();
-    const intervalId = setInterval(() => {
-      void analyzeLiveFrame();
-    }, 2500);
+    permissionRequestedRef.current = true;
+    requestPermission().then((isGranted) => {
+      if (!isGranted) {
+        showFeedback('Kamerayı kullanmak için izin vermelisin.', false);
+      }
+    });
+  }, [hasPermission, requestPermission, showFeedback]);
 
-    return () => clearInterval(intervalId);
-  }, [analyzeLiveFrame, canAnalyzeCamera]);
+  // ONNX modelini ekran açılınca yükleyip fotoğraf ve canlı mod için hazırlar.
+  useEffect(() => {
+    let isMounted = true;
 
-  async function handleCapturePress() {
-    if (!isCaptureReady && !permission?.granted) {
-      const nextPermission = await requestPermission();
-      setIsCaptureReady(nextPermission.granted);
-      setFeedback(
-        nextPermission.granted
-          ? 'Kamera açık. Parmağını ROI kutusuna hizala.'
-          : 'Kamera izni verilmedi. Yakalama yapılamaz.'
-      );
-      return;
-    }
+    loadFingertipObbSession()
+      .then(() => {
+        if (isMounted) setModelStatus('ready');
+      })
+      .catch((error) => {
+        console.warn('ONNX parmak ucu modeli yüklenemedi.', error);
+        if (isMounted) {
+          setModelStatus('error');
+          showFeedback('Model yüklenemedi.', false);
+        }
+      });
 
-    if (isCaptureReady) {
-      setLiveMetrics(null);
-      setIsCameraReady(false);
-      setAnalysisStatus('Ölçüm bekleniyor.');
-    }
+    return () => {
+      isMounted = false;
+    };
+  }, [showFeedback]);
 
-    setIsCaptureReady((current) => !current);
-    setFeedback(isCaptureReady ? 'Kamera kapatıldı.' : 'Kamera açık. Parmağını ROI kutusuna hizala.');
+  // Kamera sekmesi görünürken kamerayı çalıştırır, sekmeden çıkınca kaynağı serbest bırakır.
+  useFocusEffect(
+    useCallback(() => {
+      setIsScreenFocused(true);
+      return () => {
+        setIsScreenFocused(false);
+        setIsCameraReady(false);
+        liveDetectionTracksRef.current.clear();
+        setLiveDetections([]);
+        setLiveDetectionFrame(null);
+      };
+    }, [])
+  );
+
+  // Ekran kapanırken bekleyen geri bildirim zamanlayıcısını temizler.
+  useEffect(() => {
+    return () => {
+      if (feedbackTimerRef.current) {
+        clearTimeout(feedbackTimerRef.current);
+      }
+    };
+  }, []);
+
+  // Fotoğraf ve canlı takip modları arasında geçiş yapıp eski takip kutularını temizler.
+  function handleModeChange() {
+    const nextMode: CaptureMode = captureMode === 'photo' ? 'realtime' : 'photo';
+    liveDetectionPausedRef.current = nextMode === 'photo';
+    liveDetectionTracksRef.current.clear();
+    setLiveDetections([]);
+    setLiveDetectionFrame(null);
+    setCaptureMode(nextMode);
+    setFeedback('');
   }
 
+  // Kameradan tam el karesi alır, modeli çalıştırır ve kutu verileriyle yerel kayda ekler.
   async function handleTakePhoto() {
-    if (!cameraRef.current || !canShowCamera || isTakingPhoto) {
+    if (!canUseCamera || !isCameraReady || isTakingPhoto) return;
+
+    // Model henüz hazır değilse kutusuz kayıt üretmemek için çekimi kısa bir mesajla durdurur.
+    if (modelStatus !== 'ready') {
+      showFeedback(
+        modelStatus === 'loading' ? 'Model hazırlanıyor.' : 'Model kullanılamıyor.',
+        modelStatus === 'loading'
+      );
       return;
     }
 
     setIsTakingPhoto(true);
-    setFeedback('Kare yakalanıyor...');
+    showFeedback('Fotoğraf işleniyor...', false);
 
     try {
-      const picture = await cameraRef.current.takePictureAsync({
-        quality: 1,
-        exif: false,
-        skipProcessing: false,
-        shutterSound: false,
-      });
+      const photo = await photoOutput.capturePhoto(
+        { flashMode: 'off', enableShutterSound: false },
+        {}
+      );
+      const picturePath = await photo.saveToTemporaryFileAsync();
+      const capturedImage = {
+        uri: `file://${picturePath}`,
+        width: photo.width,
+        height: photo.height,
+      };
+      photo.dispose();
 
       const sampleId = createId('sample');
-      const sessionId = createId('session');
-      const roi = await cropFingerRoi({
-        imageUri: picture.uri,
-        imageWidth: picture.width,
-        imageHeight: picture.height,
-      });
-      const rawImageUri = await saveRawImage(picture.uri, sampleId);
-      const roiImageUri = await saveRoiImage(roi.uri, sampleId);
-      const fallbackMetrics = estimateInitialQuality({
-        imageWidth: picture.width,
-        imageHeight: picture.height,
-        roiWidth: roi.crop.width,
-        roiHeight: roi.crop.height,
-      });
-      const qualityMetrics = liveMetrics ?? fallbackMetrics;
+      const rawImageUri = await saveRawImage(capturedImage.uri, sampleId);
+      const detections = await tryDetectFingertips(rawImageUri);
 
+      // Kayıt ekranı, saklanan normalize kutuları ham görselin üzerinde yeniden çizer.
       const sample: CaptureSample = {
         id: sampleId,
         createdAt: new Date().toISOString(),
         rawImageUri,
-        roiImageUri,
-        qualityMetrics,
+        rawImageSize: {
+          width: capturedImage.width,
+          height: capturedImage.height,
+        },
+        detections,
         deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
         fingerLabel: 'unknown',
-        sessionId,
-        qualityStatus: qualityMetrics.status,
-        accepted: qualityMetrics.status !== 'poor' && qualityMetrics.status !== 'unknown',
+        sessionId: createId('session'),
+        qualityStatus: 'unknown',
+        accepted: false,
       };
 
-      const nextSamples = await appendCaptureSample(sample);
-      setSamples(nextSamples);
-      setSelectedSample(sample);
-      setFeedback(
-        sample.accepted
-          ? 'Kare kaydedildi. Canlı kalite ölçümü kayda işlendi.'
-          : 'Kare kaydedildi ancak kalite düşük veya ölçüm belirsiz.'
+      await appendCaptureSample(sample);
+      showFeedback(
+        detections.length > 0
+          ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
+          : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
       );
-    } catch {
-      setFeedback('Kare yakalanamadı. Kamerayı sabitleyip tekrar dene.');
+    } catch (error) {
+      console.warn('Fotoğraf kaydedilemedi.', error);
+      showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
       setIsTakingPhoto(false);
     }
   }
 
+  // Kamera izni reddedildiyse kullanıcıya yeniden isteme olanağı verir.
+  async function handlePermissionRetry() {
+    const isGranted = await requestPermission();
+    if (!isGranted) {
+      showFeedback('Kamera izni verilmedi.', false);
+    }
+  }
+
   return (
-    <ThemedView style={styles.container}>
-      <SafeAreaView style={[styles.safeArea, { paddingTop: insets.top + Spacing.four }]}>
-        <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-          <ThemedView style={styles.heroSection}>
-            <ThemedText type="code" style={styles.eyebrow}>
-              kamera kalite prototipi
+    <View style={styles.container}>
+      {hasPermission ? (
+        <VisionCamera
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          device="back"
+          outputs={[photoOutput, frameOutput]}
+          isActive={canUseCamera}
+          orientationSource="interface"
+          resizeMode="cover"
+          enableNativeTapToFocusGesture
+          onStarted={() => {
+            setIsCameraReady(true);
+            setFeedback('');
+          }}
+          onPreviewStopped={() => setIsCameraReady(false)}
+          onError={(error) => {
+            console.warn('Kamera oturumu hata verdi.', error);
+            setIsCameraReady(false);
+            showFeedback(`Kamera hatası: ${error.message}`, false);
+          }}
+        />
+      ) : (
+        <View style={styles.permissionState}>
+          <ThemedText style={styles.permissionText}>Kamera izni gerekli</ThemedText>
+          <Pressable style={styles.permissionButton} onPress={handlePermissionRetry}>
+            <ThemedText type="smallBold" style={styles.permissionButtonText}>
+              İzin ver
             </ThemedText>
-            <ThemedText type="title" style={styles.title}>
-              Temassız parmak izi kalite analizi
+          </Pressable>
+        </View>
+      )}
+
+      {isRealtimeMode && (
+        <LiveDetectionOverlay detections={liveDetections} imageSize={liveDetectionFrame} />
+      )}
+
+      <SafeAreaView pointerEvents="box-none" style={styles.controls}>
+        <View style={styles.topControl}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={
+              isRealtimeMode ? 'Fotoğraf moduna geç' : 'Canlı takip moduna geç'
+            }
+            hitSlop={16}
+            onPress={handleModeChange}>
+            <ThemedText type="smallBold" style={styles.modeText}>
+              {isRealtimeMode ? 'Fotoğraf modu' : 'Canlı takip'}
             </ThemedText>
-            <ThemedText themeColor="textSecondary" style={styles.description}>
-              Kamera açıkken ROI bölgesinden düzenli örnek kare alıp netlik,
-              parlama ve ışık durumunu canlı izliyoruz.
+          </Pressable>
+        </View>
+
+        <View style={styles.bottomControl}>
+          {feedback ? (
+            <ThemedText type="small" style={styles.feedbackText}>
+              {feedback}
             </ThemedText>
-          </ThemedView>
+          ) : null}
 
-          <ThemedText type="code" style={styles.code}>
-            ilk deney zinciri
-          </ThemedText>
-
-          <ThemedView type="backgroundElement" style={styles.stepContainer}>
-            <HintRow
-              title="1. Kadraj"
-              hint={<ThemedText type="small">parmak ROI içinde mi?</ThemedText>}
-            />
-            <HintRow
-              title="2. Kalite"
-              hint={<ThemedText type="small">canlı netlik ve parlama</ThemedText>}
-            />
-            <HintRow
-              title="3. Seçim"
-              hint={<ThemedText type="small">en iyi kareyi sakla</ThemedText>}
-            />
-            <HintRow
-              title="4. Sonra"
-              hint={<ThemedText type="small">enrollment ve 1:N arama</ThemedText>}
-            />
-          </ThemedView>
-
-          <ThemedView type="backgroundElement" style={styles.captureCard}>
-            {canShowCamera ? (
-              <View style={styles.cameraFrame}>
-                <CameraView
-                  ref={cameraRef}
-                  style={styles.cameraPreview}
-                  facing="back"
-                  animateShutter={false}
-                  onCameraReady={() => {
-                    setIsCameraReady(true);
-                    setAnalysisStatus('Kamera hazır. Canlı ölçüm başlıyor.');
-                  }}
-                  onMountError={() => {
-                    setIsCameraReady(false);
-                    setAnalysisStatus('Kamera başlatılamadı.');
-                  }}
-                />
-                <View pointerEvents="none" style={styles.cameraOverlay}>
-                  <View style={styles.roiBox} />
-                  <ThemedText type="smallBold" style={styles.overlayText}>
-                    Parmağını kutunun içine hizala
-                  </ThemedText>
-                  <ThemedText type="small" style={styles.overlayHint}>
-                    Netlik kırmızıysa telefonu biraz uzaklaştır
-                  </ThemedText>
-                  <ThemedText type="small" style={styles.overlayHint}>
-                    Parlama kırmızıysa ışığı değiştir ve telefonu sabit tut
-                  </ThemedText>
-                </View>
-              </View>
-            ) : (
-              <ThemedView type="backgroundSelected" style={styles.fingerGuide}>
-                <ThemedText type="code" themeColor="textSecondary">
-                  ROI
-                </ThemedText>
-              </ThemedView>
-            )}
-
-            <ThemedView style={styles.captureContent}>
-              <ThemedText type="smallBold">Yakalama alanı</ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">
-                {feedback}
-              </ThemedText>
-            </ThemedView>
-
-            <View style={styles.qualityList}>
-              <QualityCheck
-                label="Kadraj"
-                value={canAnalyzeCamera ? 'izleniyor' : canShowCamera ? 'kamera hazırlanıyor' : 'kamera bekleniyor'}
-                status={canAnalyzeCamera ? 'watching' : 'idle'}
-              />
-              <QualityCheck
-                label="Netlik"
-                value={visibleMetrics ? `${visibleMetrics.blurScore}/100` : 'ölçüm bekleniyor'}
-                status={getMetricStatus(visibleMetrics, 'blur')}
-              />
-              <QualityCheck
-                label="Parlama"
-                value={visibleMetrics ? `%${Math.round(visibleMetrics.glareRatio * 100)}` : 'ölçüm bekleniyor'}
-                status={getMetricStatus(visibleMetrics, 'glare')}
-              />
-              <QualityCheck
-                label="Işık"
-                value={visibleMetrics ? `${visibleMetrics.brightnessMean}/255` : 'ölçüm bekleniyor'}
-                status={getMetricStatus(visibleMetrics, 'brightness')}
-              />
-              <QualityCheck
-                label="Kalite"
-                value={visibleMetrics ? formatQualityStatus(visibleMetrics.status) : 'henüz yok'}
-                status={getQualityDotStatus(visibleMetrics)}
-              />
-              <QualityCheck
-                label="Ölçüm"
-                value={analysisStatus}
-                status={visibleMetrics ? 'good' : canAnalyzeCamera ? 'watching' : 'idle'}
-              />
-            </View>
-
-            <View style={styles.buttonRow}>
-              <Pressable style={styles.secondaryButton} onPress={handleCapturePress}>
-                <ThemedText type="smallBold" style={styles.secondaryButtonText}>
-                  {canShowCamera ? 'Kamerayı kapat' : 'Kamerayı aç'}
-                </ThemedText>
-              </Pressable>
-              <Pressable
-                style={[styles.captureButton, (!canShowCamera || isTakingPhoto) && styles.disabledButton]}
-                disabled={!canShowCamera || isTakingPhoto}
-                onPress={handleTakePhoto}>
-                <ThemedText type="smallBold" style={styles.captureButtonText}>
-                  {isTakingPhoto ? 'Kaydediliyor...' : 'Kare yakala'}
-                </ThemedText>
-              </Pressable>
-            </View>
-          </ThemedView>
-
-          {selectedSample && (
-            <ThemedView type="backgroundElement" style={styles.previewCard}>
-              <ThemedText type="smallBold">Son yakalanan ROI</ThemedText>
-              <Image source={{ uri: selectedSample.roiImageUri }} style={styles.roiPreview} contentFit="contain" />
-              <ThemedText type="small" themeColor="textSecondary">
-                {new Date(selectedSample.createdAt).toLocaleString('tr-TR')} · {selectedSample.deviceModel}
-              </ThemedText>
-            </ThemedView>
+          {!isRealtimeMode && (
+            <Pressable
+              accessibilityLabel="Fotoğraf çek"
+              style={[
+                styles.shutterButton,
+                (!isCameraReady || isTakingPhoto) && styles.disabledButton,
+              ]}
+              disabled={!isCameraReady || isTakingPhoto}
+              onPress={handleTakePhoto}>
+              <View style={styles.shutterInner} />
+            </Pressable>
           )}
-
-          <ThemedView type="backgroundElement" style={styles.previewCard}>
-            <ThemedText type="smallBold">Yerel kayıtlar</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">
-              {samples.length === 0
-                ? 'Henüz kayıt yok. Kamera açıp kare yakala.'
-                : `${samples.length} kayıt cihaz içinde saklanıyor.`}
-            </ThemedText>
-          </ThemedView>
-
-          {Platform.OS === 'web' && <WebBadge />}
-        </ScrollView>
+        </View>
       </SafeAreaView>
-    </ThemedView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    justifyContent: 'center',
-    flexDirection: 'row',
-  },
-  safeArea: {
-    flex: 1,
-    paddingHorizontal: Spacing.four,
-    justifyContent: 'flex-start',
-    maxWidth: MaxContentWidth,
-  },
-  scrollContent: {
-    gap: Spacing.three,
-    paddingBottom: BottomTabInset + Spacing.six,
-  },
-  heroSection: {
-    alignItems: 'flex-start',
-    justifyContent: 'center',
-    paddingHorizontal: Spacing.four,
-    gap: Spacing.three,
-  },
-  eyebrow: {
-    textTransform: 'uppercase',
-  },
-  title: {
-    maxWidth: 640,
-  },
-  description: {
-    maxWidth: 640,
-  },
-  code: {
-    textTransform: 'uppercase',
-    paddingHorizontal: Spacing.four,
-  },
-  stepContainer: {
-    gap: Spacing.three,
-    alignSelf: 'stretch',
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.four,
-    borderRadius: Spacing.four,
-  },
-  captureCard: {
-    alignSelf: 'stretch',
-    gap: Spacing.three,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.three,
-    borderRadius: Spacing.four,
-  },
-  fingerGuide: {
-    minHeight: 220,
-    borderRadius: Spacing.three,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  cameraFrame: {
-    height: 340,
-    overflow: 'hidden',
-    borderRadius: Spacing.three,
     backgroundColor: '#000000',
   },
-  cameraPreview: {
-    width: '100%',
-    height: '100%',
+  liveDetectionOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    zIndex: 2,
   },
-  cameraOverlay: {
-    ...StyleSheet.absoluteFill,
+  controls: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    zIndex: 3,
+    justifyContent: 'space-between',
+  },
+  topControl: {
+    minHeight: 56,
     alignItems: 'center',
     justifyContent: 'center',
-    gap: Spacing.two,
-    padding: Spacing.three,
+    backgroundColor: 'rgba(0, 0, 0, 0.28)',
   },
-  roiBox: {
-    width: '42%',
-    minWidth: 112,
-    maxWidth: 160,
-    aspectRatio: 0.62,
-    borderWidth: 2,
+  modeText: {
+    color: '#ffffff',
+    textShadowColor: 'rgba(0, 0, 0, 0.75)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
+  bottomControl: {
+    minHeight: 132,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: Spacing.two,
+    paddingBottom: BottomTabInset + Spacing.three,
+    backgroundColor: 'rgba(0, 0, 0, 0.28)',
+  },
+  feedbackText: {
+    color: '#ffffff',
+    textAlign: 'center',
+    textShadowColor: 'rgba(0, 0, 0, 0.8)',
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+    paddingHorizontal: Spacing.four,
+  },
+  shutterButton: {
+    width: 72,
+    height: 72,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 36,
+    borderWidth: 4,
     borderColor: '#ffffff',
-    borderRadius: Spacing.three,
-    backgroundColor: 'transparent',
+    backgroundColor: 'rgba(0, 0, 0, 0.22)',
   },
-  overlayText: {
-    color: '#ffffff',
-    textAlign: 'center',
-    textShadowColor: '#000000',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-  },
-  overlayHint: {
-    color: '#ffffff',
-    textAlign: 'center',
-    textShadowColor: '#000000',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 4,
-  },
-  captureContent: {
-    gap: Spacing.half,
-  },
-  qualityList: {
-    gap: Spacing.two,
-  },
-  qualityRow: {
-    minHeight: 44,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.two,
-    borderRadius: Spacing.two,
-    paddingHorizontal: Spacing.three,
-  },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-  },
-  statusDotIdle: {
-    backgroundColor: '#8A8F98',
-  },
-  statusDotActive: {
-    backgroundColor: '#2FD16B',
-  },
-  statusDotGood: {
-    backgroundColor: '#2FD16B',
-  },
-  statusDotWarning: {
-    backgroundColor: '#F6A623',
-  },
-  statusDotBad: {
-    backgroundColor: '#EF4444',
-  },
-  qualityLabel: {
-    minWidth: 72,
-  },
-  qualityValue: {
-    flex: 1,
-    textAlign: 'right',
-  },
-  buttonRow: {
-    flexDirection: 'row',
-    gap: Spacing.two,
-  },
-  secondaryButton: {
-    minHeight: 48,
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: Spacing.two,
-    backgroundColor: '#3A3D44',
-    paddingHorizontal: Spacing.three,
-  },
-  secondaryButtonText: {
-    color: '#ffffff',
-  },
-  captureButton: {
-    minHeight: 48,
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderRadius: Spacing.two,
-    backgroundColor: '#208AEF',
-    paddingHorizontal: Spacing.three,
+  shutterInner: {
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    backgroundColor: '#ffffff',
   },
   disabledButton: {
     opacity: 0.5,
   },
-  captureButtonText: {
+  permissionState: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: Spacing.three,
+    paddingHorizontal: Spacing.four,
+  },
+  permissionText: {
     color: '#ffffff',
   },
-  previewCard: {
-    alignSelf: 'stretch',
-    gap: Spacing.three,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.three,
-    borderRadius: Spacing.four,
+  permissionButton: {
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    backgroundColor: '#ffffff',
+    paddingHorizontal: Spacing.four,
   },
-  roiPreview: {
-    width: '100%',
-    height: 360,
-    borderRadius: Spacing.three,
-    backgroundColor: '#000000',
+  permissionButtonText: {
+    color: '#111111',
   },
 });
