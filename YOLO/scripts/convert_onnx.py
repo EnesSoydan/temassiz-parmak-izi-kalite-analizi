@@ -1,10 +1,10 @@
 from ultralytics import YOLO
 
-model = YOLO("final_hands_yolo11n_obb/weights/best.pt")
+model = YOLO(r"runs\fingertip_obb\brightness_distance_obb\weights\best.pt")
 
 model.export(
     format="onnx",
-    imgsz=640,
+    imgsz=480,
     simplify=True,
     opset=12,
 )

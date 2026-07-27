@@ -1,6 +1,6 @@
 import * as FileSystem from 'expo-file-system/legacy';
 
-import type { CaptureSample } from '@/types/biometrics';
+import type { CaptureSample, DetectionClassName } from '@/types/biometrics';
 
 // Capture verilerini Expo'nun uygulama içi documentDirectory alanında tutuyoruz.
 const ROOT_DIR = `${FileSystem.documentDirectory ?? ''}fingerprint-captures/`;
@@ -29,6 +29,18 @@ export async function saveRawImage(sourceUri: string, sampleId: string) {
 export async function saveRoiImage(sourceUri: string, sampleId: string) {
   await ensureCaptureStorage();
   const targetUri = `${ROI_DIR}${sampleId}.jpg`;
+  await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
+  return targetUri;
+}
+
+// Modelin bulduğu parmağa ait ROI görselini sınıf adıyla ayrı bir dosya olarak saklar.
+export async function saveFingerRoiImage(
+  sourceUri: string,
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  const targetUri = `${ROI_DIR}${sampleId}-${className}.jpg`;
   await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
   return targetUri;
 }
@@ -77,6 +89,17 @@ export async function deleteCaptureSample(sampleId: string) {
   // ROI dosyası da aynı kayıtla birlikte temizlenir.
   if (sample?.roiImageUri) {
     await deleteFileIfExists(sample.roiImageUri);
+  }
+
+  // Çoklu parmak ROI dosyaları varsa ham kayıtla birlikte kaldırılır.
+  if (sample?.fingerRois) {
+    await Promise.all(
+      sample.fingerRois.map(async (fingerRoi) => {
+        if (fingerRoi.imageUri) {
+          await deleteFileIfExists(fingerRoi.imageUri);
+        }
+      })
+    );
   }
 
   // İşlenmiş ROI varsa kayıtla birlikte kaldırılır; eski kayıtlarda bu alan olmayabilir.

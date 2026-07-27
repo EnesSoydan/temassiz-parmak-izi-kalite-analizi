@@ -1,6 +1,7 @@
 import * as Device from 'expo-device';
+import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { LayoutChangeEvent, Pressable, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { G, Rect, Text as SvgText } from 'react-native-svg';
@@ -12,7 +13,7 @@ import {
   useFrameOutput,
   usePhotoOutput,
 } from 'react-native-vision-camera';
-import { scheduleOnRN } from 'react-native-worklets';
+import { createSynchronizable, scheduleOnRN } from 'react-native-worklets';
 
 import { ThemedText } from '@/components/themed-text';
 import { BottomTabInset, Spacing } from '@/constants/theme';
@@ -21,12 +22,10 @@ import {
   detectFingertipObbBoxes,
   detectFingertipObbBoxesFromRawPixels,
   FINGERTIP_MODEL_SIZE,
-  type ModelPixelFormat,
 } from '@/lib/fingertip-detection';
+import { extractFingerRoisFromImage } from '@/lib/fingertip-roi';
 import { loadFingertipObbSession } from '@/lib/onnx-model';
 import type { CaptureSample, DetectedObbBox } from '@/types/biometrics';
-
-type CaptureMode = 'photo' | 'realtime';
 
 // Canlı model kutularını kamera önizlemesine taşırken kaynak frame oranını korur.
 type LiveDetectionFrame = {
@@ -53,10 +52,10 @@ const LIVE_FRAME_RESOLUTION = { width: 640, height: 480 };
 const LIVE_MODEL_FRAME_INTERVAL = 6;
 
 // Güncel kutuya daha yüksek ağırlık vererek gecikmeyi artırmadan titreşimi azaltır.
-const LIVE_TRACK_CURRENT_WEIGHT = 0.9;
+const LIVE_TRACK_CURRENT_WEIGHT = 0.8;
 
-// Bir tur kaçırılan parmak kutusunu kısa süre ekranda tutar.
-const LIVE_TRACK_MAX_MISSED_UPDATES = 1;
+// Anlık kaçırılan kutuyu iki model güncellemesi koruyup eski konumun iz bırakmasını sınırlar.
+const LIVE_TRACK_MAX_MISSED_UPDATES = 2;
 
 // Güncel model sonuçlarını sınıf kimliğiyle önceki kutulara bağlar.
 function updateLiveDetectionTracks(
@@ -254,6 +253,40 @@ async function tryDetectFingertips(imageUri: string) {
   }
 }
 
+// ROI çıkarma hatası fotoğraf kaydını iptal etmesin diye çoklu parmak kırpmayı güvenli çalıştırır.
+async function tryExtractFingerRois({
+  imageUri,
+  imageSize,
+  detections,
+  sampleId,
+}: {
+  imageUri: string;
+  imageSize: NonNullable<CaptureSample['rawImageSize']>;
+  detections: DetectedObbBox[];
+  sampleId: string;
+}) {
+  try {
+    return await extractFingerRoisFromImage({ imageUri, imageSize, detections, sampleId });
+  } catch (error) {
+    console.warn('Parmak ROI görselleri çıkarılamadı.', error);
+    return [];
+  }
+}
+
+// VisionCamera'nın EXIF yönü taşıyan çıktısını model ve çizim için tek, bake edilmiş JPEG boyutuna indirger.
+async function normalizeCapturedPhotoForModel(imageUri: string) {
+  const normalized = await manipulateAsync(imageUri, [], {
+    compress: 1,
+    format: SaveFormat.JPEG,
+  });
+
+  return {
+    uri: normalized.uri,
+    width: normalized.width,
+    height: normalized.height,
+  };
+}
+
 export default function CameraScreen() {
   const cameraRef = useRef<VisionCameraRef>(null);
   const permissionRequestedRef = useRef(false);
@@ -263,7 +296,8 @@ export default function CameraScreen() {
   const liveDetectionTracksRef = useRef(
     new Map<DetectedObbBox['className'], LiveDetectionTrack>()
   );
-  const [captureMode, setCaptureMode] = useState<CaptureMode>('photo');
+  const liveInferenceBusy = useMemo(() => createSynchronizable(false), []);
+  const liveFrameFailed = useMemo(() => createSynchronizable(false), []);
   const [isScreenFocused, setIsScreenFocused] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
@@ -273,7 +307,6 @@ export default function CameraScreen() {
   const [feedback, setFeedback] = useState('');
   const { hasPermission, requestPermission } = useCameraPermission();
   const photoOutput = usePhotoOutput({ quality: 0.95, qualityPrioritization: 'speed' });
-  const isRealtimeMode = captureMode === 'realtime';
   const canUseCamera = hasPermission && isScreenFocused;
 
   // Kısa durum mesajını gösterip başarılı işlemlerde otomatik olarak temizler.
@@ -290,35 +323,43 @@ export default function CameraScreen() {
 
   // Worklet'ten gelen mobil boyutlu görüntüyü ONNX modelinde tek sefer çalıştırır.
   const processLiveModelFrame = useCallback(
-    (
-      buffer: ArrayBuffer,
+    async (
+      rawBuffer: ArrayBuffer,
       width: number,
       height: number,
-      pixelFormat: ModelPixelFormat,
       sourceWidth: number,
       sourceHeight: number
     ) => {
       if (liveDetectionBusyRef.current || liveDetectionPausedRef.current) {
+        liveInferenceBusy.setBlocking(false);
         return;
       }
 
       liveDetectionBusyRef.current = true;
-      detectFingertipObbBoxesFromRawPixels(buffer, width, height, pixelFormat)
-        .then((detections) => {
-          const nextTracks = updateLiveDetectionTracks(liveDetectionTracksRef.current, detections);
-          liveDetectionTracksRef.current = nextTracks;
-          setLiveDetections([...nextTracks.values()].map((track) => track.detection));
-          setLiveDetectionFrame({ width: sourceWidth, height: sourceHeight });
-        })
-        .catch((error) => {
-          liveDetectionPausedRef.current = true;
-          console.warn('Canlı parmak ucu modeli çalıştırılamadı.', error);
-        })
-        .finally(() => {
-          liveDetectionBusyRef.current = false;
-        });
+
+      try {
+        // Android cihaz testinde doğru sonuç veren ham kanal sırası RGBA olarak doğrulandı.
+        const detections = await detectFingertipObbBoxesFromRawPixels(
+          rawBuffer,
+          width,
+          height,
+          'RGBA'
+        );
+
+        const nextTracks = updateLiveDetectionTracks(liveDetectionTracksRef.current, detections);
+        const trackedDetections = [...nextTracks.values()].map((track) => track.detection);
+        liveDetectionTracksRef.current = nextTracks;
+        setLiveDetections(trackedDetections);
+        setLiveDetectionFrame({ width: sourceWidth, height: sourceHeight });
+      } catch (error) {
+        liveDetectionPausedRef.current = true;
+        console.warn('Canlı parmak ucu modeli çalıştırılamadı.', error);
+      } finally {
+        liveDetectionBusyRef.current = false;
+        liveInferenceBusy.setBlocking(false);
+      }
     },
-    []
+    [liveInferenceBusy]
   );
 
   // Frame dönüşüm hatasında canlı modeli durdurup tekrar eden uyarıları engeller.
@@ -329,54 +370,70 @@ export default function CameraScreen() {
 
   const frameOutput = useFrameOutput({
     targetResolution: LIVE_FRAME_RESOLUTION,
-    pixelFormat: 'yuv',
+    // Model RGB beklediği için renk dönüşümünü kamera hattında tutarlı biçimde yaptırır.
+    pixelFormat: 'rgb',
     dropFramesWhileBusy: true,
     enablePreviewSizedOutputBuffers: true,
     enablePhysicalBufferRotation: true,
     onFrame(frame) {
       'worklet';
 
-      // Canlı takip sayacını ve kalıcı dönüşüm hatasını worklet tarafında saklar.
+      // Canlı takip için yalnızca her altıncı kamera frame'ini inference adayı yapar.
       const globalFrameState = globalThis as typeof globalThis & {
         __fingerFrameCounter?: number;
-        __fingerLiveFrameFailed?: boolean;
       };
       const nextCount = (globalFrameState.__fingerFrameCounter ?? 0) + 1;
       globalFrameState.__fingerFrameCounter = nextCount;
+      const isInferenceFrame = nextCount % LIVE_MODEL_FRAME_INTERVAL === 0;
+
+      // Model çalışırken yeni frame'i JPEG'e dönüştürmeden doğrudan kamera tamponunu serbest bırakır.
+      if (!isInferenceFrame || liveFrameFailed.getBlocking()) {
+        frame.dispose();
+        return;
+      }
+
+      if (liveInferenceBusy.getBlocking()) {
+        frame.dispose();
+        return;
+      }
+
+      liveInferenceBusy.setBlocking(true);
 
       try {
-        // Belirlenen aralıktaki frame'i model boyutuna getirip JavaScript tarafına yollar.
-        if (nextCount % LIVE_MODEL_FRAME_INTERVAL === 0 && !globalFrameState.__fingerLiveFrameFailed) {
-          const sourceWidth = frame.width;
-          const sourceHeight = frame.height;
-          const image = HybridFrameConverter.convertFrameToImage(frame);
+        const sourceWidth = frame.width;
+        const sourceHeight = frame.height;
+        const image = HybridFrameConverter.convertFrameToImage(frame);
+
+        try {
+          const resizedImage = image.resize(FINGERTIP_MODEL_SIZE, FINGERTIP_MODEL_SIZE);
 
           try {
-            const resizedImage = image.resize(FINGERTIP_MODEL_SIZE, FINGERTIP_MODEL_SIZE);
+            // Native ham tamponu görüntü serbest bırakılmadan önce bağımsız JavaScript belleğine kopyalar.
+            const rawPixels = resizedImage.toRawPixelData();
+            const sourcePixels = new Uint8Array(rawPixels.buffer);
+            const copiedPixels = new Uint8Array(sourcePixels.length);
+            copiedPixels.set(sourcePixels);
 
-            try {
-              const rawPixels = resizedImage.toRawPixelData();
-              scheduleOnRN(
-                processLiveModelFrame,
-                rawPixels.buffer,
-                rawPixels.width,
-                rawPixels.height,
-                rawPixels.pixelFormat as ModelPixelFormat,
-                sourceWidth,
-                sourceHeight
-              );
-            } finally {
-              resizedImage.dispose();
-            }
+            scheduleOnRN(
+              processLiveModelFrame,
+              copiedPixels.buffer,
+              FINGERTIP_MODEL_SIZE,
+              FINGERTIP_MODEL_SIZE,
+              sourceWidth,
+              sourceHeight
+            );
           } finally {
-            image.dispose();
+            resizedImage.dispose();
           }
+        } finally {
+          image.dispose();
         }
       } catch (error) {
-        globalFrameState.__fingerLiveFrameFailed = true;
+        liveFrameFailed.setBlocking(true);
+        liveInferenceBusy.setBlocking(false);
         scheduleOnRN(reportLiveFrameError, String(error));
       } finally {
-        // GPU tampon havuzunun dolmaması için her frame'i mutlaka serbest bırakır.
+        // GPU tampon havuzunun dolmaması için seçilen inference frame'ini her durumda serbest bırakır.
         frame.dispose();
       }
     },
@@ -415,6 +472,15 @@ export default function CameraScreen() {
     };
   }, [showFeedback]);
 
+  // Kamera sekmesi açık ve model hazır olduğunda canlı kutu tespitini otomatik çalıştırır.
+  useEffect(() => {
+    liveDetectionPausedRef.current = modelStatus !== 'ready' || !isScreenFocused;
+    if (modelStatus === 'ready' && isScreenFocused) {
+      liveFrameFailed.setBlocking(false);
+      liveInferenceBusy.setBlocking(false);
+    }
+  }, [isScreenFocused, liveFrameFailed, liveInferenceBusy, modelStatus]);
+
   // Kamera sekmesi görünürken kamerayı çalıştırır, sekmeden çıkınca kaynağı serbest bırakır.
   useFocusEffect(
     useCallback(() => {
@@ -438,17 +504,6 @@ export default function CameraScreen() {
     };
   }, []);
 
-  // Fotoğraf ve canlı takip modları arasında geçiş yapıp eski takip kutularını temizler.
-  function handleModeChange() {
-    const nextMode: CaptureMode = captureMode === 'photo' ? 'realtime' : 'photo';
-    liveDetectionPausedRef.current = nextMode === 'photo';
-    liveDetectionTracksRef.current.clear();
-    setLiveDetections([]);
-    setLiveDetectionFrame(null);
-    setCaptureMode(nextMode);
-    setFeedback('');
-  }
-
   // Kameradan tam el karesi alır, modeli çalıştırır ve kutu verileriyle yerel kayda ekler.
   async function handleTakePhoto() {
     if (!canUseCamera || !isCameraReady || isTakingPhoto) return;
@@ -471,18 +526,23 @@ export default function CameraScreen() {
         {}
       );
       const picturePath = await photo.saveToTemporaryFileAsync();
-      const capturedImage = {
-        uri: `file://${picturePath}`,
-        width: photo.width,
-        height: photo.height,
-      };
+      const capturedImage = await normalizeCapturedPhotoForModel(`file://${picturePath}`);
       photo.dispose();
 
       const sampleId = createId('sample');
       const rawImageUri = await saveRawImage(capturedImage.uri, sampleId);
       const detections = await tryDetectFingertips(rawImageUri);
+      const fingerRois = await tryExtractFingerRois({
+        imageUri: rawImageUri,
+        imageSize: {
+          width: capturedImage.width,
+          height: capturedImage.height,
+        },
+        detections,
+        sampleId,
+      });
 
-      // Kayıt ekranı, saklanan normalize kutuları ham görselin üzerinde yeniden çizer.
+      // Kayıt ekranı kutuları metadata'dan çizer; ROI dosyaları ileride enrollment için hazır tutulur.
       const sample: CaptureSample = {
         id: sampleId,
         createdAt: new Date().toISOString(),
@@ -492,6 +552,7 @@ export default function CameraScreen() {
           height: capturedImage.height,
         },
         detections,
+        fingerRois,
         deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
         fingerLabel: 'unknown',
         sessionId: createId('session'),
@@ -555,23 +616,13 @@ export default function CameraScreen() {
         </View>
       )}
 
-      {isRealtimeMode && (
-        <LiveDetectionOverlay detections={liveDetections} imageSize={liveDetectionFrame} />
-      )}
+      <LiveDetectionOverlay detections={liveDetections} imageSize={liveDetectionFrame} />
 
       <SafeAreaView pointerEvents="box-none" style={styles.controls}>
         <View style={styles.topControl}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={
-              isRealtimeMode ? 'Fotoğraf moduna geç' : 'Canlı takip moduna geç'
-            }
-            hitSlop={16}
-            onPress={handleModeChange}>
-            <ThemedText type="smallBold" style={styles.modeText}>
-              {isRealtimeMode ? 'Fotoğraf modu' : 'Canlı takip'}
-            </ThemedText>
-          </Pressable>
+          <ThemedText type="smallBold" style={styles.modeText}>
+            Canlı takip
+          </ThemedText>
         </View>
 
         <View style={styles.bottomControl}>
@@ -581,18 +632,16 @@ export default function CameraScreen() {
             </ThemedText>
           ) : null}
 
-          {!isRealtimeMode && (
-            <Pressable
-              accessibilityLabel="Fotoğraf çek"
-              style={[
-                styles.shutterButton,
-                (!isCameraReady || isTakingPhoto) && styles.disabledButton,
-              ]}
-              disabled={!isCameraReady || isTakingPhoto}
-              onPress={handleTakePhoto}>
-              <View style={styles.shutterInner} />
-            </Pressable>
-          )}
+          <Pressable
+            accessibilityLabel="Fotoğraf çek"
+            style={[
+              styles.shutterButton,
+              (!isCameraReady || isTakingPhoto) && styles.disabledButton,
+            ]}
+            disabled={!isCameraReady || isTakingPhoto}
+            onPress={handleTakePhoto}>
+            <View style={styles.shutterInner} />
+          </Pressable>
         </View>
       </SafeAreaView>
     </View>

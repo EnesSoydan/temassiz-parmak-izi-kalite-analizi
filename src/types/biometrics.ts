@@ -37,6 +37,27 @@ export type DetectedObbBox = {
   }[];
 };
 
+// Model kutusundan çıkarılan tek parmak ROI'sinin dosya ve koordinat bilgisini taşır.
+export type FingerRoi = {
+  id: string;
+  detectionId: string;
+  className: DetectionClassName;
+  confidence: number;
+  imageUri?: string;
+  crop: {
+    originX: number;
+    originY: number;
+    width: number;
+    height: number;
+    normalized: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+  };
+};
+
 // Tek bir kamera yakalamasının ham görsel, ROI ve kalite metadata'sını taşır.
 export type CaptureSample = {
   id: string;
@@ -57,6 +78,7 @@ export type CaptureSample = {
   qualityMetrics?: QualityMetrics;
   processedQualityMetrics?: QualityMetrics;
   detections?: DetectedObbBox[];
+  fingerRois?: FingerRoi[];
   deviceModel?: string;
   fingerLabel: FingerLabel;
   sessionId: string;

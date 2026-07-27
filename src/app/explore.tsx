@@ -18,11 +18,32 @@ import {
   saveRawImage,
 } from '@/lib/capture-storage';
 import { detectFingertipObbBoxes } from '@/lib/fingertip-detection';
-import type { CaptureSample } from '@/types/biometrics';
+import { extractFingerRoisFromImage } from '@/lib/fingertip-roi';
+import type { CaptureSample, DetectedObbBox } from '@/types/biometrics';
 
 // Galeriden eklenen kayıtlar için kısa ve çakışma ihtimali düşük kimlik üretir.
 function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Galeri testinde ROI çıkarma hatası olursa ana kayıt ve kutu metadata'sı yine korunur.
+async function tryExtractFingerRois({
+  imageUri,
+  imageSize,
+  detections,
+  sampleId,
+}: {
+  imageUri: string;
+  imageSize: NonNullable<CaptureSample['rawImageSize']>;
+  detections: DetectedObbBox[];
+  sampleId: string;
+}) {
+  try {
+    return await extractFingerRoisFromImage({ imageUri, imageSize, detections, sampleId });
+  } catch (error) {
+    console.warn('Galeri görselinden parmak ROI çıkarılamadı.', error);
+    return [];
+  }
 }
 
 export default function RecordsScreen() {
@@ -106,8 +127,17 @@ export default function RecordsScreen() {
       const sampleId = createId('gallery');
       const rawImageUri = await saveRawImage(asset.uri, sampleId);
       const detections = await detectFingertipObbBoxes(rawImageUri);
+      const fingerRois = await tryExtractFingerRois({
+        imageUri: rawImageUri,
+        imageSize: {
+          width: asset.width,
+          height: asset.height,
+        },
+        detections,
+        sampleId,
+      });
 
-      // Model kutularını ham görselden ayrı metadata olarak saklar, ekranda üst üste çizer.
+      // Model kutularını ve ROI dosyalarını ham görselden ayrı metadata olarak saklar.
       const sample: CaptureSample = {
         id: sampleId,
         createdAt: new Date().toISOString(),
@@ -117,6 +147,7 @@ export default function RecordsScreen() {
           height: asset.height,
         },
         detections,
+        fingerRois,
         deviceModel: `${Device.modelName ?? 'Bilinmeyen cihaz'} · Galeri`,
         fingerLabel: 'unknown',
         sessionId: createId('gallery-session'),

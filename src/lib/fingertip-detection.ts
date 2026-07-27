@@ -4,10 +4,11 @@ import { decode } from 'jpeg-js';
 import { getFingertipObbRuntime } from '@/lib/onnx-model';
 import type { DetectedObbBox, DetectionClassName } from '@/types/biometrics';
 
-export const FINGERTIP_MODEL_SIZE = 320;
+export const FINGERTIP_MODEL_SIZE = 480;
 const FOUR_CLASS_OUTPUT_CHANNELS = 9;
 const FIVE_CLASS_OUTPUT_CHANNELS = 10;
-const DETECTION_THRESHOLD = 0.3;
+const PHOTO_DETECTION_THRESHOLD = 0.3;
+const LIVE_DETECTION_THRESHOLD = 0.2;
 const NMS_IOU_THRESHOLD = 0.45;
 const MAX_DETECTIONS = 30;
 const MIN_INNER_FINGER_PROJECTION_GAP = 0.15;
@@ -65,19 +66,9 @@ async function createModelInputTensor(imageUri: string): Promise<TensorImage> {
   }
 
   const image = decode(base64ToBytes(resized.base64), { useTArray: true });
-  const pixelCount = image.width * image.height;
-  const tensorData = new Float32Array(3 * pixelCount);
-
-  // ONNX modeli CHW formatında float RGB bekler: önce tüm kırmızılar, sonra yeşiller, sonra maviler.
-  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
-    const sourceIndex = pixel * 4;
-    tensorData[pixel] = (image.data[sourceIndex] ?? 0) / 255;
-    tensorData[pixelCount + pixel] = (image.data[sourceIndex + 1] ?? 0) / 255;
-    tensorData[pixelCount * 2 + pixel] = (image.data[sourceIndex + 2] ?? 0) / 255;
-  }
 
   return {
-    tensorData,
+    tensorData: createTensorFromRgbaPixels(image.data, image.width, image.height),
     width: image.width,
     height: image.height,
   };
@@ -86,7 +77,7 @@ async function createModelInputTensor(imageUri: string): Promise<TensorImage> {
 // Fotoğrafı ONNX Runtime'a gönderir ve model çıktısını çizilebilir OBB kutularına dönüştürür.
 export async function detectFingertipObbBoxes(imageUri: string): Promise<DetectedObbBox[]> {
   const tensorImage = await createModelInputTensor(imageUri);
-  return runFingertipModel(tensorImage.tensorData);
+  return runFingertipModel(tensorImage.tensorData, PHOTO_DETECTION_THRESHOLD);
 }
 
 // Canlı kameradan gelen kare ham RGB piksel verisini dosya oluşturmadan ONNX modeline gönderir.
@@ -103,11 +94,28 @@ export async function detectFingertipObbBoxesFromRawPixels(
   }
 
   const tensorData = createTensorFromRawPixels(buffer, width, height, pixelFormat);
-  return runFingertipModel(tensorData);
+  return runFingertipModel(tensorData, LIVE_DETECTION_THRESHOLD);
+}
+
+// Canlı frame'in JPEG verisini fotoğrafla aynı RGBA çözümleme yolundan geçirerek modele gönderir.
+export async function detectFingertipObbBoxesFromEncodedJpeg(
+  buffer: ArrayBuffer,
+  width: number,
+  height: number
+): Promise<DetectedObbBox[]> {
+  if (width !== FINGERTIP_MODEL_SIZE || height !== FINGERTIP_MODEL_SIZE) {
+    throw new Error(
+      `Canlı JPEG girdisi ${FINGERTIP_MODEL_SIZE}x${FINGERTIP_MODEL_SIZE} olmalı; ${width}x${height} geldi.`
+    );
+  }
+
+  const image = decode(new Uint8Array(buffer), { useTArray: true });
+  const tensorData = createTensorFromRgbaPixels(image.data, image.width, image.height);
+  return runFingertipModel(tensorData, LIVE_DETECTION_THRESHOLD);
 }
 
 // Hazırlanmış CHW tensor verisini mevcut ONNX oturumunda çalıştırıp OBB sonuçlarını döndürür.
-async function runFingertipModel(tensorData: Float32Array) {
+async function runFingertipModel(tensorData: Float32Array, detectionThreshold: number) {
   const { ort, session } = await getFingertipObbRuntime();
   const inputTensor = new ort.Tensor('float32', tensorData, [
     1,
@@ -132,7 +140,26 @@ async function runFingertipModel(tensorData: Float32Array) {
     throw new Error(`Desteklenmeyen ONNX çıktı şekli: ${outputTensor.dims.join('x')}.`);
   }
 
-  return parseObbOutput(outputTensor.data, outputChannels);
+  return parseObbOutput(outputTensor.data, outputChannels, detectionThreshold);
+}
+
+// JPEG çözücünün ürettiği RGBA piksellerini modelin beklediği normalize CHW RGB dizisine çevirir.
+function createTensorFromRgbaPixels(
+  pixels: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number
+) {
+  const pixelCount = width * height;
+  const tensorData = new Float32Array(pixelCount * 3);
+
+  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
+    const sourceIndex = pixel * 4;
+    tensorData[pixel] = (pixels[sourceIndex] ?? 0) / 255;
+    tensorData[pixelCount + pixel] = (pixels[sourceIndex + 1] ?? 0) / 255;
+    tensorData[pixelCount * 2 + pixel] = (pixels[sourceIndex + 2] ?? 0) / 255;
+  }
+
+  return tensorData;
 }
 
 // Nitro Image piksel sırasını okuyup modelin beklediği normalize CHW RGB dizisine dönüştürür.
@@ -193,7 +220,11 @@ function getPixelChannelLayout(pixelFormat: ModelPixelFormat) {
 }
 
 // YOLO OBB ham çıktısını modelin sınıf sayısına göre normalize köşe noktalarına çevirir.
-function parseObbOutput(output: Float32Array, outputChannels: number): DetectedObbBox[] {
+function parseObbOutput(
+  output: Float32Array,
+  outputChannels: number,
+  detectionThreshold: number
+): DetectedObbBox[] {
   const anchorCount = Math.floor(output.length / outputChannels);
   const modelClassCount = outputChannels - 5;
   const candidates: RawObbCandidate[] = [];
@@ -207,7 +238,7 @@ function parseObbOutput(output: Float32Array, outputChannels: number): DetectedO
     const angle = output[anchorCount * (4 + modelClassCount) + anchor] ?? 0;
 
     // Beş sınıflı eski modeldeki hand sınıfını kutu ve sayaç sonuçlarına dahil etmeyiz.
-    if (classResult.isHand || classResult.confidence < DETECTION_THRESHOLD) {
+    if (classResult.isHand || classResult.confidence < detectionThreshold) {
       continue;
     }
 
@@ -328,9 +359,9 @@ function applyNms(candidates: RawObbCandidate[]) {
   return selected;
 }
 
-// Aynı bölgeye düşen parmak adaylarını sınıf ayırmadan NMS içinde karşılaştırır.
+// Farklı parmak sınıflarının yakın durdukları için birbirini NMS ile silmesini engeller.
 function canSuppressEachOther(first: RawObbCandidate, second: RawObbCandidate) {
-  return true;
+  return first.className === second.className;
 }
 
 // Güvenilir işaret-serçe ekseninde en iyi iki iç parmak adayını orta ve yüzük olarak birlikte atar.
@@ -362,9 +393,7 @@ function correctMiddleAndRingLabels(candidates: RawObbCandidate[]) {
     .sort((first, second) => first.projection - second.projection);
 
   if (innerCandidates.length === 0) {
-    return candidates.filter(
-      (candidate) => candidate.className !== 'middle' && candidate.className !== 'ring'
-    );
+    return candidates;
   }
 
   const selectedPair = findBestInnerFingerPair(innerCandidates);
