@@ -1,4 +1,5 @@
 import * as Device from 'expo-device';
+import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useState } from 'react';
@@ -19,11 +20,24 @@ import {
 } from '@/lib/capture-storage';
 import { detectFingertipObbBoxes } from '@/lib/fingertip-detection';
 import { extractFingerRoisFromImage } from '@/lib/fingertip-roi';
-import type { CaptureSample, DetectedObbBox } from '@/types/biometrics';
+import {
+  formatFingerprintQualityStatus,
+  getCaptureQualityStatus,
+} from '@/lib/fingerprint-quality';
+import type { CaptureSample, DetectedObbBox, FingerRoi } from '@/types/biometrics';
 
 // Galeriden eklenen kayıtlar için kısa ve çakışma ihtimali düşük kimlik üretir.
 function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Parmak sınıf adlarını ROI önizlemelerinde kısa Türkçe etiketlere çevirir.
+function formatFingerRoiClass(className: FingerRoi['className']) {
+  if (className === 'index') return 'işaret';
+  if (className === 'middle') return 'orta';
+  if (className === 'pinky') return 'serçe';
+  if (className === 'ring') return 'yüzük';
+  return 'parmak';
 }
 
 // Galeri testinde ROI çıkarma hatası olursa ana kayıt ve kutu metadata'sı yine korunur.
@@ -151,7 +165,7 @@ export default function RecordsScreen() {
         deviceModel: `${Device.modelName ?? 'Bilinmeyen cihaz'} · Galeri`,
         fingerLabel: 'unknown',
         sessionId: createId('gallery-session'),
-        qualityStatus: 'unknown',
+        qualityStatus: getCaptureQualityStatus(fingerRois),
         accepted: false,
       };
 
@@ -212,6 +226,64 @@ export default function RecordsScreen() {
                 imageSize={sample.rawImageSize}
                 detections={sample.detections}
               />
+
+              {sample.fingerRois?.length ? (
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={styles.roiStrip}>
+                  {sample.fingerRois
+                    .filter((fingerRoi) => fingerRoi.imageUri)
+                    .map((fingerRoi) => (
+                      <View key={fingerRoi.id} style={styles.roiPreview}>
+                        <View style={styles.roiImagePair}>
+                          <View style={styles.roiImageColumn}>
+                            <Image
+                              source={{ uri: fingerRoi.imageUri }}
+                              style={styles.roiImage}
+                              contentFit="cover"
+                            />
+                            <ThemedText type="small" style={styles.roiVariantLabel}>
+                              ROI
+                            </ThemedText>
+                          </View>
+
+                          <View style={styles.roiImageColumn}>
+                            {fingerRoi.segmentedImageUri ? (
+                              <Image
+                                source={{ uri: fingerRoi.segmentedImageUri }}
+                                style={[styles.roiImage, styles.segmentedRoiImage]}
+                                contentFit="cover"
+                              />
+                            ) : (
+                              <View style={[styles.roiImage, styles.emptySegmentImage]}>
+                                <ThemedText type="small" style={styles.emptySegmentText}>
+                                  Yok
+                                </ThemedText>
+                              </View>
+                            )}
+                            <ThemedText type="small" style={styles.roiVariantLabel}>
+                              Seg
+                            </ThemedText>
+                          </View>
+                        </View>
+                        <ThemedText type="small" style={styles.roiLabel}>
+                          {formatFingerRoiClass(fingerRoi.className)}
+                        </ThemedText>
+                        <ThemedText
+                          type="small"
+                          style={[
+                            styles.qualityLabel,
+                            fingerRoi.quality?.status === 'good' && styles.qualityGood,
+                            fingerRoi.quality?.status === 'medium' && styles.qualityMedium,
+                            fingerRoi.quality?.status === 'poor' && styles.qualityPoor,
+                          ]}>
+                          {formatFingerprintQualityStatus(fingerRoi.quality)}
+                        </ThemedText>
+                      </View>
+                    ))}
+                </ScrollView>
+              ) : null}
 
               <View style={styles.cardFooter}>
                 <ThemedText type="small" themeColor="textSecondary">
@@ -275,6 +347,68 @@ const styles = StyleSheet.create({
     gap: Spacing.two,
     borderRadius: 6,
     padding: Spacing.two,
+  },
+  roiStrip: {
+    gap: Spacing.two,
+    paddingRight: Spacing.two,
+  },
+  roiPreview: {
+    width: 112,
+    gap: Spacing.one,
+  },
+  roiImagePair: {
+    flexDirection: 'row',
+    gap: Spacing.one,
+  },
+  roiImageColumn: {
+    width: 52,
+    gap: Spacing.half,
+  },
+  roiImage: {
+    width: 52,
+    height: 72,
+    overflow: 'hidden',
+    borderRadius: 6,
+    backgroundColor: '#000000',
+  },
+  emptySegmentImage: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(127, 127, 127, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(127, 127, 127, 0.45)',
+    borderStyle: 'dashed',
+  },
+  segmentedRoiImage: {
+    borderWidth: 1,
+    borderColor: '#2FD16B',
+  },
+  emptySegmentText: {
+    color: '#9CA3AF',
+    fontSize: 10,
+    lineHeight: 12,
+  },
+  roiVariantLabel: {
+    textAlign: 'center',
+    fontSize: 10,
+    lineHeight: 12,
+  },
+  roiLabel: {
+    textAlign: 'center',
+  },
+  qualityLabel: {
+    textAlign: 'center',
+    fontSize: 10,
+    lineHeight: 12,
+  },
+  qualityGood: {
+    color: '#2FD16B',
+  },
+  qualityMedium: {
+    color: '#F5B844',
+  },
+  qualityPoor: {
+    color: '#E5484D',
   },
   cardFooter: {
     minHeight: 36,

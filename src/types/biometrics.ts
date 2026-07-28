@@ -13,6 +13,18 @@ export type QualityMetrics = {
   status: QualityStatus;
 };
 
+// Her parmak ROI'si için cihaz üzerinde hesaplanan ayrıntılı kalite sonucunu taşır.
+export type FingerprintQuality = {
+  globalScore: number;
+  blurScore: number;
+  contrastScore: number;
+  brightnessScore: number;
+  foregroundCoverage: number;
+  textureVisibility: number;
+  status: 'good' | 'medium' | 'poor';
+  message: string;
+};
+
 // OBB modelinin desteklediği parmak ucu sınıf adları.
 export type DetectionClassName = 'index' | 'middle' | 'pinky' | 'ring' | 'unknown';
 
@@ -44,6 +56,16 @@ export type FingerRoi = {
   className: DetectionClassName;
   confidence: number;
   imageUri?: string;
+  segmentedImageUri?: string;
+  quality?: FingerprintQuality;
+  maskPolygon?: {
+    x: number;
+    y: number;
+  }[];
+  normalizedMaskPolygon?: {
+    x: number;
+    y: number;
+  }[];
   crop: {
     originX: number;
     originY: number;

@@ -24,6 +24,10 @@ import {
   FINGERTIP_MODEL_SIZE,
 } from '@/lib/fingertip-detection';
 import { extractFingerRoisFromImage } from '@/lib/fingertip-roi';
+import {
+  createCaptureQualityFeedback,
+  getCaptureQualityStatus,
+} from '@/lib/fingerprint-quality';
 import { loadFingertipObbSession } from '@/lib/onnx-model';
 import type { CaptureSample, DetectedObbBox } from '@/types/biometrics';
 
@@ -56,6 +60,9 @@ const LIVE_TRACK_CURRENT_WEIGHT = 0.8;
 
 // Anlık kaçırılan kutuyu iki model güncellemesi koruyup eski konumun iz bırakmasını sınırlar.
 const LIVE_TRACK_MAX_MISSED_UPDATES = 2;
+
+// Deklanşörden hemen önce kamera odağının oturması için kısa bir bekleme kullanılır.
+const PRE_CAPTURE_FOCUS_DELAY_MS = 350;
 
 // Güncel model sonuçlarını sınıf kimliğiyle önceki kutulara bağlar.
 function updateLiveDetectionTracks(
@@ -197,6 +204,42 @@ function getAxisAlignedScreenBox(
   };
 }
 
+// Canlı kutuların ağırlıklı ortak merkezini kamera önizlemesi üzerinde odak noktasına çevirir.
+function getLiveFocusPoint({
+  detections,
+  imageSize,
+  layout,
+}: {
+  detections: DetectedObbBox[];
+  imageSize: LiveDetectionFrame | null;
+  layout: { width: number; height: number };
+}) {
+  if (layout.width <= 0 || layout.height <= 0 || detections.length === 0) {
+    return {
+      x: layout.width / 2,
+      y: layout.height / 2,
+    };
+  }
+
+  const imageFrame = getCoveredImageFrame(layout, imageSize);
+  const totalWeight = detections.reduce((total, detection) => total + detection.confidence, 0);
+  const normalizedCenter = detections.reduce(
+    (center, detection) => {
+      const weight = detection.confidence / Math.max(totalWeight, 0.001);
+      return {
+        x: center.x + detection.center.x * weight,
+        y: center.y + detection.center.y * weight,
+      };
+    },
+    { x: 0, y: 0 }
+  );
+
+  return {
+    x: clamp(normalizedCenter.x * imageFrame.width + imageFrame.x, 0, layout.width),
+    y: clamp(normalizedCenter.y * imageFrame.height + imageFrame.y, 0, layout.height),
+  };
+}
+
 // resizeMode="cover" ile taşan kamera görüntüsünün gerçek çizim alanını hesaplar.
 function getCoveredImageFrame(
   layout: { width: number; height: number },
@@ -241,6 +284,16 @@ function formatDetectionClass(className: DetectedObbBox['className']) {
 // Yerel capture kayıtları için kısa ve çakışma ihtimali düşük kimlik üretir.
 function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Kısa kamera işlemlerinde akışı bloklamadan beklemek için kullanılır.
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Sayıyı güvenli şekilde verilen aralıkta tutar.
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 // Model hatasının fotoğraf dosyasının kaydedilmesini engellememesi için inference'ı güvenli çalıştırır.
@@ -306,8 +359,9 @@ export default function CameraScreen() {
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [feedback, setFeedback] = useState('');
   const { hasPermission, requestPermission } = useCameraPermission();
-  const photoOutput = usePhotoOutput({ quality: 0.95, qualityPrioritization: 'speed' });
+  const photoOutput = usePhotoOutput({ quality: 1, qualityPrioritization: 'quality' });
   const canUseCamera = hasPermission && isScreenFocused;
+  const [cameraLayout, setCameraLayout] = useState({ width: 0, height: 0 });
 
   // Kısa durum mesajını gösterip başarılı işlemlerde otomatik olarak temizler.
   const showFeedback = useCallback((message: string, autoClear = true) => {
@@ -521,6 +575,8 @@ export default function CameraScreen() {
     showFeedback('Fotoğraf işleniyor...', false);
 
     try {
+      await focusCameraBeforeCapture();
+
       const photo = await photoOutput.capturePhoto(
         { flashMode: 'off', enableShutterSound: false },
         {}
@@ -556,21 +612,47 @@ export default function CameraScreen() {
         deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
         fingerLabel: 'unknown',
         sessionId: createId('session'),
-        qualityStatus: 'unknown',
+        qualityStatus: getCaptureQualityStatus(fingerRois),
         accepted: false,
       };
 
       await appendCaptureSample(sample);
       showFeedback(
-        detections.length > 0
-          ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
-          : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
+        fingerRois.length > 0
+          ? createCaptureQualityFeedback(fingerRois)
+          : detections.length > 0
+            ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
+            : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
       );
     } catch (error) {
       console.warn('Fotoğraf kaydedilemedi.', error);
       showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
       setIsTakingPhoto(false);
+    }
+  }
+
+  // Deklanşör öncesinde canlı kutuların merkezine odak/pozlama ölçümü yaparak ROI netliğini artırır.
+  async function focusCameraBeforeCapture() {
+    const camera = cameraRef.current;
+    if (!camera || cameraLayout.width <= 0 || cameraLayout.height <= 0) return;
+
+    try {
+      const point = getLiveFocusPoint({
+        detections: liveDetections,
+        imageSize: liveDetectionFrame,
+        layout: cameraLayout,
+      });
+
+      await camera.focusTo(point, {
+        responsiveness: 'snappy',
+        adaptiveness: 'locked',
+        modes: ['AE', 'AF', 'AWB'],
+        autoResetAfter: 1.5,
+      });
+      await sleep(PRE_CAPTURE_FOCUS_DELAY_MS);
+    } catch (error) {
+      console.warn('Çekim öncesi kamera odağı uygulanamadı.', error);
     }
   }
 
@@ -583,7 +665,14 @@ export default function CameraScreen() {
   }
 
   return (
-    <View style={styles.container}>
+    <View
+      style={styles.container}
+      onLayout={(event) =>
+        setCameraLayout({
+          width: event.nativeEvent.layout.width,
+          height: event.nativeEvent.layout.height,
+        })
+      }>
       {hasPermission ? (
         <VisionCamera
           ref={cameraRef}

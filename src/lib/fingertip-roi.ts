@@ -1,16 +1,17 @@
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 
-import { saveFingerRoiImage } from '@/lib/capture-storage';
+import {
+  createSegmentedFingerRoiImageUri,
+  saveFingerRoiImage,
+} from '@/lib/capture-storage';
+import { segmentFingerRoiImage } from '@/lib/finger-segmentation';
+import {
+  analyzeFingerprintQuality,
+  createSegmentationFailureQuality,
+} from '@/lib/fingerprint-quality';
 import type { CaptureSample, DetectedObbBox, FingerRoi } from '@/types/biometrics';
 
 type ImageSize = NonNullable<CaptureSample['rawImageSize']>;
-
-// Parmak ucu kutusunun çevresinde ridge bölgesini de içerecek güvenli yatay payı belirler.
-const ROI_HORIZONTAL_PADDING_RATIO = 0.75;
-
-// Kutunun üst tarafında az, alt tarafında daha fazla alan bırakarak parmak yüzeyini korur.
-const ROI_TOP_PADDING_RATIO = 0.45;
-const ROI_BOTTOM_PADDING_RATIO = 1.2;
 
 // Çok küçük hatalı kırpmaların dosya üretmesini engelleyen minimum piksel boyutu.
 const MIN_ROI_PIXEL_SIZE = 16;
@@ -62,13 +63,55 @@ export async function extractFingerRoisFromImage({
 
     // Geçici ROI dosyasını uygulamanın kalıcı capture klasörüne taşınabilir isimle kopyalar.
     const savedImageUri = await saveFingerRoiImage(cropped.uri, sampleId, roiPlan.className);
-    fingerRois.push({ ...roiPlan, imageUri: savedImageUri });
+    const processedRoi = await tryProcessFingerRoi({
+      roiImageUri: savedImageUri,
+      sampleId,
+      className: roiPlan.className,
+      sourceWidth: cropped.width,
+    });
+
+    fingerRois.push({
+      ...roiPlan,
+      imageUri: savedImageUri,
+      segmentedImageUri: processedRoi.segmentedImageUri,
+      quality: processedRoi.quality,
+    });
   }
 
   return fingerRois;
 }
 
-// Tek tespitin OBB köşelerinden eksene hizalı, genişletilmiş ROI kırpma alanı hesaplar.
+// Segmentasyon başarısız olursa normal ROI kaydını bozmadan boş sonuç döndürür.
+async function tryProcessFingerRoi({
+  roiImageUri,
+  sampleId,
+  className,
+  sourceWidth,
+}: {
+  roiImageUri: string;
+  sampleId: string;
+  className: FingerRoi['className'];
+  sourceWidth: number;
+}) {
+  try {
+    const outputImageUri = await createSegmentedFingerRoiImageUri(sampleId, className);
+    const result = await segmentFingerRoiImage({ roiImageUri, outputImageUri, sourceWidth });
+
+    if (!result) {
+      return { quality: createSegmentationFailureQuality() };
+    }
+
+    return {
+      segmentedImageUri: result.imageUri,
+      quality: analyzeFingerprintQuality(result),
+    };
+  } catch (error) {
+    console.warn('Parmak ROI segmentasyonu uygulanamadı.', error);
+    return { quality: createSegmentationFailureQuality() };
+  }
+}
+
+// Tek tespitin OBB köşelerinden yalnızca model kutusunu çevreleyen ROI kırpma alanını hesaplar.
 function createFingerRoiPlan(
   detection: DetectedObbBox,
   imageSize: ImageSize
@@ -82,14 +125,11 @@ function createFingerRoiPlan(
     return null;
   }
 
-  const centerX = axisBox.left + boxWidth / 2;
-  const expandedWidth = boxWidth * (1 + ROI_HORIZONTAL_PADDING_RATIO * 2);
-  const expandedHeight = boxHeight * (1 + ROI_TOP_PADDING_RATIO + ROI_BOTTOM_PADDING_RATIO);
   const normalizedCrop = normalizeCrop({
-    x: centerX - expandedWidth / 2,
-    y: axisBox.top - boxHeight * ROI_TOP_PADDING_RATIO,
-    width: expandedWidth,
-    height: expandedHeight,
+    x: axisBox.left,
+    y: axisBox.top,
+    width: boxWidth,
+    height: boxHeight,
   });
   const pixelCrop = toPixelCrop(normalizedCrop, imageSize);
 
@@ -103,11 +143,37 @@ function createFingerRoiPlan(
     detectionId: detection.id,
     className: detection.className,
     confidence: detection.confidence,
+    maskPolygon: createCropRelativePolygon(detection, pixelCrop, imageSize),
+    normalizedMaskPolygon: createNormalizedCropRelativePolygon(detection, pixelCrop, imageSize),
     crop: {
       ...pixelCrop,
       normalized: normalizedCrop,
     },
   };
+}
+
+// OBB köşelerini kırpılmış ROI dosyasının kendi piksel koordinat sistemine taşır.
+function createCropRelativePolygon(
+  detection: DetectedObbBox,
+  crop: { originX: number; originY: number; width: number; height: number },
+  imageSize: ImageSize
+) {
+  return detection.points.map((point) => ({
+    x: point.x * imageSize.width - crop.originX,
+    y: point.y * imageSize.height - crop.originY,
+  }));
+}
+
+// OBB köşelerini kırpılmış ROI dosyasının 0-1 oranlı koordinat sistemine taşır.
+function createNormalizedCropRelativePolygon(
+  detection: DetectedObbBox,
+  crop: { originX: number; originY: number; width: number; height: number },
+  imageSize: ImageSize
+) {
+  return detection.points.map((point) => ({
+    x: clamp01((point.x * imageSize.width - crop.originX) / Math.max(crop.width, 1)),
+    y: clamp01((point.y * imageSize.height - crop.originY) / Math.max(crop.height, 1)),
+  }));
 }
 
 // Normalize OBB noktalarından kırpma hesabına uygun eksene hizalı çevre kutusunu çıkarır.

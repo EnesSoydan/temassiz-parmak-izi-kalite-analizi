@@ -6,6 +6,7 @@ import type { CaptureSample, DetectionClassName } from '@/types/biometrics';
 const ROOT_DIR = `${FileSystem.documentDirectory ?? ''}fingerprint-captures/`;
 const RAW_DIR = `${ROOT_DIR}raw/`;
 const ROI_DIR = `${ROOT_DIR}roi/`;
+const SEGMENTED_ROI_DIR = `${ROOT_DIR}segmented-roi/`;
 const PROCESSED_ROI_DIR = `${ROOT_DIR}processed-roi/`;
 const INDEX_FILE = `${ROOT_DIR}captures.json`;
 
@@ -14,6 +15,7 @@ export async function ensureCaptureStorage() {
   await ensureDirectory(ROOT_DIR);
   await ensureDirectory(RAW_DIR);
   await ensureDirectory(ROI_DIR);
+  await ensureDirectory(SEGMENTED_ROI_DIR);
   await ensureDirectory(PROCESSED_ROI_DIR);
 }
 
@@ -43,6 +45,15 @@ export async function saveFingerRoiImage(
   const targetUri = `${ROI_DIR}${sampleId}-${className}.jpg`;
   await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
   return targetUri;
+}
+
+// Segmentasyon çıktısının yazılacağı kalıcı dosya yolunu hazırlar.
+export async function createSegmentedFingerRoiImageUri(
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  return `${SEGMENTED_ROI_DIR}${sampleId}-${className}.jpg`;
 }
 
 // Ön işlemden geçmiş ROI JPEG base64 verisini ayrı dosya olarak yazar.
@@ -97,6 +108,11 @@ export async function deleteCaptureSample(sampleId: string) {
       sample.fingerRois.map(async (fingerRoi) => {
         if (fingerRoi.imageUri) {
           await deleteFileIfExists(fingerRoi.imageUri);
+        }
+
+        // Segmentasyonlu ROI varsa normal ROI ile birlikte temizleriz.
+        if (fingerRoi.segmentedImageUri) {
+          await deleteFileIfExists(fingerRoi.segmentedImageUri);
         }
       })
     );
