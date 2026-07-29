@@ -9,6 +9,7 @@ import {
   Camera as VisionCamera,
   HybridFrameConverter,
   type CameraRef as VisionCameraRef,
+  useCameraDevice,
   useCameraPermission,
   useFrameOutput,
   usePhotoOutput,
@@ -61,7 +62,16 @@ const LIVE_TRACK_CURRENT_WEIGHT = 0.8;
 // Anlık kaçırılan kutuyu iki model güncellemesi koruyup eski konumun iz bırakmasını sınırlar.
 const LIVE_TRACK_MAX_MISSED_UPDATES = 2;
 
-// Deklanşörden hemen önce kamera odağının oturması için kısa bir bekleme kullanılır.
+// Canlı kutu odağını kamerayı sürekli yeniden taramaya zorlamayacak aralıkta yeniler.
+const LIVE_FOCUS_MIN_INTERVAL_MS = 900;
+
+// Kutu grubu çok az hareket ettiğinde gereksiz odak çağrılarını sınırlar.
+const LIVE_FOCUS_MIN_POINT_DISTANCE = 24;
+
+// Sabit duran elde bile mesafe değişimini yakalamak için odağı belirli aralıkla tazeler.
+const LIVE_FOCUS_FORCE_REFRESH_MS = 1800;
+
+// Canlı odak zaten sürerken deklanşör kilidinin oturması için yalnızca kısa bir ek bekleme kullanılır.
 const PRE_CAPTURE_FOCUS_DELAY_MS = 350;
 
 // Güncel model sonuçlarını sınıf kimliğiyle önceki kutulara bağlar.
@@ -204,7 +214,7 @@ function getAxisAlignedScreenBox(
   };
 }
 
-// Canlı kutuların ağırlıklı ortak merkezini kamera önizlemesi üzerinde odak noktasına çevirir.
+// Canlı kutuların tamamını kapsayan alanın merkezini kamera önizlemesi üzerinde odak noktasına çevirir.
 function getLiveFocusPoint({
   detections,
   imageSize,
@@ -222,17 +232,13 @@ function getLiveFocusPoint({
   }
 
   const imageFrame = getCoveredImageFrame(layout, imageSize);
-  const totalWeight = detections.reduce((total, detection) => total + detection.confidence, 0);
-  const normalizedCenter = detections.reduce(
-    (center, detection) => {
-      const weight = detection.confidence / Math.max(totalWeight, 0.001);
-      return {
-        x: center.x + detection.center.x * weight,
-        y: center.y + detection.center.y * weight,
-      };
-    },
-    { x: 0, y: 0 }
-  );
+  const normalizedPoints = detections.flatMap((detection) => detection.points);
+  const xValues = normalizedPoints.map((point) => point.x);
+  const yValues = normalizedPoints.map((point) => point.y);
+  const normalizedCenter = {
+    x: (Math.min(...xValues) + Math.max(...xValues)) / 2,
+    y: (Math.min(...yValues) + Math.max(...yValues)) / 2,
+  };
 
   return {
     x: clamp(normalizedCenter.x * imageFrame.width + imageFrame.x, 0, layout.width),
@@ -286,9 +292,49 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// Fotoğraf işlem aşamalarını karşılaştırmak için duvar saati milisaniyesini okur.
+function getCurrentTimeMs() {
+  return Date.now();
+}
+
+// Canlı model sonucuna göre kullanıcıya teknik değer göstermeden çekim duruşunu hatırlatır.
+function createLiveCaptureGuide({
+  detections,
+  modelStatus,
+  isCameraReady,
+}: {
+  detections: DetectedObbBox[];
+  modelStatus: 'loading' | 'ready' | 'error';
+  isCameraReady: boolean;
+}) {
+  if (!isCameraReady) return 'Kamera hazırlanıyor...';
+  if (modelStatus === 'loading') return 'Model hazırlanıyor...';
+  if (modelStatus === 'error') return 'Model kullanılamıyor.';
+
+  const detectedClasses = new Set(
+    detections
+      .map((detection) => detection.className)
+      .filter((className) => className !== 'unknown')
+  );
+
+  if (detectedClasses.size < 4) {
+    return 'Dört parmak ucunu kadraja al.';
+  }
+
+  return 'Telefonu parmak yüzeyine paralel tut ve sabit kal.';
+}
+
 // Kısa kamera işlemlerinde akışı bloklamadan beklemek için kullanılır.
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// İki önizleme noktası arasındaki ekran mesafesini hesaplar.
+function getPointDistance(
+  first: { x: number; y: number },
+  second: { x: number; y: number }
+) {
+  return Math.hypot(first.x - second.x, first.y - second.y);
 }
 
 // Sayıyı güvenli şekilde verilen aralıkta tutar.
@@ -346,11 +392,15 @@ export default function CameraScreen() {
   const feedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const liveDetectionBusyRef = useRef(false);
   const liveDetectionPausedRef = useRef(true);
+  const liveFocusBusyRef = useRef(false);
+  const lastLiveFocusAtRef = useRef(0);
+  const lastLiveFocusPointRef = useRef<{ x: number; y: number } | null>(null);
   const liveDetectionTracksRef = useRef(
     new Map<DetectedObbBox['className'], LiveDetectionTrack>()
   );
   const liveInferenceBusy = useMemo(() => createSynchronizable(false), []);
   const liveFrameFailed = useMemo(() => createSynchronizable(false), []);
+  const photoProcessingActive = useMemo(() => createSynchronizable(false), []);
   const [isScreenFocused, setIsScreenFocused] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
@@ -359,9 +409,22 @@ export default function CameraScreen() {
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [feedback, setFeedback] = useState('');
   const { hasPermission, requestPermission } = useCameraPermission();
+  const closeUpCameraDevice = useCameraDevice('back', {
+    physicalDevices: ['ultra-wide-angle'],
+  });
   const photoOutput = usePhotoOutput({ quality: 1, qualityPrioritization: 'quality' });
   const canUseCamera = hasPermission && isScreenFocused;
   const [cameraLayout, setCameraLayout] = useState({ width: 0, height: 0 });
+  const closeUpZoom =
+    closeUpCameraDevice?.isVirtualDevice &&
+    closeUpCameraDevice.physicalDevices.some((device) => device.type === 'ultra-wide-angle')
+      ? closeUpCameraDevice.minZoom
+      : 1;
+  const liveCaptureGuide = createLiveCaptureGuide({
+    detections: liveDetections,
+    modelStatus,
+    isCameraReady,
+  });
 
   // Kısa durum mesajını gösterip başarılı işlemlerde otomatik olarak temizler.
   const showFeedback = useCallback((message: string, autoClear = true) => {
@@ -441,7 +504,11 @@ export default function CameraScreen() {
       const isInferenceFrame = nextCount % LIVE_MODEL_FRAME_INTERVAL === 0;
 
       // Model çalışırken yeni frame'i JPEG'e dönüştürmeden doğrudan kamera tamponunu serbest bırakır.
-      if (!isInferenceFrame || liveFrameFailed.getBlocking()) {
+      if (
+        !isInferenceFrame ||
+        liveFrameFailed.getBlocking() ||
+        photoProcessingActive.getBlocking()
+      ) {
         frame.dispose();
         return;
       }
@@ -535,6 +602,65 @@ export default function CameraScreen() {
     }
   }, [isScreenFocused, liveFrameFailed, liveInferenceBusy, modelStatus]);
 
+  // Canlı kutular kararlı biçimde görüldükçe kutu grubunun merkezinde yakın odağı sürekli tutar.
+  useEffect(() => {
+    const camera = cameraRef.current;
+    if (
+      !camera ||
+      !canUseCamera ||
+      !isCameraReady ||
+      isTakingPhoto ||
+      liveFocusBusyRef.current ||
+      liveDetections.length === 0 ||
+      cameraLayout.width <= 0 ||
+      cameraLayout.height <= 0
+    ) {
+      return;
+    }
+
+    const point = getLiveFocusPoint({
+      detections: liveDetections,
+      imageSize: liveDetectionFrame,
+      layout: cameraLayout,
+    });
+    const now = Date.now();
+    const elapsed = now - lastLiveFocusAtRef.current;
+    const previousPoint = lastLiveFocusPointRef.current;
+    const pointMoved =
+      !previousPoint || getPointDistance(previousPoint, point) >= LIVE_FOCUS_MIN_POINT_DISTANCE;
+
+    if (
+      elapsed < LIVE_FOCUS_MIN_INTERVAL_MS ||
+      (!pointMoved && elapsed < LIVE_FOCUS_FORCE_REFRESH_MS)
+    ) {
+      return;
+    }
+
+    liveFocusBusyRef.current = true;
+    lastLiveFocusAtRef.current = now;
+    lastLiveFocusPointRef.current = point;
+
+    camera
+      .focusTo(point, {
+        responsiveness: 'steady',
+        adaptiveness: 'continuous',
+        autoResetAfter: null,
+      })
+      .catch((error) => {
+        console.warn('Canlı kutu odağı uygulanamadı.', error);
+      })
+      .finally(() => {
+        liveFocusBusyRef.current = false;
+      });
+  }, [
+    cameraLayout,
+    canUseCamera,
+    isCameraReady,
+    isTakingPhoto,
+    liveDetectionFrame,
+    liveDetections,
+  ]);
+
   // Kamera sekmesi görünürken kamerayı çalıştırır, sekmeden çıkınca kaynağı serbest bırakır.
   useFocusEffect(
     useCallback(() => {
@@ -542,6 +668,9 @@ export default function CameraScreen() {
       return () => {
         setIsScreenFocused(false);
         setIsCameraReady(false);
+        liveFocusBusyRef.current = false;
+        lastLiveFocusAtRef.current = 0;
+        lastLiveFocusPointRef.current = null;
         liveDetectionTracksRef.current.clear();
         setLiveDetections([]);
         setLiveDetectionFrame(null);
@@ -572,22 +701,38 @@ export default function CameraScreen() {
     }
 
     setIsTakingPhoto(true);
+    liveDetectionPausedRef.current = true;
+    photoProcessingActive.setBlocking(true);
     showFeedback('Fotoğraf işleniyor...', false);
+    const processingStartedAt = getCurrentTimeMs();
 
     try {
+      const focusStartedAt = getCurrentTimeMs();
       await focusCameraBeforeCapture();
+      const focusDuration = getCurrentTimeMs() - focusStartedAt;
 
+      const captureStartedAt = getCurrentTimeMs();
       const photo = await photoOutput.capturePhoto(
         { flashMode: 'off', enableShutterSound: false },
         {}
       );
+      const captureDuration = getCurrentTimeMs() - captureStartedAt;
+      const temporarySaveStartedAt = getCurrentTimeMs();
       const picturePath = await photo.saveToTemporaryFileAsync();
+      const temporarySaveDuration = getCurrentTimeMs() - temporarySaveStartedAt;
+      const normalizationStartedAt = getCurrentTimeMs();
       const capturedImage = await normalizeCapturedPhotoForModel(`file://${picturePath}`);
+      const normalizationDuration = getCurrentTimeMs() - normalizationStartedAt;
       photo.dispose();
 
       const sampleId = createId('sample');
+      const rawSaveStartedAt = getCurrentTimeMs();
       const rawImageUri = await saveRawImage(capturedImage.uri, sampleId);
+      const rawSaveDuration = getCurrentTimeMs() - rawSaveStartedAt;
+      const detectionStartedAt = getCurrentTimeMs();
       const detections = await tryDetectFingertips(rawImageUri);
+      const detectionDuration = getCurrentTimeMs() - detectionStartedAt;
+      const roiStartedAt = getCurrentTimeMs();
       const fingerRois = await tryExtractFingerRois({
         imageUri: rawImageUri,
         imageSize: {
@@ -597,6 +742,7 @@ export default function CameraScreen() {
         detections,
         sampleId,
       });
+      const roiDuration = getCurrentTimeMs() - roiStartedAt;
 
       // Kayıt ekranı kutuları metadata'dan çizer; ROI dosyaları ileride enrollment için hazır tutulur.
       const sample: CaptureSample = {
@@ -616,7 +762,12 @@ export default function CameraScreen() {
         accepted: false,
       };
 
+      const indexSaveStartedAt = getCurrentTimeMs();
       await appendCaptureSample(sample);
+      const indexSaveDuration = getCurrentTimeMs() - indexSaveStartedAt;
+      console.info(
+        `[Fotoğraf süre] odak=${focusDuration}ms, çekim=${captureDuration}ms, geçici_kayıt=${temporarySaveDuration}ms, normalize=${normalizationDuration}ms, ham_kayıt=${rawSaveDuration}ms, model=${detectionDuration}ms, roi=${roiDuration}ms, indeks=${indexSaveDuration}ms, toplam=${getCurrentTimeMs() - processingStartedAt}ms`
+      );
       showFeedback(
         fingerRois.length > 0
           ? createCaptureQualityFeedback(fingerRois)
@@ -628,6 +779,8 @@ export default function CameraScreen() {
       console.warn('Fotoğraf kaydedilemedi.', error);
       showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
+      photoProcessingActive.setBlocking(false);
+      liveDetectionPausedRef.current = modelStatus !== 'ready' || !isScreenFocused;
       setIsTakingPhoto(false);
     }
   }
@@ -647,8 +800,7 @@ export default function CameraScreen() {
       await camera.focusTo(point, {
         responsiveness: 'snappy',
         adaptiveness: 'locked',
-        modes: ['AE', 'AF', 'AWB'],
-        autoResetAfter: 1.5,
+        autoResetAfter: null,
       });
       await sleep(PRE_CAPTURE_FOCUS_DELAY_MS);
     } catch (error) {
@@ -677,7 +829,7 @@ export default function CameraScreen() {
         <VisionCamera
           ref={cameraRef}
           style={StyleSheet.absoluteFill}
-          device="back"
+          device={closeUpCameraDevice ?? 'back'}
           outputs={[photoOutput, frameOutput]}
           isActive={canUseCamera}
           orientationSource="interface"
@@ -686,6 +838,24 @@ export default function CameraScreen() {
           onStarted={() => {
             setIsCameraReady(true);
             setFeedback('');
+            const controller = cameraRef.current?.controller;
+            const activeDevice = controller?.device;
+            if (!controller || !activeDevice) return;
+
+            // Fiziksel ultra geniş lenste varsayılan zoom korunur; sanal kamerada lens geçişi oturum başladıktan sonra yapılır.
+            const applyCloseUpZoom = activeDevice.isVirtualDevice
+              ? controller.setZoom(closeUpZoom)
+              : Promise.resolve();
+
+            applyCloseUpZoom
+              .then(() => {
+                console.info(
+                  `[Yakın odak] lens=${activeDevice.type}, sanal=${activeDevice.isVirtualDevice}, zoom=${closeUpZoom.toFixed(2)}`
+                );
+              })
+              .catch((error) => {
+                console.warn('Yakın çekim zoom değeri uygulanamadı.', error);
+              });
           }}
           onPreviewStopped={() => setIsCameraReady(false)}
           onError={(error) => {
@@ -715,9 +885,9 @@ export default function CameraScreen() {
         </View>
 
         <View style={styles.bottomControl}>
-          {feedback ? (
+          {feedback || liveCaptureGuide ? (
             <ThemedText type="small" style={styles.feedbackText}>
-              {feedback}
+              {feedback || liveCaptureGuide}
             </ThemedText>
           ) : null}
 

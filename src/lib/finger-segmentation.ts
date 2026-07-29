@@ -10,6 +10,14 @@ export type SegmentationResult = {
   width: number;
   height: number;
   coverage: number;
+  silhouetteAxisDegrees: number;
+  timings: {
+    decodeMs: number;
+    maskMs: number;
+    enhancementMs: number;
+    encodeMs: number;
+    writeMs: number;
+  };
 };
 
 type YCrCbColor = {
@@ -30,9 +38,9 @@ const SKIN_RANGE = {
   cbMax: 150,
 };
 
-// Maske kapsaması bu aralığın dışındaysa parmak alanı güvenilir kabul edilmez.
-const MIN_MASK_COVERAGE = 0.18;
-const MAX_MASK_COVERAGE = 0.96;
+// Sıkı OBB kırpımlarında parmak ROI'nin çoğunu kaplayabilir; yalnızca neredeyse tam taşmayı reddederiz.
+const MIN_MASK_COVERAGE = 0.12;
+const MAX_MASK_COVERAGE = 0.995;
 
 // ROI JPEG dosyasını küçültüp çözer; aynı piksel verisi hem segmentasyon hem kalite için paylaşılır.
 export async function segmentFingerRoiImage({
@@ -46,35 +54,62 @@ export async function segmentFingerRoiImage({
 }): Promise<SegmentationResult | null> {
   ensureJpegBufferShim();
 
+  const decodeStartedAt = Date.now();
   const image = await loadAnalysisImage(roiImageUri, sourceWidth);
+  const decodeMs = Date.now() - decodeStartedAt;
   const sourcePixels = new Uint8Array(image.data);
+  const maskStartedAt = Date.now();
   const targetColor = sampleCenterSkinColor(sourcePixels, image.width, image.height);
-  const initialMask = createSkinMask(sourcePixels, image.width, image.height, targetColor);
-  const closedMask = erode(
-    dilate(initialMask, image.width, image.height, 2),
+  const skinMask = cleanAndSelectMask(
+    createSkinMask(sourcePixels, image.width, image.height, targetColor),
     image.width,
-    image.height,
-    1
+    image.height
   );
-  const cleanedMask = dilate(
-    erode(closedMask, image.width, image.height, 1),
-    image.width,
-    image.height,
-    1
-  );
-  const mask = keepCenterConnectedComponent(cleanedMask, image.width, image.height);
-  const coverage = countMaskPixels(mask) / Math.max(image.width * image.height, 1);
+  const skinCoverage = calculateMaskCoverage(skinMask, image.width, image.height);
+  let mask = skinMask;
+  let coverage = skinCoverage;
+  let method = 'ten';
 
-  if (coverage < MIN_MASK_COVERAGE || coverage > MAX_MASK_COVERAGE) {
+  // Sabit YCrCb ten aralığı beyaz dengesi nedeniyle kaçırırsa merkez rengine göre ikinci maske deneriz.
+  if (!isValidMaskCoverage(skinCoverage)) {
+    const adaptiveMask = cleanAndSelectMask(
+      createAdaptiveCenterMask(sourcePixels, image.width, image.height, targetColor),
+      image.width,
+      image.height
+    );
+    const adaptiveCoverage = calculateMaskCoverage(adaptiveMask, image.width, image.height);
+
+    if (isValidMaskCoverage(adaptiveCoverage)) {
+      mask = adaptiveMask;
+      coverage = adaptiveCoverage;
+      method = 'uyarlanabilir';
+    } else {
+      console.info(
+        `[ROI segmentasyon] sonuç=yok, ten=${formatCoverage(skinCoverage)}, uyarlanabilir=${formatCoverage(adaptiveCoverage)}`
+      );
+      return null;
+    }
+  }
+
+  if (!isValidMaskCoverage(coverage)) {
     return null;
   }
 
+  const silhouetteAxisDegrees = estimateMaskPrincipalAxis(mask, image.width, image.height);
+  const maskMs = Date.now() - maskStartedAt;
+  console.info(`[ROI segmentasyon] yöntem=${method}, kapsam=${formatCoverage(coverage)}`);
+  const enhancementStartedAt = Date.now();
   const segmentedPixels = createEnhancedSegmentedPixels(sourcePixels, mask, image.width, image.height);
+  const enhancementMs = Date.now() - enhancementStartedAt;
 
+  const encodeStartedAt = Date.now();
   const jpeg = encode({ data: segmentedPixels, width: image.width, height: image.height }, 95);
+  const encodeMs = Date.now() - encodeStartedAt;
+  const writeStartedAt = Date.now();
   await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
     encoding: FileSystem.EncodingType.Base64,
   });
+  const writeMs = Date.now() - writeStartedAt;
 
   return {
     imageUri: outputImageUri,
@@ -83,7 +118,55 @@ export async function segmentFingerRoiImage({
     width: image.width,
     height: image.height,
     coverage,
+    silhouetteAxisDegrees,
+    timings: {
+      decodeMs,
+      maskMs,
+      enhancementMs,
+      encodeMs,
+      writeMs,
+    },
   };
+}
+
+// Segmentasyon maskesinin ikinci momentlerinden parmağın 0-180 derece aralığındaki uzun eksenini ölçer.
+function estimateMaskPrincipalAxis(
+  mask: Uint8Array,
+  width: number,
+  height: number
+) {
+  let count = 0;
+  let xTotal = 0;
+  let yTotal = 0;
+
+  for (let index = 0; index < mask.length; index += 1) {
+    if (!mask[index]) continue;
+    xTotal += index % width;
+    yTotal += Math.floor(index / width);
+    count += 1;
+  }
+
+  if (count < 12) return 90;
+  const centerX = xTotal / count;
+  const centerY = yTotal / count;
+  let covarianceXX = 0;
+  let covarianceXY = 0;
+  let covarianceYY = 0;
+
+  for (let index = 0; index < mask.length; index += 1) {
+    if (!mask[index]) continue;
+    const deltaX = (index % width) - centerX;
+    const deltaY = Math.floor(index / width) - centerY;
+    covarianceXX += deltaX * deltaX;
+    covarianceXY += deltaX * deltaY;
+    covarianceYY += deltaY * deltaY;
+  }
+
+  let axisDegrees =
+    (0.5 * Math.atan2(2 * covarianceXY, covarianceXX - covarianceYY) * 180) /
+    Math.PI;
+  if (axisDegrees < 0) axisDegrees += 180;
+  return Math.round(axisDegrees * 10) / 10;
 }
 
 // Segmentasyon çıktısını yalnızca silüet değil, ridge dokusunu daha görünür yapan gri görüntü olarak üretir.
@@ -160,15 +243,8 @@ function normalizeLocalBrightness(
 
 // Maskeli alanın yüzde değerlerine göre kontrastı güvenli şekilde genişletir.
 function stretchMaskedContrast(grayscale: Uint8Array, mask: Uint8Array) {
-  const values: number[] = [];
   const stretched = new Uint8Array(grayscale.length);
-
-  for (let index = 0; index < grayscale.length; index += 1) {
-    if (mask[index]) values.push(grayscale[index]);
-  }
-
-  const low = getPercentile(values, 0.04);
-  const high = getPercentile(values, 0.96);
+  const { low, high } = getMaskedContrastBounds(grayscale, mask);
   const range = Math.max(high - low, 12);
 
   for (let index = 0; index < grayscale.length; index += 1) {
@@ -201,24 +277,18 @@ function sharpenMaskedGrayscale(
 // Küçük 3x3 bulanıklaştırma, keskinleştirme için düşük frekans referansı üretir.
 function blurGrayscale(grayscale: Uint8Array, width: number, height: number) {
   const blurred = new Uint8Array(grayscale.length);
+  const integral = createIntegralImage(grayscale, width, height);
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      let total = 0;
-      let count = 0;
+      const left = Math.max(0, x - 1);
+      const top = Math.max(0, y - 1);
+      const right = Math.min(width - 1, x + 1);
+      const bottom = Math.min(height - 1, y + 1);
+      const area = (right - left + 1) * (bottom - top + 1);
+      const total = readIntegralSum(integral, width, left, top, right, bottom);
 
-      for (let dy = -1; dy <= 1; dy += 1) {
-        for (let dx = -1; dx <= 1; dx += 1) {
-          const nx = x + dx;
-          const ny = y + dy;
-
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          total += grayscale[ny * width + nx];
-          count += 1;
-        }
-      }
-
-      blurred[y * width + x] = Math.round(total / Math.max(count, 1));
+      blurred[y * width + x] = Math.round(total / area);
     }
   }
 
@@ -341,6 +411,52 @@ function createSkinMask(
   return mask;
 }
 
+// Sabit ten aralığına girmeyen ışık koşullarında ROI merkezinin renk yakınlığıyla yedek maske üretir.
+function createAdaptiveCenterMask(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  targetColor: YCrCbColor
+) {
+  const mask = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const color = readPixelYCrCb(pixels, width, x, y);
+      const chromaDistance = Math.abs(color.cr - targetColor.cr) + Math.abs(color.cb - targetColor.cb);
+      const brightnessDistance = Math.abs(color.y - targetColor.y);
+
+      if (chromaDistance <= 52 && brightnessDistance <= 110) {
+        mask[y * width + x] = 1;
+      }
+    }
+  }
+
+  return mask;
+}
+
+// İlk maskenin küçük boşluklarını kapatıp yalnızca merkeze yakın büyük bileşenini saklar.
+function cleanAndSelectMask(mask: Uint8Array, width: number, height: number) {
+  const closedMask = erode(dilate(mask, width, height, 2), width, height, 1);
+  const cleanedMask = dilate(erode(closedMask, width, height, 1), width, height, 1);
+  return keepCenterConnectedComponent(cleanedMask, width, height);
+}
+
+// Maske kapsamasını ROI piksel sayısına oranlar.
+function calculateMaskCoverage(mask: Uint8Array, width: number, height: number) {
+  return countMaskPixels(mask) / Math.max(width * height, 1);
+}
+
+// Boş, çok küçük veya görüntünün tamamına taşmış maskeleri geçersiz sayar.
+function isValidMaskCoverage(coverage: number) {
+  return coverage >= MIN_MASK_COVERAGE && coverage <= MAX_MASK_COVERAGE;
+}
+
+// Segmentasyon kalibrasyon loglarında kapsama oranını okunabilir yüzdeye dönüştürür.
+function formatCoverage(coverage: number) {
+  return `${Math.round(coverage * 1000) / 10}%`;
+}
+
 // Aynı renkteki arka plan parçalarını elemek için merkeze en yakın büyük bağlı alanı saklar.
 function keepCenterConnectedComponent(mask: Uint8Array, width: number, height: number) {
   const labels = new Int32Array(mask.length);
@@ -446,25 +562,17 @@ function readPixelYCrCb(pixels: Uint8Array, width: number, x: number, y: number)
 // Maskeyi genişleterek küçük boşlukları kapatır.
 function dilate(mask: Uint8Array, width: number, height: number, radius: number) {
   const nextMask = new Uint8Array(mask.length);
+  const integral = createBinaryIntegralImage(mask, width, height);
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      let hasFilledNeighbor = false;
+      const left = Math.max(0, x - radius);
+      const top = Math.max(0, y - radius);
+      const right = Math.min(width - 1, x + radius);
+      const bottom = Math.min(height - 1, y + radius);
+      const filledCount = readBinaryIntegralSum(integral, width, left, top, right, bottom);
 
-      for (let dy = -radius; dy <= radius && !hasFilledNeighbor; dy += 1) {
-        for (let dx = -radius; dx <= radius; dx += 1) {
-          const nx = x + dx;
-          const ny = y + dy;
-
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          if (mask[ny * width + nx]) {
-            hasFilledNeighbor = true;
-            break;
-          }
-        }
-      }
-
-      nextMask[y * width + x] = hasFilledNeighbor ? 1 : 0;
+      nextMask[y * width + x] = filledCount > 0 ? 1 : 0;
     }
   }
 
@@ -474,28 +582,65 @@ function dilate(mask: Uint8Array, width: number, height: number, radius: number)
 // Maskeyi daraltarak tekil arka plan gürültüsünü temizler.
 function erode(mask: Uint8Array, width: number, height: number, radius: number) {
   const nextMask = new Uint8Array(mask.length);
+  const integral = createBinaryIntegralImage(mask, width, height);
+  const kernelWidth = radius * 2 + 1;
+  const requiredCount = kernelWidth * kernelWidth;
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      let allFilled = true;
+      const left = x - radius;
+      const top = y - radius;
+      const right = x + radius;
+      const bottom = y + radius;
 
-      for (let dy = -radius; dy <= radius && allFilled; dy += 1) {
-        for (let dx = -radius; dx <= radius; dx += 1) {
-          const nx = x + dx;
-          const ny = y + dy;
-
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height || !mask[ny * width + nx]) {
-            allFilled = false;
-            break;
-          }
-        }
+      // Önceki davranışta görüntü dışındaki komşular sıfır kabul edildiği için sınırı doğrudan boş bırakırız.
+      if (left < 0 || top < 0 || right >= width || bottom >= height) {
+        continue;
       }
 
-      nextMask[y * width + x] = allFilled ? 1 : 0;
+      const filledCount = readBinaryIntegralSum(integral, width, left, top, right, bottom);
+      nextMask[y * width + x] = filledCount === requiredCount ? 1 : 0;
     }
   }
 
   return nextMask;
+}
+
+// İkili maskenin dikdörtgen toplamlarını sabit zamanda okuyabilmek için integral görüntüsünü üretir.
+function createBinaryIntegralImage(mask: Uint8Array, width: number, height: number) {
+  const integral = new Int32Array((width + 1) * (height + 1));
+
+  for (let y = 1; y <= height; y += 1) {
+    let rowTotal = 0;
+
+    for (let x = 1; x <= width; x += 1) {
+      rowTotal += mask[(y - 1) * width + (x - 1)] ? 1 : 0;
+      integral[y * (width + 1) + x] = integral[(y - 1) * (width + 1) + x] + rowTotal;
+    }
+  }
+
+  return integral;
+}
+
+// İkili integral görüntüden verilen kapalı dikdörtgenin dolu piksel sayısını okur.
+function readBinaryIntegralSum(
+  integral: Int32Array,
+  width: number,
+  left: number,
+  top: number,
+  right: number,
+  bottom: number
+) {
+  const stride = width + 1;
+  const x2 = right + 1;
+  const y2 = bottom + 1;
+
+  return (
+    integral[y2 * stride + x2] -
+    integral[top * stride + x2] -
+    integral[y2 * stride + left] +
+    integral[top * stride + left]
+  );
 }
 
 // Maskedeki dolu piksel sayısını hesaplar.
@@ -566,16 +711,35 @@ function bytesToBase64(bytes: Uint8Array) {
   return result;
 }
 
-// Yüzdelik değerleri kontrast germe sırasında uç parlaklıkları bastırmak için kullanırız.
-function getPercentile(values: number[], percentile: number) {
-  if (values.length === 0) return 0;
-  const sorted = [...values].sort((first, second) => first - second);
-  const index = (sorted.length - 1) * percentile;
-  const lower = Math.floor(index);
-  const upper = Math.ceil(index);
-  const fraction = index - lower;
+// 8-bit histogram üzerinden sıralama yapmadan maskeli alanın %4-%96 kontrast sınırlarını bulur.
+function getMaskedContrastBounds(grayscale: Uint8Array, mask: Uint8Array) {
+  const histogram = new Uint32Array(256);
+  let count = 0;
 
-  return (sorted[lower] ?? 0) * (1 - fraction) + (sorted[upper] ?? 0) * fraction;
+  for (let index = 0; index < grayscale.length; index += 1) {
+    if (!mask[index]) continue;
+    histogram[grayscale[index]] += 1;
+    count += 1;
+  }
+
+  return {
+    low: getHistogramPercentile(histogram, count, 0.04),
+    high: getHistogramPercentile(histogram, count, 0.96),
+  };
+}
+
+// Histogramda hedef yüzdelik sırasına ulaşan ilk 8-bit değeri döndürür.
+function getHistogramPercentile(histogram: Uint32Array, count: number, percentile: number) {
+  if (count === 0) return 0;
+  const target = Math.floor((count - 1) * percentile);
+  let cumulative = 0;
+
+  for (let value = 0; value < histogram.length; value += 1) {
+    cumulative += histogram[value];
+    if (cumulative > target) return value;
+  }
+
+  return 255;
 }
 
 // Görüntü işlemlerinde değerleri güvenli 8-bit piksel aralığında tutar.

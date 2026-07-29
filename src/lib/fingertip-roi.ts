@@ -1,20 +1,27 @@
-import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
+import { Images, type Image as NitroImage } from 'react-native-nitro-image';
 
 import {
+  createEnhancedFingerRoiImageUri,
+  createOrientationFingerRoiImageUri,
   createSegmentedFingerRoiImageUri,
+  saveCanonicalFingerRoiImage,
   saveFingerRoiImage,
 } from '@/lib/capture-storage';
 import { segmentFingerRoiImage } from '@/lib/finger-segmentation';
 import {
-  analyzeFingerprintQuality,
+  analyzeFingerprintQualityDetailed,
   createSegmentationFailureQuality,
 } from '@/lib/fingerprint-quality';
+import { saveRidgeEnhancedImage } from '@/lib/ridge-enhancement';
 import type { CaptureSample, DetectedObbBox, FingerRoi } from '@/types/biometrics';
 
 type ImageSize = NonNullable<CaptureSample['rawImageSize']>;
 
 // Çok küçük hatalı kırpmaların dosya üretmesini engelleyen minimum piksel boyutu.
 const MIN_ROI_PIXEL_SIZE = 16;
+
+// Üç işçi native beklemeleri paylaşırken dördüncü büyük piksel çalışma kopyasını açmayarak belleği sınırlar.
+const ROI_PROCESSING_CONCURRENCY = 2;
 
 // Canlı veya fotoğraf model kutularından parmak başına normalize ROI planı üretir.
 export function createFingerRoiPlans(
@@ -39,46 +46,102 @@ export async function extractFingerRoisFromImage({
   sampleId: string;
 }) {
   const roiPlans = createFingerRoiPlans(detections, imageSize);
-  const fingerRois: FingerRoi[] = [];
+  const processingStartedAt = Date.now();
+  // Kaynak fotoğrafı her parmak için tekrar çözmek yerine tek native görüntü nesnesi paylaşılır.
+  const sourceImage = await Images.loadFromFileAsync(toNativeFilePath(imageUri));
 
-  for (const roiPlan of roiPlans) {
-    // Expo ImageManipulator ham fotoğrafı bozmadan geçici kırpılmış ROI dosyası üretir.
-    const cropped = await manipulateAsync(
-      imageUri,
-      [
-        {
-          crop: {
-            originX: roiPlan.crop.originX,
-            originY: roiPlan.crop.originY,
-            width: roiPlan.crop.width,
-            height: roiPlan.crop.height,
-          },
-        },
-      ],
-      {
-        compress: 0.95,
-        format: SaveFormat.JPEG,
-      }
-    );
+  // İki işçi native kırpma ve dosya erişimini üst üste bindirir; üç işçi cihazda JS sıkışmasına yol açıyordu.
+  const fingerRois = await mapWithConcurrency(
+    roiPlans,
+    ROI_PROCESSING_CONCURRENCY,
+    async (roiPlan) => {
+      const fingerStartedAt = Date.now();
+      const cropStartedAt = Date.now();
 
-    // Geçici ROI dosyasını uygulamanın kalıcı capture klasörüne taşınabilir isimle kopyalar.
-    const savedImageUri = await saveFingerRoiImage(cropped.uri, sampleId, roiPlan.className);
-    const processedRoi = await tryProcessFingerRoi({
-      roiImageUri: savedImageUri,
-      sampleId,
-      className: roiPlan.className,
-      sourceWidth: cropped.width,
-    });
+      // Nitro Image aynı çözülmüş fotoğraftan eksene hizalı ham ROI'yi native tarafta kırpar.
+      const cropped = await sourceImage.cropAsync(
+        roiPlan.crop.originX,
+        roiPlan.crop.originY,
+        roiPlan.crop.originX + roiPlan.crop.width,
+        roiPlan.crop.originY + roiPlan.crop.height
+      );
+      const croppedPath = await cropped.saveToTemporaryFileAsync('jpg', 95);
+      const cropMs = Date.now() - cropStartedAt;
 
-    fingerRois.push({
-      ...roiPlan,
-      imageUri: savedImageUri,
-      segmentedImageUri: processedRoi.segmentedImageUri,
-      quality: processedRoi.quality,
-    });
-  }
+      // Geçici ROI dosyasını uygulamanın kalıcı capture klasörüne taşınabilir isimle kopyalar.
+      const saveStartedAt = Date.now();
+      const savedImageUri = await saveFingerRoiImage(
+        toFileUri(croppedPath),
+        sampleId,
+        roiPlan.className
+      );
+      const canonical = await createCanonicalFingerRoi(cropped, roiPlan);
+      const canonicalPath = await canonical.image.saveToTemporaryFileAsync('jpg', 95);
+      const canonicalImageUri = await saveCanonicalFingerRoiImage(
+        toFileUri(canonicalPath),
+        sampleId,
+        roiPlan.className
+      );
+      const saveMs = Date.now() - saveStartedAt;
+      const processedRoi = await tryProcessFingerRoi({
+        roiImageUri: canonicalImageUri,
+        sampleId,
+        className: roiPlan.className,
+        sourceWidth: canonical.sourcePixelWidth,
+        canonicalRotationDegrees: canonical.rotationDegrees,
+      });
+
+      const timings = processedRoi.timings;
+      console.info(
+        timings
+          ? `[ROI süre] parmak=${roiPlan.className}, kırpma=${cropMs}ms, kayıt=${saveMs}ms, çözme=${timings.decodeMs}ms, maske=${timings.maskMs}ms, iyileştirme=${timings.enhancementMs}ms, jpeg=${timings.encodeMs}ms, yazma=${timings.writeMs}ms, kalite=${timings.qualityMs}ms, toplam=${Date.now() - fingerStartedAt}ms`
+          : `[ROI süre] parmak=${roiPlan.className}, kırpma=${cropMs}ms, kayıt=${saveMs}ms, segmentasyon=başarısız, toplam=${Date.now() - fingerStartedAt}ms`
+      );
+
+      return {
+        ...roiPlan,
+        imageUri: savedImageUri,
+        canonicalImageUri,
+        segmentedImageUri: processedRoi.segmentedImageUri,
+        enhancedImageUri: processedRoi.enhancedImageUri,
+        orientationImageUri: processedRoi.orientationImageUri,
+        sourcePixelWidth: canonical.sourcePixelWidth,
+        canonicalRotationDegrees: canonical.rotationDegrees,
+        silhouetteAxisDegrees: processedRoi.silhouetteAxisDegrees,
+        canonicalResidualDegrees: processedRoi.canonicalResidualDegrees,
+        quality: processedRoi.quality,
+      };
+    }
+  );
+
+  console.info(
+    `[ROI süre] parmak_sayısı=${fingerRois.length}, toplam=${Date.now() - processingStartedAt}ms`
+  );
 
   return fingerRois;
+}
+
+// Verilen işleri sabit sayıda işçiyle çalıştırıp sonuçların giriş sırasını korur.
+async function mapWithConcurrency<Input, Output>(
+  items: Input[],
+  concurrency: number,
+  worker: (item: Input) => Promise<Output>
+) {
+  const results = new Array<Output>(items.length);
+  let nextIndex = 0;
+
+  // Her işçi sıradaki boş indeksi alır; JavaScript eşzamanlı kalırken native işler bekleme süresini paylaşır.
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex]);
+    }
+  }
+
+  const workerCount = Math.min(Math.max(concurrency, 1), items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
 }
 
 // Segmentasyon başarısız olursa normal ROI kaydını bozmadan boş sonuç döndürür.
@@ -87,28 +150,155 @@ async function tryProcessFingerRoi({
   sampleId,
   className,
   sourceWidth,
+  canonicalRotationDegrees,
 }: {
   roiImageUri: string;
   sampleId: string;
   className: FingerRoi['className'];
   sourceWidth: number;
+  canonicalRotationDegrees: number;
 }) {
   try {
     const outputImageUri = await createSegmentedFingerRoiImageUri(sampleId, className);
+    const enhancedImageUri = await createEnhancedFingerRoiImageUri(sampleId, className);
+    const orientationImageUri = await createOrientationFingerRoiImageUri(
+      sampleId,
+      className
+    );
     const result = await segmentFingerRoiImage({ roiImageUri, outputImageUri, sourceWidth });
 
     if (!result) {
       return { quality: createSegmentationFailureQuality() };
     }
 
+    const qualityStartedAt = Date.now();
+    const analysis = analyzeFingerprintQualityDetailed({
+      ...result,
+      sourcePixelWidth: sourceWidth,
+    });
+    const quality = analysis.quality;
+    let savedEnhancedImageUri: string | undefined;
+    let savedOrientationImageUri: string | undefined;
+
+    // Yön haritası ridge kanıtı çıkmasa da orientation hesabını doğrulayabilmek için saklanır.
+    if (analysis.orientationPixels) {
+      savedOrientationImageUri = await saveRidgeEnhancedImage({
+        pixels: analysis.orientationPixels,
+        width: result.width,
+        height: result.height,
+        outputImageUri: orientationImageUri,
+      });
+    }
+
+    // Enhancement yalnızca ridge kanıtı bulunan alan varsa yazılır; boş teknik çıktı galeriye eklenmez.
+    if (analysis.enhancedPixels && analysis.enhancementSupportedAreaRatio > 0.02) {
+      await saveRidgeEnhancedImage({
+        pixels: analysis.enhancedPixels,
+        width: result.width,
+        height: result.height,
+        outputImageUri: enhancedImageUri,
+      });
+      savedEnhancedImageUri = enhancedImageUri;
+    }
+    const qualityMs = Date.now() - qualityStartedAt;
+    const canonicalResidualDegrees = normalizeAxisRotation(
+      result.silhouetteAxisDegrees - 90
+    );
+
+    // Saha kalibrasyonunda farklı çekimleri karşılaştırmak için yalnızca terminale kısa kalite özeti yazar.
+    console.info(
+      `[ROI kalite] parmak=${className}, çekim=${quality.captureStatus}, biyometri=${quality.biometricStatus}, genel=${quality.globalScore}, çözünürlük=${quality.sourceResolutionScore}, ridge=${quality.ridgePeriodicity}, frekans=${quality.ridgeFrequencyConsistency}, yön=${quality.orientationCoherence}, güvenilir_yön=${quality.orientationReliableBlockRatio}%, yön_düzeltme=${quality.orientationMedianCorrectionDegrees.toFixed(1)}°, obb_dönüş=${canonicalRotationDegrees.toFixed(1)}°, silüet_ekseni=${result.silhouetteAxisDegrees.toFixed(1)}°, dikey_sapma=${canonicalResidualDegrees.toFixed(1)}°, iyileştirme=${quality.ridgeEnhancementGainPercent.toFixed(1)}%, destek=${quality.ridgeEnhancementSupportedAreaRatio}%, blok=${quality.ridgeValidBlockCount}/${quality.ridgeCandidateBlockCount}/${quality.ridgeInteriorBlockCount}/${quality.ridgeOrientationBlockCount}, periyot=${quality.ridgeMedianPeriodPixels.toFixed(1)}px [${quality.ridgePeriodHistogram}], ret=${quality.ridgeRejectionSummary}`
+    );
+
     return {
       segmentedImageUri: result.imageUri,
-      quality: analyzeFingerprintQuality(result),
+      enhancedImageUri: savedEnhancedImageUri,
+      orientationImageUri: savedOrientationImageUri,
+      silhouetteAxisDegrees: result.silhouetteAxisDegrees,
+      canonicalResidualDegrees,
+      quality,
+      timings: {
+        ...result.timings,
+        qualityMs,
+      },
     };
   } catch (error) {
     console.warn('Parmak ROI segmentasyonu uygulanamadı.', error);
     return { quality: createSegmentationFailureQuality() };
   }
+}
+
+// OBB'nin uzun kenarını dikey eksene getirip yalnızca gerçek açılı kutu boyutunu saklar.
+async function createCanonicalFingerRoi(cropped: NitroImage, roiPlan: FingerRoi) {
+  const geometry = getCanonicalGeometry(roiPlan.maskPolygon);
+  if (!geometry) {
+    return {
+      image: cropped,
+      sourcePixelWidth: Math.min(cropped.width, cropped.height),
+      rotationDegrees: 0,
+    };
+  }
+
+  const rotated = await cropped.rotateAsync(geometry.rotationDegrees, false);
+  const targetWidth = Math.min(Math.max(Math.round(geometry.shortEdge), 1), rotated.width);
+  const targetHeight = Math.min(Math.max(Math.round(geometry.longEdge), 1), rotated.height);
+  const left = Math.max(0, Math.round((rotated.width - targetWidth) / 2));
+  const top = Math.max(0, Math.round((rotated.height - targetHeight) / 2));
+  const canonical = await rotated.cropAsync(
+    left,
+    top,
+    Math.min(left + targetWidth, rotated.width),
+    Math.min(top + targetHeight, rotated.height)
+  );
+
+  return {
+    image: canonical,
+    sourcePixelWidth: geometry.shortEdge,
+    rotationDegrees: geometry.rotationDegrees,
+  };
+}
+
+// OBB köşelerinden uzun parmak eksenini ve dikleştirme için gereken dönüş açısını hesaplar.
+function getCanonicalGeometry(points?: { x: number; y: number }[]) {
+  if (!points || points.length !== 4) return null;
+
+  const edges = points.map((point, index) => {
+    const next = points[(index + 1) % points.length];
+    const deltaX = next.x - point.x;
+    const deltaY = next.y - point.y;
+    return {
+      length: Math.hypot(deltaX, deltaY),
+      angleDegrees: (Math.atan2(deltaY, deltaX) * 180) / Math.PI,
+    };
+  });
+  const longEdge = [...edges].sort((first, second) => second.length - first.length)[0];
+  const shortEdge = [...edges].sort((first, second) => first.length - second.length)[0];
+
+  if (!longEdge || !shortEdge || shortEdge.length < 1) return null;
+
+  return {
+    longEdge: longEdge.length,
+    shortEdge: shortEdge.length,
+    rotationDegrees: normalizeAxisRotation(90 - longEdge.angleDegrees),
+  };
+}
+
+// Çizgi ekseni 180 derece simetrik olduğu için en kısa eşdeğer dönüşü seçer.
+function normalizeAxisRotation(degrees: number) {
+  let normalized = degrees;
+  while (normalized > 90) normalized -= 180;
+  while (normalized < -90) normalized += 180;
+  return normalized;
+}
+
+// Nitro Image'in beklediği yerel dosya yolundan file URI önekini kaldırır.
+function toNativeFilePath(uri: string) {
+  return decodeURIComponent(uri.replace(/^file:\/\//, ''));
+}
+
+// Nitro Image'in geçici dosya yolunu Expo FileSystem'in kullanacağı URI'ye dönüştürür.
+function toFileUri(path: string) {
+  return path.startsWith('file://') ? path : `file://${path}`;
 }
 
 // Tek tespitin OBB köşelerinden yalnızca model kutusunu çevreleyen ROI kırpma alanını hesaplar.

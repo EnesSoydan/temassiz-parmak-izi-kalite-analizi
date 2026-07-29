@@ -16,14 +16,36 @@ export type QualityMetrics = {
 // Her parmak ROI'si için cihaz üzerinde hesaplanan ayrıntılı kalite sonucunu taşır.
 export type FingerprintQuality = {
   globalScore: number;
+  captureStatus: 'good' | 'medium' | 'poor';
+  biometricStatus: 'sufficient' | 'insufficient';
+  sourceResolutionScore: number;
+  validEvidenceRatio: number;
   blurScore: number;
   contrastScore: number;
   brightnessScore: number;
   foregroundCoverage: number;
   textureVisibility: number;
+  orientationCoherence: number;
+  orientationReliableBlockRatio: number;
+  orientationMedianCorrectionDegrees: number;
+  ridgePeriodicity: number;
+  ridgeFrequencyConsistency: number;
+  ridgeValidBlockRatio: number;
+  ridgeMedianPeriodPixels: number;
+  ridgeOrientationBlockCount: number;
+  ridgeInteriorBlockCount: number;
+  ridgeCandidateBlockCount: number;
+  ridgeValidBlockCount: number;
+  ridgePeriodHistogram: string;
+  ridgeRejectionSummary: string;
+  ridgeEnhancementGainPercent: number;
+  ridgeEnhancementSupportedAreaRatio: number;
   status: 'good' | 'medium' | 'poor';
   message: string;
 };
+
+// Kalibrasyon çekimlerini ham fotoğrafı paylaşmadan elle sınıflandırmak için kullanılan etiketler.
+export type QualityCalibrationLabel = 'good' | 'borderline' | 'bad';
 
 // OBB modelinin desteklediği parmak ucu sınıf adları.
 export type DetectionClassName = 'index' | 'middle' | 'pinky' | 'ring' | 'unknown';
@@ -56,7 +78,14 @@ export type FingerRoi = {
   className: DetectionClassName;
   confidence: number;
   imageUri?: string;
+  canonicalImageUri?: string;
   segmentedImageUri?: string;
+  enhancedImageUri?: string;
+  orientationImageUri?: string;
+  sourcePixelWidth?: number;
+  canonicalRotationDegrees?: number;
+  silhouetteAxisDegrees?: number;
+  canonicalResidualDegrees?: number;
   quality?: FingerprintQuality;
   maskPolygon?: {
     x: number;
@@ -105,6 +134,7 @@ export type CaptureSample = {
   fingerLabel: FingerLabel;
   sessionId: string;
   qualityStatus: QualityStatus;
+  calibrationLabel?: QualityCalibrationLabel;
   accepted: boolean;
 };
 

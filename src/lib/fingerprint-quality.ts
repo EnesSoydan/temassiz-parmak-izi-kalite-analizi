@@ -1,4 +1,15 @@
 import type { FingerRoi, FingerprintQuality, QualityStatus } from '@/types/biometrics';
+import {
+  estimateOrientationField,
+  type OrientationBlock,
+} from '@/lib/orientation-field';
+import {
+  FINGERPRINT_QUALITY_THRESHOLDS as QUALITY_THRESHOLDS,
+  getScaleAwareEvidenceMinimums,
+} from '@/lib/fingerprint-quality-config';
+import { createOrientationVisualization } from '@/lib/orientation-visualization';
+import { createControlledRidgeEnhancement } from '@/lib/ridge-enhancement';
+import { estimateRidgeFrequency } from '@/lib/ridge-frequency';
 
 type QualityAnalysisInput = {
   pixels: Uint8Array;
@@ -6,6 +17,7 @@ type QualityAnalysisInput = {
   width: number;
   height: number;
   coverage: number;
+  sourcePixelWidth?: number;
 };
 
 type BlockQuality = {
@@ -13,6 +25,7 @@ type BlockQuality = {
   contrastScore: number;
   brightnessScore: number;
   textureScore: number;
+  orientationScore: number;
   meanBrightness: number;
   shadowRatio: number;
   glareRatio: number;
@@ -24,57 +37,112 @@ const MIN_BLOCK_MASK_COVERAGE = 0.6;
 // Kitaptaki yerel kalite yaklaşımına uygun, ayarlanabilir blok taban genişliği.
 const BASE_BLOCK_SIZE = 16;
 
-// İlk saha testinde tek noktadan kalibrasyon yapılabilmesi için geçici eşikler burada tutulur.
-const QUALITY_THRESHOLDS = {
-  minCoverage: 0.18,
-  maxCoverage: 0.96,
-  goodScore: 62,
-  mediumScore: 34,
-  dimBrightness: 58,
-  brightBrightness: 210,
-  glareRatio: 0.035,
-  weakBlur: 32,
-  weakTexture: 28,
-  weakContrast: 30,
-};
-
 // Segmentasyon maskesi içindeki ROI'yi bloklara ayırarak parmak bazında kalite sonucu üretir.
 export function analyzeFingerprintQuality({
+  ...input
+}: QualityAnalysisInput): FingerprintQuality {
+  return analyzeFingerprintQualityDetailed(input).quality;
+}
+
+// Kalite kararını ham veriden üretirken aynı orientation/frequency hesabından enhancement çıktısı da oluşturur.
+export function analyzeFingerprintQualityDetailed({
   pixels,
   mask,
   width,
   height,
   coverage,
-}: QualityAnalysisInput): FingerprintQuality {
+  sourcePixelWidth = width,
+}: QualityAnalysisInput) {
   const rawGrayscale = createGrayscaleImage(pixels, width, height);
-  const featureGrayscale = preprocessFingerprintGrayscale(rawGrayscale, mask, width, height);
+  const rawIntegral = createIntegralImage(rawGrayscale, width, height);
+  const featureGrayscale = preprocessFingerprintGrayscale(
+    rawGrayscale,
+    mask,
+    width,
+    height,
+    rawIntegral
+  );
+  const frequencyGrayscale = preprocessRidgeFrequencyGrayscale(
+    rawGrayscale,
+    mask,
+    width,
+    height,
+    rawIntegral
+  );
   const blockSize = getBlockSize(width, height);
+  const orientationBlocks = estimateOrientationField({
+    grayscale: featureGrayscale,
+    mask,
+    width,
+    height,
+    blockSize,
+    minMaskCoverage: MIN_BLOCK_MASK_COVERAGE,
+  });
+  const ridgeFrequency = estimateRidgeFrequency({
+    grayscale: frequencyGrayscale,
+    mask,
+    width,
+    height,
+    orientationBlocks,
+  });
+  const orientationVisualization = createOrientationVisualization({
+    grayscale: featureGrayscale,
+    mask,
+    width,
+    height,
+    orientationBlocks,
+  });
   const blocks: BlockQuality[] = [];
 
-  for (let top = 1; top + blockSize < height - 1; top += blockSize) {
-    for (let left = 1; left + blockSize < width - 1; left += blockSize) {
-      const block = analyzeBlock(rawGrayscale, featureGrayscale, mask, width, left, top, blockSize);
-      if (block) blocks.push(block);
-    }
+  for (const orientationBlock of orientationBlocks) {
+    const block = analyzeBlock(rawGrayscale, featureGrayscale, mask, width, orientationBlock);
+    if (block) blocks.push(block);
   }
 
   if (blocks.length === 0) {
-    return createSegmentationFailureQuality(coverage);
+    return {
+      quality: createSegmentationFailureQuality(coverage),
+      enhancedPixels: undefined,
+      enhancementSupportedAreaRatio: 0,
+      orientationPixels: orientationVisualization.pixels,
+    };
   }
 
   const blurScore = summarizeBlockScores(blocks.map((block) => block.blurScore));
   const contrastScore = summarizeBlockScores(blocks.map((block) => block.contrastScore));
   const brightnessScore = summarizeBlockScores(blocks.map((block) => block.brightnessScore));
   const textureVisibility = summarizeBlockScores(blocks.map((block) => block.textureScore));
+  const orientationCoherence = summarizeBlockScores(blocks.map((block) => block.orientationScore));
+  const {
+    ridgePeriodicity,
+    ridgeFrequencyConsistency,
+    medianPeriodPixels: ridgeMedianPeriodPixels,
+  } = ridgeFrequency;
+  const ridgeValidBlockCount = ridgeFrequency.validBlockCount;
+  const ridgeValidBlockRatio = Math.round(ridgeFrequency.validBlockRatio * 100);
+  const evidenceMinimums = getScaleAwareEvidenceMinimums(ridgeFrequency.candidateBlockCount);
+  const sourceResolutionScore = scoreRange(sourcePixelWidth, 48, 150);
   const foregroundCoverage = Math.round(clamp01(coverage) * 100);
   const coverageScore = calculateCoverageScore(coverage);
-  const globalScore = Math.round(
-    blurScore * 0.25 +
-      textureVisibility * 0.25 +
-      contrastScore * 0.2 +
-      brightnessScore * 0.15 +
-      coverageScore * 0.15
+  const weightedGlobalScore = Math.round(
+    blurScore * 0.16 +
+      textureVisibility * 0.12 +
+      contrastScore * 0.1 +
+      orientationCoherence * 0.16 +
+      ridgePeriodicity * 0.2 +
+      ridgeFrequencyConsistency * 0.1 +
+      ridgeValidBlockRatio * 0.08 +
+      brightnessScore * 0.05 +
+      coverageScore * 0.03
   );
+  // Ridge alanı çok küçükse ağırlıklı skorun nihai kaliteyi olduğundan yüksek göstermesini sınırlar.
+  const globalScore =
+    ridgeValidBlockCount === 0
+      ? Math.min(weightedGlobalScore, 49)
+      : ridgeValidBlockCount < evidenceMinimums.medium ||
+          ridgeValidBlockRatio < QUALITY_THRESHOLDS.weakRidgeValidBlockRatio
+        ? Math.min(weightedGlobalScore, 59)
+        : weightedGlobalScore;
   const meanBrightness = getMedian(blocks.map((block) => block.meanBrightness));
   const glareRatio = getPercentile(blocks.map((block) => block.glareRatio), 0.75);
   const message = createQualityMessage({
@@ -83,19 +151,83 @@ export function analyzeFingerprintQuality({
     contrastScore,
     brightnessScore,
     textureVisibility,
+    orientationCoherence,
+    ridgePeriodicity,
+    ridgeFrequencyConsistency,
+    ridgeValidBlockRatio,
+    ridgeValidBlockCount,
+    ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
     meanBrightness,
     glareRatio,
   });
+  const captureStatus = getFingerprintCaptureStatus({
+    globalScore,
+    orientationCoherence,
+    ridgePeriodicity,
+    ridgeFrequencyConsistency,
+    ridgeValidBlockRatio,
+    ridgeValidBlockCount,
+    ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
+  });
+  const biometricStatus = getFingerprintBiometricStatus({
+    globalScore,
+    orientationCoherence,
+    ridgePeriodicity,
+    ridgeFrequencyConsistency,
+    ridgeValidBlockRatio,
+    ridgeValidBlockCount,
+    ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
+    sourceResolutionScore,
+  });
+  const enhancement = createControlledRidgeEnhancement({
+    grayscale: featureGrayscale,
+    mask,
+    width,
+    height,
+    frequencyBlocks: ridgeFrequency.blocks,
+  });
 
-  return {
+  const quality: FingerprintQuality = {
     globalScore: clampScore(globalScore),
+    captureStatus,
+    biometricStatus,
+    sourceResolutionScore,
+    validEvidenceRatio: ridgeValidBlockRatio,
     blurScore,
     contrastScore,
     brightnessScore,
     foregroundCoverage,
     textureVisibility,
-    status: getFingerprintQualityStatus(globalScore),
+    orientationCoherence,
+    orientationReliableBlockRatio: Math.round(
+      orientationVisualization.reliableBlockRatio * 100
+    ),
+    orientationMedianCorrectionDegrees:
+      orientationVisualization.medianAngularCorrectionDegrees,
+    ridgePeriodicity,
+    ridgeFrequencyConsistency,
+    ridgeValidBlockRatio,
+    ridgeMedianPeriodPixels,
+    ridgeOrientationBlockCount: ridgeFrequency.orientationBlockCount,
+    ridgeInteriorBlockCount: ridgeFrequency.interiorBlockCount,
+    ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
+    ridgeValidBlockCount: ridgeFrequency.validBlockCount,
+    ridgePeriodHistogram: ridgeFrequency.periodHistogram,
+    ridgeRejectionSummary: ridgeFrequency.rejectionSummary,
+    ridgeEnhancementGainPercent: enhancement.contrastGainPercent,
+    ridgeEnhancementSupportedAreaRatio: Math.round(
+      enhancement.supportedAreaRatio * 100
+    ),
+    // Eski kayıt ve arayüz kodları için status, çekim kararının geriye uyumlu karşılığıdır.
+    status: captureStatus,
     message,
+  };
+
+  return {
+    quality,
+    enhancedPixels: enhancement.pixels,
+    enhancementSupportedAreaRatio: enhancement.supportedAreaRatio,
+    orientationPixels: orientationVisualization.pixels,
   };
 }
 
@@ -103,11 +235,30 @@ export function analyzeFingerprintQuality({
 export function createSegmentationFailureQuality(foregroundCoverage = 0): FingerprintQuality {
   return {
     globalScore: 0,
+    captureStatus: 'poor',
+    biometricStatus: 'insufficient',
+    sourceResolutionScore: 0,
+    validEvidenceRatio: 0,
     blurScore: 0,
     contrastScore: 0,
     brightnessScore: 0,
     foregroundCoverage: Math.round(clamp01(foregroundCoverage) * 100),
     textureVisibility: 0,
+    orientationCoherence: 0,
+    orientationReliableBlockRatio: 0,
+    orientationMedianCorrectionDegrees: 0,
+    ridgePeriodicity: 0,
+    ridgeFrequencyConsistency: 0,
+    ridgeValidBlockRatio: 0,
+    ridgeMedianPeriodPixels: 0,
+    ridgeOrientationBlockCount: 0,
+    ridgeInteriorBlockCount: 0,
+    ridgeCandidateBlockCount: 0,
+    ridgeValidBlockCount: 0,
+    ridgePeriodHistogram: 'yok',
+    ridgeRejectionSummary: 'segmentasyon',
+    ridgeEnhancementGainPercent: 0,
+    ridgeEnhancementSupportedAreaRatio: 0,
     status: 'poor',
     message: 'Parmak alanı ayrılamadı. Elini daha düz ve net göster.',
   };
@@ -120,18 +271,19 @@ export function getCaptureQualityStatus(fingerRois: FingerRoi[]): QualityStatus 
     .filter((quality): quality is FingerprintQuality => quality !== undefined);
 
   if (qualities.length === 0) return 'unknown';
-  if (qualities.some((quality) => quality.status === 'poor')) return 'poor';
-  if (qualities.some((quality) => quality.status === 'medium')) return 'usable';
+  if (qualities.some((quality) => getCaptureStatus(quality) === 'poor')) return 'poor';
+  if (qualities.some((quality) => getCaptureStatus(quality) === 'medium')) return 'usable';
   return 'good';
 }
 
 // Kamera ekranında en zayıf parmağı önceleyen kısa ve anlaşılır geri bildirim üretir.
 export function createCaptureQualityFeedback(fingerRois: FingerRoi[]) {
   const poorQualityRois = fingerRois
-    .filter((fingerRoi) => fingerRoi.quality?.status === 'poor')
+    .filter((fingerRoi) => fingerRoi.quality && getCaptureStatus(fingerRoi.quality) === 'poor')
     .sort((first, second) => (first.quality?.globalScore ?? 0) - (second.quality?.globalScore ?? 0));
   const mediumQualityCount = fingerRois.filter(
-    (fingerRoi) => fingerRoi.quality?.status === 'medium'
+    (fingerRoi) =>
+      fingerRoi.quality && getCaptureStatus(fingerRoi.quality) === 'medium'
   ).length;
 
   if (poorQualityRois.length === 0 && mediumQualityCount === 0) {
@@ -143,6 +295,11 @@ export function createCaptureQualityFeedback(fingerRois: FingerRoi[]) {
   }
 
   if (poorQualityRois.length > 1) {
+    // Işık ve netlik yeterliyken ridge alanı birkaç parmakta birden düşüyorsa çekim açısını düzeltmeyi önerir.
+    if (shouldRecommendParallelCapture(fingerRois)) {
+      return 'Telefonu parmak yüzeyine paralel tutup yeniden çek.';
+    }
+
     return `${poorQualityRois.length} parmak ROI'si için yeniden çekim öneriliyor.`;
   }
 
@@ -150,11 +307,40 @@ export function createCaptureQualityFeedback(fingerRois: FingerRoi[]) {
   return `${formatFingerClass(fingerRoi.className)} parmak: ${fingerRoi.quality?.message ?? 'kalite düşük.'}`;
 }
 
+// Birden fazla ROI'deki ortak ridge kaybının düşük ışık veya bulanıklıktan gelmediğini doğrular.
+function shouldRecommendParallelCapture(fingerRois: FingerRoi[]) {
+  const qualities = fingerRois
+    .map((fingerRoi) => fingerRoi.quality)
+    .filter((quality): quality is FingerprintQuality => quality !== undefined);
+
+  if (qualities.length < 3) return false;
+
+  const lowRidgeAreaCount = qualities.filter(
+    (quality) => {
+      const minimums = getScaleAwareEvidenceMinimums(quality.ridgeCandidateBlockCount);
+      return (
+        quality.ridgeValidBlockCount < minimums.medium ||
+        quality.ridgeValidBlockRatio < QUALITY_THRESHOLDS.weakRidgeValidBlockRatio
+      );
+    }
+  ).length;
+  const otherwiseUsableCount = qualities.filter(
+    (quality) =>
+      quality.blurScore >= QUALITY_THRESHOLDS.weakBlur &&
+      quality.brightnessScore >= 45 &&
+      quality.contrastScore >= QUALITY_THRESHOLDS.weakContrast &&
+      quality.foregroundCoverage >= QUALITY_THRESHOLDS.minCoverage * 100 &&
+      quality.foregroundCoverage <= QUALITY_THRESHOLDS.maxCoverage * 100
+  ).length;
+
+  return lowRidgeAreaCount >= 2 && otherwiseUsableCount >= 2;
+}
+
 // Kayıtlar ekranında kullanılacak kısa Türkçe kalite etiketini döndürür.
 export function formatFingerprintQualityStatus(quality?: FingerprintQuality) {
   if (!quality) return 'Analiz yok';
-  if (quality.status === 'good') return 'Uygun';
-  if (quality.status === 'medium') return 'Orta';
+  if (getCaptureStatus(quality) === 'good') return 'Uygun';
+  if (getCaptureStatus(quality) === 'medium') return 'Orta';
   return 'Tekrar çek';
 }
 
@@ -170,20 +356,15 @@ function analyzeBlock(
   featureGrayscale: Uint8Array,
   mask: Uint8Array,
   width: number,
-  left: number,
-  top: number,
-  blockSize: number
+  orientationBlock: OrientationBlock
 ): BlockQuality | null {
-  const values: number[] = [];
-  const rawValues: number[] = [];
+  const featureHistogram = new Uint32Array(256);
   let maskedCount = 0;
   let pixelCount = 0;
+  let rawTotal = 0;
   let shadowCount = 0;
   let glareCount = 0;
-  let gradientEnergy = 0;
-  let tensorX = 0;
-  let tensorY = 0;
-  let tensorMagnitude = 0;
+  const { left, top, size: blockSize } = orientationBlock;
 
   for (let y = top; y < top + blockSize; y += 1) {
     for (let x = left; x < left + blockSize; x += 1) {
@@ -193,50 +374,73 @@ function analyzeBlock(
 
       const rawValue = rawGrayscale[index];
       const featureValue = featureGrayscale[index];
-      values.push(featureValue);
-      rawValues.push(rawValue);
+      featureHistogram[featureValue] += 1;
+      rawTotal += rawValue;
       maskedCount += 1;
       if (rawValue < 45) shadowCount += 1;
       if (rawValue > 235) glareCount += 1;
-
-      const gradientX = (featureGrayscale[index + 1] ?? featureValue) -
-        (featureGrayscale[index - 1] ?? featureValue);
-      const gradientY = (featureGrayscale[index + width] ?? featureValue) -
-        (featureGrayscale[index - width] ?? featureValue);
-      const energy = gradientX * gradientX + gradientY * gradientY;
-      gradientEnergy += energy;
-      tensorX += gradientX * gradientX - gradientY * gradientY;
-      tensorY += 2 * gradientX * gradientY;
-      tensorMagnitude += energy;
     }
   }
 
-  if (maskedCount / Math.max(pixelCount, 1) < MIN_BLOCK_MASK_COVERAGE || values.length < 12) {
+  if (maskedCount / Math.max(pixelCount, 1) < MIN_BLOCK_MASK_COVERAGE || maskedCount < 12) {
     return null;
   }
 
-  const meanBrightness = getMean(rawValues);
-  const contrastRange = getPercentile(values, 0.9) - getPercentile(values, 0.1);
-  const averageGradientEnergy = gradientEnergy / maskedCount;
-  const coherence = Math.hypot(tensorX, tensorY) / Math.max(tensorMagnitude, 1);
-  const blurScore = scoreRange(averageGradientEnergy, 80, 900);
+  const meanBrightness = rawTotal / maskedCount;
+  const contrastRange =
+    getHistogramPercentile(featureHistogram, maskedCount, 0.9) -
+    getHistogramPercentile(featureHistogram, maskedCount, 0.1);
+  const orientationScore = clampScore(
+    orientationBlock.coherence * 70 + orientationBlock.neighborhoodConsistency * 30
+  );
+  const blurScore = scoreRange(orientationBlock.gradientEnergy, 80, 900);
   const contrastScore = scoreRange(contrastRange, 18, 62);
   const brightnessScore = calculateBrightnessScore(
     meanBrightness,
     shadowCount / maskedCount,
     glareCount / maskedCount
   );
-  const textureScore = clampScore(blurScore * 0.55 + coherence * 100 * 0.45);
+  const textureScore = clampScore(blurScore * 0.5 + orientationScore * 0.35 + contrastScore * 0.15);
 
   return {
     blurScore,
     contrastScore,
     brightnessScore,
     textureScore,
+    orientationScore,
     meanBrightness,
     shadowRatio: shadowCount / maskedCount,
     glareRatio: glareCount / maskedCount,
   };
+}
+
+// Ridge frekansında yapay kontrast üretmeden yalnızca yavaş ışık değişimini dengeler.
+function preprocessRidgeFrequencyGrayscale(
+  grayscale: Uint8Array,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  integral: Float64Array
+) {
+  const radius = Math.max(6, Math.min(16, Math.round(Math.min(width, height) / 9)));
+  const normalized = new Uint8Array(grayscale.length);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!mask[index]) continue;
+
+      const left = Math.max(0, x - radius);
+      const top = Math.max(0, y - radius);
+      const right = Math.min(width - 1, x + radius);
+      const bottom = Math.min(height - 1, y + radius);
+      const area = (right - left + 1) * (bottom - top + 1);
+      const localMean = readIntegralSum(integral, width, left, top, right, bottom) / area;
+      normalized[index] = clampByte(128 + grayscale[index] - localMean);
+    }
+  }
+
+  return normalized;
 }
 
 // Kalite ölçümünde çizgi dokusunu daha adil görmek için lokal ışık normalizasyonu uygular.
@@ -244,12 +448,13 @@ function preprocessFingerprintGrayscale(
   grayscale: Uint8Array,
   mask: Uint8Array,
   width: number,
-  height: number
+  height: number,
+  integral: Float64Array
 ) {
   const radius = Math.max(5, Math.min(12, Math.round(Math.min(width, height) / 12)));
-  const integral = createIntegralImage(grayscale, width, height);
   const normalized = new Uint8Array(grayscale.length);
-  const values: number[] = [];
+  const histogram = new Uint32Array(256);
+  let valueCount = 0;
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
@@ -265,12 +470,13 @@ function preprocessFingerprintGrayscale(
       const value = clampByte(128 + (grayscale[index] - localMean) * 1.65);
 
       normalized[index] = value;
-      values.push(value);
+      histogram[value] += 1;
+      valueCount += 1;
     }
   }
 
-  const low = getPercentile(values, 0.04);
-  const high = getPercentile(values, 0.96);
+  const low = getHistogramPercentile(histogram, valueCount, 0.04);
+  const high = getHistogramPercentile(histogram, valueCount, 0.96);
   const range = Math.max(high - low, 12);
 
   for (let index = 0; index < normalized.length; index += 1) {
@@ -279,6 +485,31 @@ function preprocessFingerprintGrayscale(
   }
 
   return normalized;
+}
+
+// 8-bit histogramdan sıralı diziyle aynı enterpolasyonlu yüzdelik değerini hesaplar.
+function getHistogramPercentile(histogram: Uint32Array, count: number, percentile: number) {
+  if (count === 0) return 0;
+  const index = (count - 1) * percentile;
+  const lowerRank = Math.floor(index);
+  const upperRank = Math.ceil(index);
+  const fraction = index - lowerRank;
+  const lowerValue = getHistogramValueAtRank(histogram, lowerRank);
+  const upperValue = getHistogramValueAtRank(histogram, upperRank);
+
+  return lowerValue * (1 - fraction) + upperValue * fraction;
+}
+
+// Histogramda sıfır tabanlı hedef sıraya karşılık gelen gri değeri döndürür.
+function getHistogramValueAtRank(histogram: Uint32Array, targetRank: number) {
+  let cumulative = 0;
+
+  for (let value = 0; value < histogram.length; value += 1) {
+    cumulative += histogram[value];
+    if (cumulative > targetRank) return value;
+  }
+
+  return 255;
 }
 
 // RGBA görüntüyü tekrar eden renk hesabını önlemek için bir kez gri tona dönüştürür.
@@ -338,6 +569,12 @@ function createQualityMessage({
   contrastScore,
   brightnessScore,
   textureVisibility,
+  orientationCoherence,
+  ridgePeriodicity,
+  ridgeFrequencyConsistency,
+  ridgeValidBlockRatio,
+  ridgeValidBlockCount,
+  ridgeCandidateBlockCount,
   meanBrightness,
   glareRatio,
 }: {
@@ -346,6 +583,12 @@ function createQualityMessage({
   contrastScore: number;
   brightnessScore: number;
   textureVisibility: number;
+  orientationCoherence: number;
+  ridgePeriodicity: number;
+  ridgeFrequencyConsistency: number;
+  ridgeValidBlockRatio: number;
+  ridgeValidBlockCount: number;
+  ridgeCandidateBlockCount: number;
   meanBrightness: number;
   glareRatio: number;
 }) {
@@ -360,17 +603,111 @@ function createQualityMessage({
   if (textureVisibility < QUALITY_THRESHOLDS.weakTexture) {
     return 'Parmak izi dokusu yeterince görünmüyor. Parmağını biraz yaklaştır.';
   }
+  if (orientationCoherence < QUALITY_THRESHOLDS.weakOrientation) {
+    return 'Çizgi yönü yeterince tutarlı değil. Parmağını daha sabit tut.';
+  }
+  if (ridgePeriodicity < QUALITY_THRESHOLDS.weakRidgePeriodicity) {
+    return 'Parmak izi çizgileri düzenli seçilemiyor. Parmağını yaklaştır ve sabit tut.';
+  }
+  const evidenceMinimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
+  if (
+    ridgeValidBlockCount < evidenceMinimums.medium ||
+    ridgeValidBlockRatio < QUALITY_THRESHOLDS.weakRidgeValidBlockRatio
+  ) {
+    return 'Parmak izi çizgileri yeterli alanda seçilemiyor. Parmağını kameraya yaklaştır.';
+  }
+  if (ridgeFrequencyConsistency < QUALITY_THRESHOLDS.weakRidgeFrequencyConsistency) {
+    return 'Parmak izi çizgi aralıkları yeterince tutarlı değil. Daha net bir çekim dene.';
+  }
   if (contrastScore < QUALITY_THRESHOLDS.weakContrast) {
     return 'Kontrast düşük. Daha dengeli ışıkta tekrar dene.';
   }
   return 'Görüntü uygun.';
 }
 
-// Genel skorun kullanıcıya gösterilecek üç seviyeli durumunu belirler.
-function getFingerprintQualityStatus(globalScore: number): FingerprintQuality['status'] {
-  if (globalScore >= QUALITY_THRESHOLDS.goodScore) return 'good';
-  if (globalScore >= QUALITY_THRESHOLDS.mediumScore) return 'medium';
+// Kullanıcı yönlendirmesini ROI ölçeğine göre değişen kanıt miktarıyla belirler.
+function getFingerprintCaptureStatus({
+  globalScore,
+  orientationCoherence,
+  ridgePeriodicity,
+  ridgeFrequencyConsistency,
+  ridgeValidBlockRatio,
+  ridgeValidBlockCount,
+  ridgeCandidateBlockCount,
+}: {
+  globalScore: number;
+  orientationCoherence: number;
+  ridgePeriodicity: number;
+  ridgeFrequencyConsistency: number;
+  ridgeValidBlockRatio: number;
+  ridgeValidBlockCount: number;
+  ridgeCandidateBlockCount: number;
+}): FingerprintQuality['captureStatus'] {
+  const minimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
+
+  if (
+    globalScore >= QUALITY_THRESHOLDS.goodScore &&
+    orientationCoherence >= 32 &&
+    ridgePeriodicity >= 34 &&
+    ridgeFrequencyConsistency >= 28 &&
+    ridgeValidBlockRatio >= QUALITY_THRESHOLDS.captureGoodValidRatio &&
+    ridgeValidBlockCount >= minimums.good
+  ) {
+    return 'good';
+  }
+
+  // Az sayıdaki geçerli blokta frekans komşuluğu ölçülemeyebilir; bu eksiklik orta çekimi tek başına reddetmez.
+  const hasEnoughFrequencyNeighbors =
+    ridgeValidBlockCount < 4 || ridgeFrequencyConsistency >= 12;
+  if (
+    globalScore >= QUALITY_THRESHOLDS.mediumScore &&
+    orientationCoherence >= 20 &&
+    ridgePeriodicity >= 16 &&
+    hasEnoughFrequencyNeighbors &&
+    ridgeValidBlockRatio >= QUALITY_THRESHOLDS.captureMediumValidRatio &&
+    ridgeValidBlockCount >= minimums.medium
+  ) {
+    return 'medium';
+  }
   return 'poor';
+}
+
+// Gelecekte enrollment için kullanılacak sıkı karar, ham ridge kanıtı ve kaynak çözünürlüğünü birlikte ister.
+function getFingerprintBiometricStatus({
+  globalScore,
+  orientationCoherence,
+  ridgePeriodicity,
+  ridgeFrequencyConsistency,
+  ridgeValidBlockRatio,
+  ridgeValidBlockCount,
+  ridgeCandidateBlockCount,
+  sourceResolutionScore,
+}: {
+  globalScore: number;
+  orientationCoherence: number;
+  ridgePeriodicity: number;
+  ridgeFrequencyConsistency: number;
+  ridgeValidBlockRatio: number;
+  ridgeValidBlockCount: number;
+  ridgeCandidateBlockCount: number;
+  sourceResolutionScore: number;
+}): FingerprintQuality['biometricStatus'] {
+  const minimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
+  const sufficient =
+    globalScore >= QUALITY_THRESHOLDS.biometricScore &&
+    orientationCoherence >= QUALITY_THRESHOLDS.biometricOrientation &&
+    ridgePeriodicity >= QUALITY_THRESHOLDS.biometricPeriodicity &&
+    ridgeFrequencyConsistency >= QUALITY_THRESHOLDS.biometricFrequencyConsistency &&
+    ridgeValidBlockRatio >= QUALITY_THRESHOLDS.biometricValidRatio &&
+    ridgeValidBlockCount >= minimums.biometric &&
+    sourceResolutionScore >= QUALITY_THRESHOLDS.biometricResolution;
+
+  return sufficient ? 'sufficient' : 'insufficient';
+}
+
+// Eski kayıtlarda captureStatus bulunmadığında status alanına güvenli biçimde geri düşer.
+function getCaptureStatus(quality: FingerprintQuality) {
+  return quality.captureStatus ?? quality.status;
 }
 
 // Parmak sınıfını kısa Türkçe etikete dönüştürür.
@@ -419,11 +756,6 @@ function readIntegralSum(
     integral[y2 * stride + x1] +
     integral[y1 * stride + x1]
   );
-}
-
-// Sayı dizisinin ortalamasını hesaplar.
-function getMean(values: number[]) {
-  return values.reduce((total, value) => total + value, 0) / Math.max(values.length, 1);
 }
 
 // Sıralı kopya üzerinden istenen yüzdelik değeri döndürür.
