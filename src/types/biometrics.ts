@@ -13,6 +13,17 @@ export type QualityMetrics = {
   status: QualityStatus;
 };
 
+// Biyometrik kabulün hangi sıkı kontrolde kaldığını kalibrasyon için makinece okunabilir biçimde taşır.
+export type BiometricRejectionReason =
+  | 'segmentation'
+  | 'global-score'
+  | 'orientation'
+  | 'periodicity'
+  | 'frequency-consistency'
+  | 'evidence-ratio'
+  | 'evidence-count'
+  | 'source-resolution';
+
 // Her parmak ROI'si için cihaz üzerinde hesaplanan ayrıntılı kalite sonucunu taşır.
 export type FingerprintQuality = {
   globalScore: number;
@@ -36,6 +47,11 @@ export type FingerprintQuality = {
   ridgeInteriorBlockCount: number;
   ridgeCandidateBlockCount: number;
   ridgeValidBlockCount: number;
+  ridgeAnalysisBlockSize?: number;
+  ridgeAnalyzedScaleCount?: number;
+  ridgeOrientationCandidateRatio?: number;
+  biometricRequiredValidBlockCount?: number;
+  biometricRejectionReasons?: BiometricRejectionReason[];
   ridgePeriodHistogram: string;
   ridgeRejectionSummary: string;
   ridgeEnhancementGainPercent: number;

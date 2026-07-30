@@ -185,6 +185,16 @@ export async function exportQualityCalibrationSummary() {
               ridgeCandidateBlockCount:
                 fingerRoi.quality.ridgeCandidateBlockCount,
               ridgeValidBlockCount: fingerRoi.quality.ridgeValidBlockCount,
+              ridgeAnalysisBlockSize:
+                fingerRoi.quality.ridgeAnalysisBlockSize ?? 0,
+              ridgeAnalyzedScaleCount:
+                fingerRoi.quality.ridgeAnalyzedScaleCount ?? 1,
+              ridgeOrientationCandidateRatio:
+                fingerRoi.quality.ridgeOrientationCandidateRatio ?? 0,
+              biometricRequiredValidBlockCount:
+                fingerRoi.quality.biometricRequiredValidBlockCount ?? 0,
+              biometricRejectionReasons:
+                fingerRoi.quality.biometricRejectionReasons ?? [],
               ridgeEnhancementGainPercent:
                 fingerRoi.quality.ridgeEnhancementGainPercent ?? 0,
               ridgeEnhancementSupportedAreaRatio:

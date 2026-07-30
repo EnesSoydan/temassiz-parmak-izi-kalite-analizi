@@ -398,7 +398,7 @@ function CaptureCard({
 
           {inspection?.variant === 'orientation' ? (
             <ThemedText type="small" style={styles.inspectionLegend}>
-              Çizgiler ridge eksenidir: yeşil yüksek, sarı orta, kırmızı düşük güven.
+              Çerçeve: yeşil geçerli, kırmızı frekans reddi, sarı yön adayı değil. Mavi çizgi ridge yönüdür.
             </ThemedText>
           ) : null}
 

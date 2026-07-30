@@ -38,6 +38,28 @@ export type RidgeFrequencySummary = {
   blocks: RidgeFrequencyBlock[];
 };
 
+// Aynı ROI'nin farklı blok ölçeklerinde ölçülen sonuçlarından fiziksel iç alanda daha güçlü kanıt üreteni seçer.
+export function selectPreferredRidgeScale<
+  Analysis extends {
+    ridgeFrequency: RidgeFrequencySummary;
+  },
+>(primary: Analysis, secondary: Analysis) {
+  const primaryScore = scoreRidgeScale(primary.ridgeFrequency);
+  const secondaryScore = scoreRidgeScale(secondary.ridgeFrequency);
+  return secondaryScore > primaryScore + 2 ? secondary : primary;
+}
+
+// Küçük blokların salt adet avantajını önlemek için geçerli kanıtı tüm iç blok alanına oranlar.
+function scoreRidgeScale(summary: RidgeFrequencySummary) {
+  const physicalEvidenceRatio =
+    summary.validBlockCount / Math.max(summary.interiorBlockCount, 1);
+  return (
+    physicalEvidenceRatio * 100 * 0.55 +
+    summary.ridgePeriodicity * 0.25 +
+    summary.ridgeFrequencyConsistency * 0.2
+  );
+}
+
 type EstimateRidgeFrequencyInput = {
   grayscale: Uint8Array;
   mask: Uint8Array;
@@ -237,7 +259,8 @@ function createXSignature(
   const tangentY = Math.sin(block.angleRadians);
   const normalX = -tangentY;
   const normalY = tangentX;
-  const normalRadius = Math.max(10, block.size);
+  // Küçük orientation hücresinde de 9-12 px ridge periyotlarını görebilecek kadar uzun profil örnekleriz.
+  const normalRadius = Math.max(18, block.size);
   const tangentRadius = Math.max(4, Math.round(block.size * 0.55));
   const requiredTangentSamples = Math.ceil((tangentRadius * 2 + 1) * 0.65);
   const signature: (number | null)[] = [];

@@ -175,6 +175,7 @@ async function tryProcessFingerRoi({
     const analysis = analyzeFingerprintQualityDetailed({
       ...result,
       sourcePixelWidth: sourceWidth,
+      fingerClass: className,
     });
     const quality = analysis.quality;
     let savedEnhancedImageUri: string | undefined;
@@ -206,8 +207,10 @@ async function tryProcessFingerRoi({
     );
 
     // Saha kalibrasyonunda farklı çekimleri karşılaştırmak için yalnızca terminale kısa kalite özeti yazar.
+    const biometricRejections =
+      quality.biometricRejectionReasons?.join('+') || 'yok';
     console.info(
-      `[ROI kalite] parmak=${className}, çekim=${quality.captureStatus}, biyometri=${quality.biometricStatus}, genel=${quality.globalScore}, çözünürlük=${quality.sourceResolutionScore}, ridge=${quality.ridgePeriodicity}, frekans=${quality.ridgeFrequencyConsistency}, yön=${quality.orientationCoherence}, güvenilir_yön=${quality.orientationReliableBlockRatio}%, yön_düzeltme=${quality.orientationMedianCorrectionDegrees.toFixed(1)}°, obb_dönüş=${canonicalRotationDegrees.toFixed(1)}°, silüet_ekseni=${result.silhouetteAxisDegrees.toFixed(1)}°, dikey_sapma=${canonicalResidualDegrees.toFixed(1)}°, iyileştirme=${quality.ridgeEnhancementGainPercent.toFixed(1)}%, destek=${quality.ridgeEnhancementSupportedAreaRatio}%, blok=${quality.ridgeValidBlockCount}/${quality.ridgeCandidateBlockCount}/${quality.ridgeInteriorBlockCount}/${quality.ridgeOrientationBlockCount}, periyot=${quality.ridgeMedianPeriodPixels.toFixed(1)}px [${quality.ridgePeriodHistogram}], ret=${quality.ridgeRejectionSummary}`
+      `[ROI kalite] parmak=${className}, çekim=${quality.captureStatus}, biyometri=${quality.biometricStatus}, biyometri_ret=${biometricRejections}, genel=${quality.globalScore}, çözünürlük=${quality.sourceResolutionScore}, ridge=${quality.ridgePeriodicity}, frekans=${quality.ridgeFrequencyConsistency}, yön=${quality.orientationCoherence}, güvenilir_yön=${quality.orientationReliableBlockRatio}%, yön_düzeltme=${quality.orientationMedianCorrectionDegrees.toFixed(1)}°, obb_dönüş=${canonicalRotationDegrees.toFixed(1)}°, silüet_ekseni=${result.silhouetteAxisDegrees.toFixed(1)}°, dikey_sapma=${canonicalResidualDegrees.toFixed(1)}°, ölçek=${quality.ridgeAnalysisBlockSize ?? 0}px/${quality.ridgeAnalyzedScaleCount ?? 1}, iyileştirme=${quality.ridgeEnhancementGainPercent.toFixed(1)}%, gabor_alanı=${quality.ridgeEnhancementSupportedAreaRatio}%, yön_adayı=${quality.ridgeOrientationCandidateRatio ?? 0}%, kanıt=${quality.ridgeValidBlockCount}/${quality.ridgeCandidateBlockCount} (${quality.ridgeValidBlockRatio}%, gereken=${quality.biometricRequiredValidBlockCount ?? 0}/22%), iç_blok=${quality.ridgeInteriorBlockCount}/${quality.ridgeOrientationBlockCount}, periyot=${quality.ridgeMedianPeriodPixels.toFixed(1)}px [${quality.ridgePeriodHistogram}], frekans_ret=${quality.ridgeRejectionSummary}`
     );
 
     return {

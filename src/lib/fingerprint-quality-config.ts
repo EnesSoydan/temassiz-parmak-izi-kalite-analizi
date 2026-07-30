@@ -22,6 +22,7 @@ export const FINGERPRINT_QUALITY_THRESHOLDS = {
   biometricPeriodicity: 55,
   biometricFrequencyConsistency: 50,
   biometricResolution: 45,
+  biometricOrientationFallbackValidRatio: 26,
 } as const;
 
 // Küçük ROI'leri büyük parmaklarla aynı sabit blok sayısına zorlamadan gereken kanıtı hesaplar.
@@ -31,4 +32,47 @@ export function getScaleAwareEvidenceMinimums(candidateBlockCount: number) {
     good: Math.max(8, Math.ceil(candidateBlockCount * 0.18)),
     biometric: Math.max(12, Math.ceil(candidateBlockCount * 0.22)),
   };
+}
+
+// Doğrulanmış yerel ridge kanıtının kıvrımlı ROI'deki düşük global yön özetini telafi edip edemeyeceğini belirler.
+export function hasStrongLocalOrientationEvidence({
+  ridgePeriodicity,
+  ridgeFrequencyConsistency,
+  ridgeValidBlockRatio,
+  ridgeValidBlockCount,
+  ridgeCandidateBlockCount,
+}: {
+  ridgePeriodicity: number;
+  ridgeFrequencyConsistency: number;
+  ridgeValidBlockRatio: number;
+  ridgeValidBlockCount: number;
+  ridgeCandidateBlockCount: number;
+}) {
+  const minimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
+  return (
+    ridgePeriodicity >= FINGERPRINT_QUALITY_THRESHOLDS.biometricPeriodicity &&
+    ridgeFrequencyConsistency >=
+      FINGERPRINT_QUALITY_THRESHOLDS.biometricFrequencyConsistency &&
+    ridgeValidBlockRatio >=
+      FINGERPRINT_QUALITY_THRESHOLDS.biometricOrientationFallbackValidRatio &&
+    ridgeValidBlockCount >= minimums.biometric
+  );
+}
+
+// Ana ölçekte biyometrik kanıt sınıra ulaşmıyorsa ikinci orientation ölçeğinin denenmesini ister.
+export function shouldTrySecondaryRidgeScale({
+  ridgeValidBlockRatio,
+  ridgeValidBlockCount,
+  ridgeCandidateBlockCount,
+}: {
+  ridgeValidBlockRatio: number;
+  ridgeValidBlockCount: number;
+  ridgeCandidateBlockCount: number;
+}) {
+  const minimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
+  return (
+    ridgeValidBlockRatio * 100 <
+      FINGERPRINT_QUALITY_THRESHOLDS.biometricOrientationFallbackValidRatio ||
+    ridgeValidBlockCount < minimums.biometric
+  );
 }

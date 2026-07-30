@@ -1,4 +1,5 @@
 import type { OrientationBlock } from '@/lib/orientation-field';
+import type { RidgeFrequencyBlock } from '@/lib/ridge-frequency';
 
 type OrientationVisualizationInput = {
   grayscale: Uint8Array;
@@ -6,15 +7,17 @@ type OrientationVisualizationInput = {
   width: number;
   height: number;
   orientationBlocks: OrientationBlock[];
+  frequencyBlocks?: RidgeFrequencyBlock[];
 };
 
-// Yumuşatılmış ridge eksenlerini segmentli gri görüntü üzerinde güven renkleriyle gösterir.
+// Yumuşatılmış ridge eksenlerini ve frekans kanıt kararlarını aynı doğrulama haritasında gösterir.
 export function createOrientationVisualization({
   grayscale,
   mask,
   width,
   height,
   orientationBlocks,
+  frequencyBlocks = [],
 }: OrientationVisualizationInput) {
   const pixels = new Uint8Array(mask.length * 4);
   const primaryBlocks = orientationBlocks.filter(
@@ -31,9 +34,23 @@ export function createOrientationVisualization({
     pixels[outputIndex + 3] = 255;
   }
 
+  // İç blok çerçevesi yeşilse frekans kanıtı geçerli, kırmızıysa reddedilmiş, sarıysa yön adayı olamamıştır.
+  for (const block of primaryBlocks.filter((item) => item.maskCoverage >= 0.85)) {
+    const frequencyBlock = findFrequencyBlockForOrientationBlock(
+      block,
+      frequencyBlocks
+    );
+    const color: [number, number, number] = frequencyBlock
+      ? frequencyBlock.valid
+        ? [47, 209, 107]
+        : [229, 72, 77]
+      : [245, 184, 68];
+    drawBlockOutline(pixels, mask, width, height, block, color);
+  }
+
   for (const block of primaryBlocks) {
     const confidence = getOrientationBlockConfidence(block);
-    const color = getConfidenceColor(confidence);
+    const color = getOrientationColor(confidence);
     const centerX = block.left + block.size / 2;
     const centerY = block.top + block.size / 2;
     const halfLength = block.size * 0.34;
@@ -70,6 +87,33 @@ export function createOrientationVisualization({
   };
 }
 
+// İki kaydırılmış ızgaradaki frekans ölçümünü aynı fiziksel ana yön hücresiyle eşleştirir.
+function findFrequencyBlockForOrientationBlock(
+  orientationBlock: OrientationBlock,
+  frequencyBlocks: RidgeFrequencyBlock[]
+) {
+  const centerX = orientationBlock.left + orientationBlock.size / 2;
+  const centerY = orientationBlock.top + orientationBlock.size / 2;
+  let nearest: RidgeFrequencyBlock | undefined;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  for (const block of frequencyBlocks) {
+    const distance = Math.hypot(
+      block.left + block.size / 2 - centerX,
+      block.top + block.size / 2 - centerY
+    );
+    if (
+      distance <= orientationBlock.size * 0.8 &&
+      distance < nearestDistance
+    ) {
+      nearest = block;
+      nearestDistance = distance;
+    }
+  }
+
+  return nearest;
+}
+
 // Ham coherence ve komşuluk devamlılığını tek görsel güven değerinde birleştirir.
 function getOrientationBlockConfidence(block: OrientationBlock) {
   return clamp01(
@@ -79,11 +123,35 @@ function getOrientationBlockConfidence(block: OrientationBlock) {
   );
 }
 
-// Yüksek güveni yeşil, orta güveni sarı, düşük güveni kırmızı olarak kodlar.
-function getConfidenceColor(confidence: number): [number, number, number] {
-  if (confidence >= 0.58) return [47, 209, 107];
-  if (confidence >= 0.38) return [245, 184, 68];
-  return [229, 72, 77];
+// Kanıt çerçevelerinden ayrılması için ridge yönünü güvene göre açık mavi ve gri tonlarda çizer.
+function getOrientationColor(confidence: number): [number, number, number] {
+  if (confidence >= 0.58) return [90, 190, 255];
+  if (confidence >= 0.38) return [190, 220, 240];
+  return [120, 130, 140];
+}
+
+// Blok kararını doku görüntüsünü kapatmadan tek piksel çerçeve olarak çizer.
+function drawBlockOutline(
+  pixels: Uint8Array,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  block: OrientationBlock,
+  color: [number, number, number]
+) {
+  const left = Math.round(block.left);
+  const top = Math.round(block.top);
+  const right = Math.round(block.left + block.size - 1);
+  const bottom = Math.round(block.top + block.size - 1);
+
+  for (let x = left; x <= right; x += 1) {
+    writeColorPixel(pixels, mask, width, height, x, top, color);
+    writeColorPixel(pixels, mask, width, height, x, bottom, color);
+  }
+  for (let y = top; y <= bottom; y += 1) {
+    writeColorPixel(pixels, mask, width, height, left, y, color);
+    writeColorPixel(pixels, mask, width, height, right, y, color);
+  }
 }
 
 // Görüntü koordinatlarında iki piksel kalınlığında yön ekseni çizer.

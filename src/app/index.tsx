@@ -8,7 +8,10 @@ import Svg, { G, Rect, Text as SvgText } from 'react-native-svg';
 import {
   Camera as VisionCamera,
   HybridFrameConverter,
+  type CameraDevice,
   type CameraRef as VisionCameraRef,
+  type Constraint,
+  type MeteringMode,
   useCameraDevice,
   useCameraPermission,
   useFrameOutput,
@@ -73,6 +76,9 @@ const LIVE_FOCUS_FORCE_REFRESH_MS = 1800;
 
 // Canlı odak zaten sürerken deklanşör kilidinin oturması için yalnızca kısa bir ek bekleme kullanılır.
 const PRE_CAPTURE_FOCUS_DELAY_MS = 350;
+
+// Bölgesel AE ölçümünü korurken sabit pozlama telafisi uygulamayız.
+const ROI_EXPOSURE_COMPENSATION_INDEX = 0;
 
 // Güncel model sonuçlarını sınıf kimliğiyle önceki kutulara bağlar.
 function updateLiveDetectionTracks(
@@ -214,8 +220,8 @@ function getAxisAlignedScreenBox(
   };
 }
 
-// Canlı kutuların tamamını kapsayan alanın merkezini kamera önizlemesi üzerinde odak noktasına çevirir.
-function getLiveFocusPoint({
+// Canlı kutuların tamamını kapsayan alanı kamera önizlemesinde 3A ölçüm bölgesine çevirir.
+function getLiveMeteringRegion({
   detections,
   imageSize,
   layout,
@@ -228,22 +234,72 @@ function getLiveFocusPoint({
     return {
       x: layout.width / 2,
       y: layout.height / 2,
+      size: Math.max(Math.min(layout.width, layout.height) * 0.18, 1),
     };
   }
 
   const imageFrame = getCoveredImageFrame(layout, imageSize);
-  const normalizedPoints = detections.flatMap((detection) => detection.points);
-  const xValues = normalizedPoints.map((point) => point.x);
-  const yValues = normalizedPoints.map((point) => point.y);
-  const normalizedCenter = {
-    x: (Math.min(...xValues) + Math.max(...xValues)) / 2,
-    y: (Math.min(...yValues) + Math.max(...yValues)) / 2,
-  };
+  const screenPoints = detections.flatMap((detection) =>
+    detection.points.map((point) => ({
+      x: point.x * imageFrame.width + imageFrame.x,
+      y: point.y * imageFrame.height + imageFrame.y,
+    }))
+  );
+  const xValues = screenPoints.map((point) => point.x);
+  const yValues = screenPoints.map((point) => point.y);
+  const left = Math.min(...xValues);
+  const top = Math.min(...yValues);
+  const right = Math.max(...xValues);
+  const bottom = Math.max(...yValues);
+  const shortestLayoutEdge = Math.min(layout.width, layout.height);
 
   return {
-    x: clamp(normalizedCenter.x * imageFrame.width + imageFrame.x, 0, layout.width),
-    y: clamp(normalizedCenter.y * imageFrame.height + imageFrame.y, 0, layout.height),
+    x: clamp((left + right) / 2, 0, layout.width),
+    y: clamp((top + bottom) / 2, 0, layout.height),
+    size: clamp(
+      Math.max(right - left, bottom - top) * 1.12,
+      shortestLayoutEdge * 0.12,
+      shortestLayoutEdge * 0.48
+    ),
   };
+}
+
+// Cihazın desteklediği odak, pozlama ve beyaz dengesi ölçüm modlarını güvenli sırayla seçer.
+function getSupportedMeteringModes(device: CameraDevice) {
+  const modes: MeteringMode[] = [];
+  if (device.supportsFocusMetering) modes.push('AF');
+  if (device.supportsExposureMetering) modes.push('AE');
+  if (device.supportsWhiteBalanceMetering) modes.push('AWB');
+  return modes;
+}
+
+// Box bölgesini boyutuyla birlikte CameraX 3A ölçümüne gönderir.
+async function meterCameraAtRegion({
+  camera,
+  device,
+  region,
+  adaptiveness,
+}: {
+  camera: VisionCameraRef;
+  device: CameraDevice;
+  region: { x: number; y: number; size: number };
+  adaptiveness: 'continuous' | 'locked';
+}) {
+  const controller = camera.controller;
+  const modes = getSupportedMeteringModes(device);
+  if (!controller || modes.length === 0) return;
+
+  const meteringPoint = camera.createMeteringPoint(
+    region.x,
+    region.y,
+    region.size
+  );
+  await controller.focusTo(meteringPoint, {
+    modes,
+    responsiveness: adaptiveness === 'locked' ? 'snappy' : 'steady',
+    adaptiveness,
+    autoResetAfter: null,
+  });
 }
 
 // resizeMode="cover" ile taşan kamera görüntüsünün gerçek çizim alanını hesaplar.
@@ -337,6 +393,11 @@ function getPointDistance(
   return Math.hypot(first.x - second.x, first.y - second.y);
 }
 
+// Yeni bir 3A isteğinin önceki isteği iptal etmesini beklenen yenileme davranışı olarak tanır.
+function isMeteringCancellation(error: unknown) {
+  return String(error).includes('OperationCanceledException');
+}
+
 // Sayıyı güvenli şekilde verilen aralıkta tutar.
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -393,6 +454,7 @@ export default function CameraScreen() {
   const liveDetectionBusyRef = useRef(false);
   const liveDetectionPausedRef = useRef(true);
   const liveFocusBusyRef = useRef(false);
+  const captureMeteringActiveRef = useRef(false);
   const lastLiveFocusAtRef = useRef(0);
   const lastLiveFocusPointRef = useRef<{ x: number; y: number } | null>(null);
   const liveDetectionTracksRef = useRef(
@@ -413,6 +475,11 @@ export default function CameraScreen() {
     physicalDevices: ['ultra-wide-angle'],
   });
   const photoOutput = usePhotoOutput({ quality: 1, qualityPrioritization: 'quality' });
+  // Fotoğraf çözünürlüğünü canlı akıştan önde tutup mümkünse piksel birleştirmeyen sensör formatını isteriz.
+  const cameraConstraints = useMemo<Constraint[]>(
+    () => [{ binned: false }, { resolutionBias: photoOutput }],
+    [photoOutput]
+  );
   const canUseCamera = hasPermission && isScreenFocused;
   const [cameraLayout, setCameraLayout] = useState({ width: 0, height: 0 });
   const closeUpZoom =
@@ -618,7 +685,7 @@ export default function CameraScreen() {
       return;
     }
 
-    const point = getLiveFocusPoint({
+    const region = getLiveMeteringRegion({
       detections: liveDetections,
       imageSize: liveDetectionFrame,
       layout: cameraLayout,
@@ -627,7 +694,8 @@ export default function CameraScreen() {
     const elapsed = now - lastLiveFocusAtRef.current;
     const previousPoint = lastLiveFocusPointRef.current;
     const pointMoved =
-      !previousPoint || getPointDistance(previousPoint, point) >= LIVE_FOCUS_MIN_POINT_DISTANCE;
+      !previousPoint ||
+      getPointDistance(previousPoint, region) >= LIVE_FOCUS_MIN_POINT_DISTANCE;
 
     if (
       elapsed < LIVE_FOCUS_MIN_INTERVAL_MS ||
@@ -638,16 +706,27 @@ export default function CameraScreen() {
 
     liveFocusBusyRef.current = true;
     lastLiveFocusAtRef.current = now;
-    lastLiveFocusPointRef.current = point;
+    lastLiveFocusPointRef.current = region;
 
-    camera
-      .focusTo(point, {
-        responsiveness: 'steady',
-        adaptiveness: 'continuous',
-        autoResetAfter: null,
+    const activeDevice = camera.controller?.device;
+    if (!activeDevice) {
+      liveFocusBusyRef.current = false;
+      return;
+    }
+
+    meterCameraAtRegion({
+      camera,
+      device: activeDevice,
+      region,
+      adaptiveness: 'continuous',
       })
       .catch((error) => {
-        console.warn('Canlı kutu odağı uygulanamadı.', error);
+        if (
+          !captureMeteringActiveRef.current &&
+          !isMeteringCancellation(error)
+        ) {
+          console.warn('Canlı kutu odağı uygulanamadı.', error);
+        }
       })
       .finally(() => {
         liveFocusBusyRef.current = false;
@@ -701,6 +780,7 @@ export default function CameraScreen() {
     }
 
     setIsTakingPhoto(true);
+    captureMeteringActiveRef.current = true;
     liveDetectionPausedRef.current = true;
     photoProcessingActive.setBlocking(true);
     showFeedback('Fotoğraf işleniyor...', false);
@@ -717,6 +797,10 @@ export default function CameraScreen() {
         {}
       );
       const captureDuration = getCurrentTimeMs() - captureStartedAt;
+      // Oturum kısıtlarının gerçek fotoğraf çıktısına etkisini cihaz üzerinde doğrularız.
+      console.info(
+        `[Fotoğraf kaynak] boyut=${photo.width}x${photo.height}, yön=${photo.orientation}, ham=${photo.isRawPhoto}`
+      );
       const temporarySaveStartedAt = getCurrentTimeMs();
       const picturePath = await photo.saveToTemporaryFileAsync();
       const temporarySaveDuration = getCurrentTimeMs() - temporarySaveStartedAt;
@@ -779,6 +863,7 @@ export default function CameraScreen() {
       console.warn('Fotoğraf kaydedilemedi.', error);
       showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
+      captureMeteringActiveRef.current = false;
       photoProcessingActive.setBlocking(false);
       liveDetectionPausedRef.current = modelStatus !== 'ready' || !isScreenFocused;
       setIsTakingPhoto(false);
@@ -791,17 +876,32 @@ export default function CameraScreen() {
     if (!camera || cameraLayout.width <= 0 || cameraLayout.height <= 0) return;
 
     try {
-      const point = getLiveFocusPoint({
+      // Devam eden canlı 3A isteğini bitirip deklanşör ölçümünü tek etkin istek olarak başlatırız.
+      await camera.resetFocus().catch((error) => {
+        if (!isMeteringCancellation(error)) {
+          console.warn('Canlı kamera ölçümü sıfırlanamadı.', error);
+        }
+      });
+      const region = getLiveMeteringRegion({
         detections: liveDetections,
         imageSize: liveDetectionFrame,
         layout: cameraLayout,
       });
+      const activeDevice = camera.controller?.device;
+      if (!activeDevice) return;
 
-      await camera.focusTo(point, {
-        responsiveness: 'snappy',
+      await meterCameraAtRegion({
+        camera,
+        device: activeDevice,
+        region,
         adaptiveness: 'locked',
-        autoResetAfter: null,
       });
+      const controller = camera.controller;
+      if (controller) {
+        console.info(
+          `[Çekim 3A] modlar=${getSupportedMeteringModes(activeDevice).join('+') || 'yok'}, bölge=${Math.round(region.size)}px, poz_kademesi=${controller.exposureBias.toFixed(0)}`
+        );
+      }
       await sleep(PRE_CAPTURE_FOCUS_DELAY_MS);
     } catch (error) {
       console.warn('Çekim öncesi kamera odağı uygulanamadı.', error);
@@ -831,10 +931,16 @@ export default function CameraScreen() {
           style={StyleSheet.absoluteFill}
           device={closeUpCameraDevice ?? 'back'}
           outputs={[photoOutput, frameOutput]}
+          constraints={cameraConstraints}
           isActive={canUseCamera}
           orientationSource="interface"
           resizeMode="cover"
           enableNativeTapToFocusGesture
+          onSessionConfigSelected={(config) => {
+            console.info(
+              `[Kamera formatı] binned=${config.isBinned}, piksel=${config.nativePixelFormat}, odak=${config.autoFocusSystem}, foto_hdr=${config.isPhotoHDREnabled}`
+            );
+          }}
           onStarted={() => {
             setIsCameraReady(true);
             setFeedback('');
@@ -842,20 +948,34 @@ export default function CameraScreen() {
             const activeDevice = controller?.device;
             if (!controller || !activeDevice) return;
 
-            // Fiziksel ultra geniş lenste varsayılan zoom korunur; sanal kamerada lens geçişi oturum başladıktan sonra yapılır.
-            const applyCloseUpZoom = activeDevice.isVirtualDevice
-              ? controller.setZoom(closeUpZoom)
-              : Promise.resolve();
+            // Kamera aktif olduktan sonra yakın lens zoomunu ve ROI için kontrollü EV telafisini sırayla uygularız.
+            void (async () => {
+              try {
+                if (activeDevice.isVirtualDevice) {
+                  await controller.setZoom(closeUpZoom);
+                }
 
-            applyCloseUpZoom
-              .then(() => {
+                const exposureCompensationIndex = activeDevice.supportsExposureBias
+                  ? clamp(
+                      ROI_EXPOSURE_COMPENSATION_INDEX,
+                      activeDevice.minExposureBias,
+                      activeDevice.maxExposureBias
+                    )
+                  : 0;
+                if (activeDevice.supportsExposureBias) {
+                  await controller.setExposureBias(exposureCompensationIndex);
+                }
+
                 console.info(
                   `[Yakın odak] lens=${activeDevice.type}, sanal=${activeDevice.isVirtualDevice}, zoom=${closeUpZoom.toFixed(2)}`
                 );
-              })
-              .catch((error) => {
-                console.warn('Yakın çekim zoom değeri uygulanamadı.', error);
-              });
+                console.info(
+                  `[Kamera 3A] AF=${activeDevice.supportsFocusMetering}, AE=${activeDevice.supportsExposureMetering}, AWB=${activeDevice.supportsWhiteBalanceMetering}, poz_kademesi=${exposureCompensationIndex.toFixed(0)} [${activeDevice.minExposureBias.toFixed(0)},${activeDevice.maxExposureBias.toFixed(0)}], düşük_ışık=${activeDevice.supportsLowLightBoost}`
+                );
+              } catch (error) {
+                console.warn('Yakın çekim kamera ayarları uygulanamadı.', error);
+              }
+            })();
           }}
           onPreviewStopped={() => setIsCameraReady(false)}
           onError={(error) => {

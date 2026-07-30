@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
 
-import { getScaleAwareEvidenceMinimums } from '../src/lib/fingerprint-quality-config.ts';
+import {
+  getScaleAwareEvidenceMinimums,
+  hasStrongLocalOrientationEvidence,
+  shouldTrySecondaryRidgeScale,
+} from '../src/lib/fingerprint-quality-config.ts';
 import { estimateOrientationField } from '../src/lib/orientation-field.ts';
 import { createOrientationVisualization } from '../src/lib/orientation-visualization.ts';
-import { estimateRidgeFrequency } from '../src/lib/ridge-frequency.ts';
+import {
+  estimateRidgeFrequency,
+  selectPreferredRidgeScale,
+} from '../src/lib/ridge-frequency.ts';
 
 const WIDTH = 96;
 const HEIGHT = 96;
@@ -129,7 +136,84 @@ const orientationVisualization = createOrientationVisualization({
   width: WIDTH,
   height: HEIGHT,
   orientationBlocks: orientationField,
+  frequencyBlocks: periodic.blocks,
 });
+const rejectedEvidenceVisualization = createOrientationVisualization({
+  grayscale: createFlatImage(),
+  mask: createFullMask(),
+  width: WIDTH,
+  height: HEIGHT,
+  orientationBlocks: orientationField,
+  frequencyBlocks: flat.blocks,
+});
+const curvedButLocallyReliable = hasStrongLocalOrientationEvidence({
+  ridgePeriodicity: 70,
+  ridgeFrequencyConsistency: 67,
+  ridgeValidBlockRatio: 27,
+  ridgeValidBlockCount: 20,
+  ridgeCandidateBlockCount: 75,
+});
+const curvedAndWeakEvidence = hasStrongLocalOrientationEvidence({
+  ridgePeriodicity: 70,
+  ridgeFrequencyConsistency: 67,
+  ridgeValidBlockRatio: 16,
+  ridgeValidBlockCount: 12,
+  ridgeCandidateBlockCount: 77,
+});
+const weakPrimaryNeedsSecondScale = shouldTrySecondaryRidgeScale({
+  ridgeValidBlockRatio: 0.19,
+  ridgeValidBlockCount: 17,
+  ridgeCandidateBlockCount: 90,
+});
+const strongPrimarySkipsSecondScale = shouldTrySecondaryRidgeScale({
+  ridgeValidBlockRatio: 0.44,
+  ridgeValidBlockCount: 50,
+  ridgeCandidateBlockCount: 114,
+});
+const preferredPhysicalScale = selectPreferredRidgeScale(
+  {
+    id: 'primary',
+    ridgeFrequency: {
+      ...periodic,
+      validBlockCount: 10,
+      interiorBlockCount: 100,
+      ridgePeriodicity: 70,
+      ridgeFrequencyConsistency: 70,
+    },
+  },
+  {
+    id: 'secondary',
+    ridgeFrequency: {
+      ...periodic,
+      validBlockCount: 20,
+      interiorBlockCount: 120,
+      ridgePeriodicity: 70,
+      ridgeFrequencyConsistency: 70,
+    },
+  }
+);
+const countInflatedScale = selectPreferredRidgeScale(
+  {
+    id: 'primary',
+    ridgeFrequency: {
+      ...periodic,
+      validBlockCount: 10,
+      interiorBlockCount: 100,
+      ridgePeriodicity: 70,
+      ridgeFrequencyConsistency: 70,
+    },
+  },
+  {
+    id: 'secondary',
+    ridgeFrequency: {
+      ...periodic,
+      validBlockCount: 30,
+      interiorBlockCount: 400,
+      ridgePeriodicity: 70,
+      ridgeFrequencyConsistency: 70,
+    },
+  }
+);
 
 assert.ok(periodic.ridgePeriodicity >= 55, 'Düzenli ridge sinyali yüksek periyodiklik vermeli.');
 assert.ok(periodic.validBlockRatio >= 0.75, 'Düzenli ridge bloklarının çoğu geçerli olmalı.');
@@ -179,12 +263,65 @@ assert.ok(
   countColoredOrientationPixels(orientationVisualization.pixels) > 0,
   'Orientation haritası ridge eksenlerini renkli çizgilerle göstermeli.'
 );
+assert.ok(
+  countExactColor(orientationVisualization.pixels, [47, 209, 107]) > 0,
+  'Geçerli frekans kanıtı haritada yeşil blok çerçevesi üretmeli.'
+);
+assert.ok(
+  countExactColor(rejectedEvidenceVisualization.pixels, [229, 72, 77]) > 0,
+  'Reddedilen frekans kanıtı haritada kırmızı blok çerçevesi üretmeli.'
+);
+assert.equal(
+  curvedButLocallyReliable,
+  true,
+  'Güçlü yerel ridge kanıtı kıvrımlı ROI içindeki düşük global yön özetini telafi edebilmeli.'
+);
+assert.equal(
+  curvedAndWeakEvidence,
+  false,
+  'Düşük yön ve yetersiz yerel kanıt birlikteyse biyometrik ret korunmalı.'
+);
+assert.equal(
+  weakPrimaryNeedsSecondScale,
+  true,
+  'Biyometrik kanıtı yetersiz ana ölçek ikinci analizi tetiklemeli.'
+);
+assert.equal(
+  strongPrimarySkipsSecondScale,
+  false,
+  'Güçlü ana ölçek gereksiz ikinci analiz çalıştırmamalı.'
+);
+assert.equal(
+  preferredPhysicalScale.id,
+  'secondary',
+  'İç alanda daha yaygın doğrulanmış ridge kanıtı üreten ölçek seçilmeli.'
+);
+assert.equal(
+  countInflatedScale.id,
+  'primary',
+  'Yalnızca daha çok küçük blok üretmek ikinci ölçeği seçmek için yeterli olmamalı.'
+);
 
 // Orientation görselindeki gri tabandan farklı renkli yön çizgilerini sayar.
 function countColoredOrientationPixels(pixels) {
   let count = 0;
   for (let index = 0; index < pixels.length; index += 4) {
     if (pixels[index] !== pixels[index + 1] || pixels[index + 1] !== pixels[index + 2]) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+// Kanıt haritasında karar sınıfına ayrılan tam RGB renginin yazıldığını doğrular.
+function countExactColor(pixels, color) {
+  let count = 0;
+  for (let index = 0; index < pixels.length; index += 4) {
+    if (
+      pixels[index] === color[0] &&
+      pixels[index + 1] === color[1] &&
+      pixels[index + 2] === color[2]
+    ) {
       count += 1;
     }
   }

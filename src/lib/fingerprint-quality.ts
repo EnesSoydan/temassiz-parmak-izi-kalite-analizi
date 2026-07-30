@@ -1,4 +1,10 @@
-import type { FingerRoi, FingerprintQuality, QualityStatus } from '@/types/biometrics';
+import type {
+  BiometricRejectionReason,
+  DetectionClassName,
+  FingerRoi,
+  FingerprintQuality,
+  QualityStatus,
+} from '@/types/biometrics';
 import {
   estimateOrientationField,
   type OrientationBlock,
@@ -6,10 +12,15 @@ import {
 import {
   FINGERPRINT_QUALITY_THRESHOLDS as QUALITY_THRESHOLDS,
   getScaleAwareEvidenceMinimums,
+  hasStrongLocalOrientationEvidence,
+  shouldTrySecondaryRidgeScale,
 } from '@/lib/fingerprint-quality-config';
 import { createOrientationVisualization } from '@/lib/orientation-visualization';
 import { createControlledRidgeEnhancement } from '@/lib/ridge-enhancement';
-import { estimateRidgeFrequency } from '@/lib/ridge-frequency';
+import {
+  estimateRidgeFrequency,
+  selectPreferredRidgeScale,
+} from '@/lib/ridge-frequency';
 
 type QualityAnalysisInput = {
   pixels: Uint8Array;
@@ -18,6 +29,7 @@ type QualityAnalysisInput = {
   height: number;
   coverage: number;
   sourcePixelWidth?: number;
+  fingerClass?: DetectionClassName;
 };
 
 type BlockQuality = {
@@ -52,6 +64,7 @@ export function analyzeFingerprintQualityDetailed({
   height,
   coverage,
   sourcePixelWidth = width,
+  fingerClass,
 }: QualityAnalysisInput) {
   const rawGrayscale = createGrayscaleImage(pixels, width, height);
   const rawIntegral = createIntegralImage(rawGrayscale, width, height);
@@ -70,27 +83,46 @@ export function analyzeFingerprintQualityDetailed({
     rawIntegral
   );
   const blockSize = getBlockSize(width, height);
-  const orientationBlocks = estimateOrientationField({
-    grayscale: featureGrayscale,
+  const primaryScale = analyzeRidgeScale({
+    featureGrayscale,
+    frequencyGrayscale,
     mask,
     width,
     height,
     blockSize,
-    minMaskCoverage: MIN_BLOCK_MASK_COVERAGE,
   });
-  const ridgeFrequency = estimateRidgeFrequency({
-    grayscale: frequencyGrayscale,
-    mask,
-    width,
-    height,
-    orientationBlocks,
-  });
+  // Serçede daima, diğer parmaklarda yalnızca ana kanıt yetersizse ikinci ölçeği kontrollü biçimde deneriz.
+  const shouldAnalyzeSecondaryScale =
+    fingerClass === 'pinky' ||
+    shouldTrySecondaryRidgeScale({
+      ridgeValidBlockRatio: primaryScale.ridgeFrequency.validBlockRatio,
+      ridgeValidBlockCount: primaryScale.ridgeFrequency.validBlockCount,
+      ridgeCandidateBlockCount:
+        primaryScale.ridgeFrequency.candidateBlockCount,
+    });
+  const selectedScale =
+    shouldAnalyzeSecondaryScale
+      ? selectPreferredRidgeScale(
+          primaryScale,
+          analyzeRidgeScale({
+            featureGrayscale,
+            frequencyGrayscale,
+            mask,
+            width,
+            height,
+            blockSize: getSecondaryOrientationBlockSize(blockSize),
+          })
+        )
+      : primaryScale;
+  const analyzedScaleCount = shouldAnalyzeSecondaryScale ? 2 : 1;
+  const { orientationBlocks, ridgeFrequency } = selectedScale;
   const orientationVisualization = createOrientationVisualization({
     grayscale: featureGrayscale,
     mask,
     width,
     height,
     orientationBlocks,
+    frequencyBlocks: ridgeFrequency.blocks,
   });
   const blocks: BlockQuality[] = [];
 
@@ -169,7 +201,7 @@ export function analyzeFingerprintQualityDetailed({
     ridgeValidBlockCount,
     ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
   });
-  const biometricStatus = getFingerprintBiometricStatus({
+  const biometricAssessment = getFingerprintBiometricAssessment({
     globalScore,
     orientationCoherence,
     ridgePeriodicity,
@@ -190,7 +222,7 @@ export function analyzeFingerprintQualityDetailed({
   const quality: FingerprintQuality = {
     globalScore: clampScore(globalScore),
     captureStatus,
-    biometricStatus,
+    biometricStatus: biometricAssessment.status,
     sourceResolutionScore,
     validEvidenceRatio: ridgeValidBlockRatio,
     blurScore,
@@ -212,6 +244,15 @@ export function analyzeFingerprintQualityDetailed({
     ridgeInteriorBlockCount: ridgeFrequency.interiorBlockCount,
     ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
     ridgeValidBlockCount: ridgeFrequency.validBlockCount,
+    ridgeAnalysisBlockSize: selectedScale.blockSize,
+    ridgeAnalyzedScaleCount: analyzedScaleCount,
+    ridgeOrientationCandidateRatio: Math.round(
+      (ridgeFrequency.candidateBlockCount /
+        Math.max(ridgeFrequency.interiorBlockCount, 1)) *
+        100
+    ),
+    biometricRequiredValidBlockCount: evidenceMinimums.biometric,
+    biometricRejectionReasons: biometricAssessment.reasons,
     ridgePeriodHistogram: ridgeFrequency.periodHistogram,
     ridgeRejectionSummary: ridgeFrequency.rejectionSummary,
     ridgeEnhancementGainPercent: enhancement.contrastGainPercent,
@@ -255,6 +296,11 @@ export function createSegmentationFailureQuality(foregroundCoverage = 0): Finger
     ridgeInteriorBlockCount: 0,
     ridgeCandidateBlockCount: 0,
     ridgeValidBlockCount: 0,
+    ridgeAnalysisBlockSize: 0,
+    ridgeAnalyzedScaleCount: 0,
+    ridgeOrientationCandidateRatio: 0,
+    biometricRequiredValidBlockCount: 0,
+    biometricRejectionReasons: ['segmentation'],
     ridgePeriodHistogram: 'yok',
     ridgeRejectionSummary: 'segmentasyon',
     ridgeEnhancementGainPercent: 0,
@@ -348,6 +394,46 @@ export function formatFingerprintQualityStatus(quality?: FingerprintQuality) {
 function getBlockSize(width: number, height: number) {
   const shortestEdge = Math.min(width, height);
   return Math.max(BASE_BLOCK_SIZE, Math.min(32, Math.round(shortestEdge / 8)));
+}
+
+// Tek bir blok ölçeğinde orientation alanı ve ona bağlı ridge frekans kanıtını birlikte üretir.
+function analyzeRidgeScale({
+  featureGrayscale,
+  frequencyGrayscale,
+  mask,
+  width,
+  height,
+  blockSize,
+}: {
+  featureGrayscale: Uint8Array;
+  frequencyGrayscale: Uint8Array;
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  blockSize: number;
+}) {
+  const orientationBlocks = estimateOrientationField({
+    grayscale: featureGrayscale,
+    mask,
+    width,
+    height,
+    blockSize,
+    minMaskCoverage: MIN_BLOCK_MASK_COVERAGE,
+  });
+  const ridgeFrequency = estimateRidgeFrequency({
+    grayscale: frequencyGrayscale,
+    mask,
+    width,
+    height,
+    orientationBlocks,
+  });
+
+  return { blockSize, orientationBlocks, ridgeFrequency };
+}
+
+// Serçenin kıvrımlı ridge akışını izlemek için ana ölçekten daha ince fakat kararlı bir ikinci ızgara seçer.
+function getSecondaryOrientationBlockSize(primaryBlockSize: number) {
+  return Math.max(12, Math.min(primaryBlockSize - 2, Math.round(primaryBlockSize * 0.75)));
 }
 
 // Bir blokta yalnızca maske içindeki pikselleri kullanarak ışık, kontrast, keskinlik ve doku ölçer.
@@ -673,7 +759,7 @@ function getFingerprintCaptureStatus({
 }
 
 // Gelecekte enrollment için kullanılacak sıkı karar, ham ridge kanıtı ve kaynak çözünürlüğünü birlikte ister.
-function getFingerprintBiometricStatus({
+export function getFingerprintBiometricAssessment({
   globalScore,
   orientationCoherence,
   ridgePeriodicity,
@@ -691,18 +777,52 @@ function getFingerprintBiometricStatus({
   ridgeValidBlockCount: number;
   ridgeCandidateBlockCount: number;
   sourceResolutionScore: number;
-}): FingerprintQuality['biometricStatus'] {
+}): {
+  status: FingerprintQuality['biometricStatus'];
+  reasons: BiometricRejectionReason[];
+} {
   const minimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
-  const sufficient =
-    globalScore >= QUALITY_THRESHOLDS.biometricScore &&
-    orientationCoherence >= QUALITY_THRESHOLDS.biometricOrientation &&
-    ridgePeriodicity >= QUALITY_THRESHOLDS.biometricPeriodicity &&
-    ridgeFrequencyConsistency >= QUALITY_THRESHOLDS.biometricFrequencyConsistency &&
-    ridgeValidBlockRatio >= QUALITY_THRESHOLDS.biometricValidRatio &&
-    ridgeValidBlockCount >= minimums.biometric &&
-    sourceResolutionScore >= QUALITY_THRESHOLDS.biometricResolution;
+  const reasons: BiometricRejectionReason[] = [];
+  // Yaygın ve doğrulanmış yerel ridge akışı, kıvrımlı parmak ucunda düşük kalan global yön özetini telafi edebilir.
+  const hasStrongLocalEvidence = hasStrongLocalOrientationEvidence({
+    ridgePeriodicity,
+    ridgeFrequencyConsistency,
+    ridgeValidBlockRatio,
+    ridgeValidBlockCount,
+    ridgeCandidateBlockCount,
+  });
 
-  return sufficient ? 'sufficient' : 'insufficient';
+  // Her başarısız koşulu ayrı saklayarak tek bir "insufficient" sonucunun nedenini görünür kılarız.
+  if (globalScore < QUALITY_THRESHOLDS.biometricScore) reasons.push('global-score');
+  if (
+    orientationCoherence < QUALITY_THRESHOLDS.biometricOrientation &&
+    !hasStrongLocalEvidence
+  ) {
+    reasons.push('orientation');
+  }
+  if (ridgePeriodicity < QUALITY_THRESHOLDS.biometricPeriodicity) {
+    reasons.push('periodicity');
+  }
+  if (
+    ridgeFrequencyConsistency <
+    QUALITY_THRESHOLDS.biometricFrequencyConsistency
+  ) {
+    reasons.push('frequency-consistency');
+  }
+  if (ridgeValidBlockRatio < QUALITY_THRESHOLDS.biometricValidRatio) {
+    reasons.push('evidence-ratio');
+  }
+  if (ridgeValidBlockCount < minimums.biometric) {
+    reasons.push('evidence-count');
+  }
+  if (sourceResolutionScore < QUALITY_THRESHOLDS.biometricResolution) {
+    reasons.push('source-resolution');
+  }
+
+  return {
+    status: reasons.length === 0 ? 'sufficient' : 'insufficient',
+    reasons,
+  };
 }
 
 // Eski kayıtlarda captureStatus bulunmadığında status alanına güvenli biçimde geri düşer.
