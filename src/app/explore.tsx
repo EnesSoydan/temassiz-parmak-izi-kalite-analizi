@@ -30,6 +30,7 @@ import {
   setCaptureCalibrationLabel,
 } from '@/lib/capture-storage';
 import { detectFingertipObbBoxes } from '@/lib/fingertip-detection';
+import { sortFingerRois } from '@/lib/finger-order';
 import { extractFingerRoisFromImage } from '@/lib/fingertip-roi';
 import {
   formatFingerprintQualityStatus,
@@ -61,7 +62,8 @@ type RoiInspectionVariant =
   | 'canonical'
   | 'segmented'
   | 'orientation'
-  | 'enhanced';
+  | 'enhanced'
+  | 'minutiae';
 
 // Tam ekran inceleyicide gösterilebilen ROI sürümlerini kullanıcı etiketleriyle tanımlar.
 const ROI_INSPECTION_OPTIONS: {
@@ -73,6 +75,7 @@ const ROI_INSPECTION_OPTIONS: {
   { value: 'segmented', label: 'Seg' },
   { value: 'orientation', label: 'Yön' },
   { value: 'enhanced', label: 'Ridge' },
+  { value: 'minutiae', label: 'Minutiae' },
 ];
 
 // Seçilen inceleme sürümünün parmak ROI metadata'sındaki dosya yolunu döndürür.
@@ -84,7 +87,8 @@ function getRoiInspectionUri(
   if (variant === 'canonical') return fingerRoi.canonicalImageUri;
   if (variant === 'segmented') return fingerRoi.segmentedImageUri;
   if (variant === 'orientation') return fingerRoi.orientationImageUri;
-  return fingerRoi.enhancedImageUri;
+  if (variant === 'enhanced') return fingerRoi.enhancedImageUri;
+  return fingerRoi.minutiaeImageUri;
 }
 
 // Tek bir kaydın ham fotoğrafını, ROI çiftlerini ve kalite durumlarını gösterir.
@@ -179,7 +183,7 @@ function CaptureCard({
           horizontal
           showsHorizontalScrollIndicator={false}
           contentContainerStyle={styles.roiStrip}>
-          {sample.fingerRois
+          {sortFingerRois(sample.fingerRois)
             .filter((fingerRoi) => fingerRoi.imageUri)
             .map((fingerRoi) => (
               <View key={fingerRoi.id} style={styles.roiPreview}>
@@ -282,6 +286,28 @@ function CaptureCard({
                     )}
                     <ThemedText type="small" style={styles.roiVariantLabel}>
                       Ridge
+                    </ThemedText>
+                  </View>
+
+                  <View style={styles.roiImageColumn}>
+                    {fingerRoi.minutiaeImageUri ? (
+                      <Pressable
+                        onPress={() => openInspection(fingerRoi, 'minutiae')}>
+                        <Image
+                          source={{ uri: fingerRoi.minutiaeImageUri }}
+                          style={[styles.roiImage, styles.minutiaeRoiImage]}
+                          contentFit="cover"
+                        />
+                      </Pressable>
+                    ) : (
+                      <View style={[styles.roiImage, styles.emptySegmentImage]}>
+                        <ThemedText type="small" style={styles.emptySegmentText}>
+                          Yok
+                        </ThemedText>
+                      </View>
+                    )}
+                    <ThemedText type="small" style={styles.roiVariantLabel}>
+                      Nokta
                     </ThemedText>
                   </View>
                 </View>
@@ -398,7 +424,13 @@ function CaptureCard({
 
           {inspection?.variant === 'orientation' ? (
             <ThemedText type="small" style={styles.inspectionLegend}>
-              Çerçeve: yeşil geçerli, kırmızı frekans reddi, sarı yön adayı değil. Mavi çizgi ridge yönüdür.
+              8x8 hücre: yeşil doğrulandı, kırmızı kaba yönle uyuşmadı,
+              sarı zayıf. Mavi çizgi ridge yönü, gri çizgi belirsiz yöndür.
+            </ThemedText>
+          ) : null}
+          {inspection?.variant === 'minutiae' ? (
+            <ThemedText type="small" style={styles.inspectionLegend}>
+              Beyaz çizgi ridge iskeleti, turuncu işaret ridge sonu, mavi işaret çatallanmadır.
             </ThemedText>
           ) : null}
 
@@ -720,7 +752,7 @@ const styles = StyleSheet.create({
     paddingRight: Spacing.two,
   },
   roiPreview: {
-    width: 280,
+    width: 336,
     gap: Spacing.one,
   },
   roiImagePair: {
@@ -757,6 +789,10 @@ const styles = StyleSheet.create({
   orientationRoiImage: {
     borderWidth: 1,
     borderColor: '#A78BFA',
+  },
+  minutiaeRoiImage: {
+    borderWidth: 1,
+    borderColor: '#FF912D',
   },
   emptySegmentText: {
     color: '#9CA3AF',

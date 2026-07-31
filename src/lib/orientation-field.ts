@@ -12,6 +12,12 @@ export type OrientationBlock = {
   gridOffset?: number;
 };
 
+type FineOrientationSelectionInput = {
+  fineBlocks: OrientationBlock[];
+  referenceBlocks: OrientationBlock[];
+  maximumAngleDifferenceDegrees?: number;
+};
+
 type EstimateOrientationFieldInput = {
   grayscale: Uint8Array;
   mask: Uint8Array;
@@ -53,6 +59,57 @@ export function estimateOrientationField({
   }
 
   return smoothOrientationField(blocks);
+}
+
+// İnce yön ızgarasında yalnızca güvenilir ve kaba yön alanıyla uyuşan yerel çizgileri tutar.
+export function selectVerifiedFineOrientationBlocks({
+  fineBlocks,
+  referenceBlocks,
+  maximumAngleDifferenceDegrees = 28,
+}: FineOrientationSelectionInput) {
+  const references = referenceBlocks.filter(
+    (block) =>
+      (block.gridOffset ?? 0) === 0 &&
+      block.maskCoverage >= 0.85 &&
+      getOrientationConfidence(block) >= 0.5
+  );
+
+  return fineBlocks.filter((fineBlock) => {
+    if (
+      (fineBlock.gridOffset ?? 0) !== 0 ||
+      fineBlock.maskCoverage < 0.85 ||
+      getOrientationConfidence(fineBlock) < 0.45
+    ) {
+      return false;
+    }
+
+    const centerX = fineBlock.left + fineBlock.size / 2;
+    const centerY = fineBlock.top + fineBlock.size / 2;
+    let nearestReference: OrientationBlock | undefined;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (const reference of references) {
+      const distance = Math.hypot(
+        reference.left + reference.size / 2 - centerX,
+        reference.top + reference.size / 2 - centerY
+      );
+      if (
+        distance <= reference.size * 0.72 &&
+        distance < nearestDistance
+      ) {
+        nearestReference = reference;
+        nearestDistance = distance;
+      }
+    }
+
+    return (
+      !!nearestReference &&
+      getAxisDifferenceDegrees(
+        fineBlock.angleRadians,
+        nearestReference.angleRadians
+      ) <= maximumAngleDifferenceDegrees
+    );
+  });
 }
 
 // Tek blokta Sobel benzeri türevlerden 0-180 derece eksenli ridge yönü ve tutarlılık hesaplar.
@@ -154,6 +211,21 @@ function smoothOrientationField(blocks: OrientationBlock[]) {
       neighborhoodConsistency,
     };
   });
+}
+
+// Ham, yumuşatılmış ve komşuluk yön kanıtını tek bir karşılaştırma güvenine dönüştürür.
+function getOrientationConfidence(block: OrientationBlock) {
+  return (
+    block.coherence * 0.5 +
+    block.neighborhoodConsistency * 0.3 +
+    (block.smoothedCoherence ?? block.coherence) * 0.2
+  );
+}
+
+// İki eksenli ridge yönü arasındaki en küçük farkı derece cinsinden hesaplar.
+function getAxisDifferenceDegrees(first: number, second: number) {
+  const difference = Math.abs(first - second) % Math.PI;
+  return (Math.min(difference, Math.PI - difference) * 180) / Math.PI;
 }
 
 // Ridge yönünü 0 ile pi arasında tutarak sağ/sol yön değil çizgi ekseni olarak saklar.

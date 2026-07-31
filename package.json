@@ -56,6 +56,7 @@
     "web": "expo start --web",
     "lint": "expo lint",
     "test:ridge": "node --experimental-strip-types scripts/test-ridge-frequency.mjs",
+    "test:minutiae": "node --experimental-strip-types scripts/test-minutiae.mjs",
     "postinstall": "patch-package"
   },
   "private": true

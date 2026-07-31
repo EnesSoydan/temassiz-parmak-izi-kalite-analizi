@@ -1,5 +1,6 @@
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { decode } from 'jpeg-js';
+import type { Image as NitroImage } from 'react-native-nitro-image';
 
 import { getFingertipObbRuntime } from '@/lib/onnx-model';
 import type { DetectedObbBox, DetectionClassName } from '@/types/biometrics';
@@ -7,7 +8,8 @@ import type { DetectedObbBox, DetectionClassName } from '@/types/biometrics';
 export const FINGERTIP_MODEL_SIZE = 480;
 const FOUR_CLASS_OUTPUT_CHANNELS = 9;
 const FIVE_CLASS_OUTPUT_CHANNELS = 10;
-const PHOTO_DETECTION_THRESHOLD = 0.3;
+// Küçük serçe kutusunun canlıda kabul edilip fotoğrafta elenmemesi için iki akış aynı güven eşiğini kullanır.
+const PHOTO_DETECTION_THRESHOLD = 0.2;
 const LIVE_DETECTION_THRESHOLD = 0.2;
 const NMS_IOU_THRESHOLD = 0.45;
 const MAX_DETECTIONS = 30;
@@ -78,6 +80,27 @@ async function createModelInputTensor(imageUri: string): Promise<TensorImage> {
 export async function detectFingertipObbBoxes(imageUri: string): Promise<DetectedObbBox[]> {
   const tensorImage = await createModelInputTensor(imageUri);
   return runFingertipModel(tensorImage.tensorData, PHOTO_DETECTION_THRESHOLD);
+}
+
+// Kameranın yönü düzeltilmiş native görüntüsünü JPEG'e çevirmeden model boyutuna indirip modele gönderir.
+export async function detectFingertipObbBoxesFromImage(
+  image: NitroImage
+): Promise<DetectedObbBox[]> {
+  const resized = await image.resizeAsync(FINGERTIP_MODEL_SIZE, FINGERTIP_MODEL_SIZE);
+
+  try {
+    const pixels = await resized.toRawPixelDataAsync(false);
+    // Galaxy cihazında Nitro Image BGRA bildirse de gerçek byte sırası canlı kanal testinde RGBA olarak doğrulandı.
+    const tensorData = createTensorFromRawPixels(
+      pixels.buffer,
+      pixels.width,
+      pixels.height,
+      'RGBA'
+    );
+    return runFingertipModel(tensorData, PHOTO_DETECTION_THRESHOLD);
+  } finally {
+    resized.dispose();
+  }
 }
 
 // Canlı kameradan gelen kare ham RGB piksel verisini dosya oluşturmadan ONNX modeline gönderir.

@@ -1,8 +1,8 @@
 import * as Device from 'expo-device';
-import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { LayoutChangeEvent, Pressable, StyleSheet, View } from 'react-native';
+import type { Image as NitroImage } from 'react-native-nitro-image';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Svg, { G, Rect, Text as SvgText } from 'react-native-svg';
 import {
@@ -24,6 +24,7 @@ import { BottomTabInset, Spacing } from '@/constants/theme';
 import { appendCaptureSample, saveRawImage } from '@/lib/capture-storage';
 import {
   detectFingertipObbBoxes,
+  detectFingertipObbBoxesFromImage,
   detectFingertipObbBoxesFromRawPixels,
   FINGERTIP_MODEL_SIZE,
 } from '@/lib/fingertip-detection';
@@ -403,13 +404,26 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
-// Model hatasının fotoğraf dosyasının kaydedilmesini engellememesi için inference'ı güvenli çalıştırır.
-async function tryDetectFingertips(imageUri: string) {
+// Native model girdisi boş kalırsa yalnızca tespit için güvenilir JPEG yoluna geri düşer.
+async function tryDetectFingertipsFromImage(
+  image: NitroImage,
+  fallbackImageUri: string
+) {
   try {
-    return await detectFingertipObbBoxes(imageUri);
+    const nativeDetections = await detectFingertipObbBoxesFromImage(image);
+    if (nativeDetections.length > 0) return nativeDetections;
+
+    console.info('[Fotoğraf model] native RGBA sonuç boş, JPEG yedeği deneniyor.');
+    return await detectFingertipObbBoxes(fallbackImageUri);
   } catch (error) {
-    console.warn('Parmak ucu modeli çalıştırılamadı.', error);
-    return [];
+    console.warn('Parmak ucu modeli native görüntüyle çalıştırılamadı.', error);
+
+    try {
+      return await detectFingertipObbBoxes(fallbackImageUri);
+    } catch (fallbackError) {
+      console.warn('Parmak ucu modeli JPEG yedeğiyle de çalıştırılamadı.', fallbackError);
+      return [];
+    }
   }
 }
 
@@ -419,32 +433,26 @@ async function tryExtractFingerRois({
   imageSize,
   detections,
   sampleId,
+  sourceImage,
 }: {
   imageUri: string;
   imageSize: NonNullable<CaptureSample['rawImageSize']>;
   detections: DetectedObbBox[];
   sampleId: string;
+  sourceImage?: NitroImage;
 }) {
   try {
-    return await extractFingerRoisFromImage({ imageUri, imageSize, detections, sampleId });
+    return await extractFingerRoisFromImage({
+      imageUri,
+      imageSize,
+      detections,
+      sampleId,
+      sourceImage,
+    });
   } catch (error) {
     console.warn('Parmak ROI görselleri çıkarılamadı.', error);
     return [];
   }
-}
-
-// VisionCamera'nın EXIF yönü taşıyan çıktısını model ve çizim için tek, bake edilmiş JPEG boyutuna indirger.
-async function normalizeCapturedPhotoForModel(imageUri: string) {
-  const normalized = await manipulateAsync(imageUri, [], {
-    compress: 1,
-    format: SaveFormat.JPEG,
-  });
-
-  return {
-    uri: normalized.uri,
-    width: normalized.width,
-    height: normalized.height,
-  };
 }
 
 export default function CameraScreen() {
@@ -466,6 +474,8 @@ export default function CameraScreen() {
   const [isScreenFocused, setIsScreenFocused] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
+  // Flaş deneyi sırasında ilk çekimi doğrudan flaşlı başlatır; kullanıcı üst anahtardan kapatabilir.
+  const [isFlashEnabled, setIsFlashEnabled] = useState(true);
   const [liveDetections, setLiveDetections] = useState<DetectedObbBox[]>([]);
   const [liveDetectionFrame, setLiveDetectionFrame] = useState<LiveDetectionFrame | null>(null);
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'error'>('loading');
@@ -487,6 +497,7 @@ export default function CameraScreen() {
     closeUpCameraDevice.physicalDevices.some((device) => device.type === 'ultra-wide-angle')
       ? closeUpCameraDevice.minZoom
       : 1;
+  const activeCameraHasFlash = closeUpCameraDevice?.hasFlash === true;
   const liveCaptureGuide = createLiveCaptureGuide({
     detections: liveDetections,
     modelStatus,
@@ -783,8 +794,10 @@ export default function CameraScreen() {
     captureMeteringActiveRef.current = true;
     liveDetectionPausedRef.current = true;
     photoProcessingActive.setBlocking(true);
-    showFeedback('Fotoğraf işleniyor...', false);
+    // Odak ve gerçek deklanşör tamamlanana kadar kullanıcının elini kadrajda sabit tutmasını ister.
+    showFeedback('Elini sabit tut, fotoğraf çekiliyor...', false);
     const processingStartedAt = getCurrentTimeMs();
+    let sourceImage: NitroImage | undefined;
 
     try {
       const focusStartedAt = getCurrentTimeMs();
@@ -792,77 +805,103 @@ export default function CameraScreen() {
       const focusDuration = getCurrentTimeMs() - focusStartedAt;
 
       const captureStartedAt = getCurrentTimeMs();
+      const shouldUseFlash =
+        isFlashEnabled &&
+        (cameraRef.current?.controller?.device.hasFlash ?? false);
       const photo = await photoOutput.capturePhoto(
-        { flashMode: 'off', enableShutterSound: false },
+        {
+          flashMode: shouldUseFlash ? 'on' : 'off',
+          enableRedEyeReduction: false,
+          enableShutterSound: false,
+        },
         {}
       );
       const captureDuration = getCurrentTimeMs() - captureStartedAt;
-      // Oturum kısıtlarının gerçek fotoğraf çıktısına etkisini cihaz üzerinde doğrularız.
-      console.info(
-        `[Fotoğraf kaynak] boyut=${photo.width}x${photo.height}, yön=${photo.orientation}, ham=${photo.isRawPhoto}`
-      );
-      const temporarySaveStartedAt = getCurrentTimeMs();
-      const picturePath = await photo.saveToTemporaryFileAsync();
-      const temporarySaveDuration = getCurrentTimeMs() - temporarySaveStartedAt;
-      const normalizationStartedAt = getCurrentTimeMs();
-      const capturedImage = await normalizeCapturedPhotoForModel(`file://${picturePath}`);
-      const normalizationDuration = getCurrentTimeMs() - normalizationStartedAt;
-      photo.dispose();
+      // Bu noktadan sonra bütün model ve ROI işlemleri sabit JPEG üzerinde çalışır; el artık çekilebilir.
+      showFeedback('Fotoğraf alındı, işleniyor...', false);
+      console.info(`[Çekim ışık] flaş=${shouldUseFlash ? 'on' : 'off'}`);
+      let picturePath: string;
+      const sourceOrientation = photo.orientation;
+      const physicalWidth = photo.width;
+      const physicalHeight = photo.height;
+      let photoDisposed = false;
 
-      const sampleId = createId('sample');
-      const rawSaveStartedAt = getCurrentTimeMs();
-      const rawImageUri = await saveRawImage(capturedImage.uri, sampleId);
-      const rawSaveDuration = getCurrentTimeMs() - rawSaveStartedAt;
-      const detectionStartedAt = getCurrentTimeMs();
-      const detections = await tryDetectFingertips(rawImageUri);
-      const detectionDuration = getCurrentTimeMs() - detectionStartedAt;
-      const roiStartedAt = getCurrentTimeMs();
-      const fingerRois = await tryExtractFingerRois({
-        imageUri: rawImageUri,
-        imageSize: {
-          width: capturedImage.width,
-          height: capturedImage.height,
-        },
-        detections,
-        sampleId,
-      });
-      const roiDuration = getCurrentTimeMs() - roiStartedAt;
+      try {
+        // Kamera JPEG'ini yeniden kodlamadan saklar, yönlü işleme görüntüsünü aynı native fotoğraftan üretiriz.
+        const temporarySaveStartedAt = getCurrentTimeMs();
+        picturePath = await photo.saveToTemporaryFileAsync();
+        const temporarySaveDuration = getCurrentTimeMs() - temporarySaveStartedAt;
+        const orientationStartedAt = getCurrentTimeMs();
+        sourceImage = await photo.toImageAsync();
+        const orientationDuration = getCurrentTimeMs() - orientationStartedAt;
 
-      // Kayıt ekranı kutuları metadata'dan çizer; ROI dosyaları ileride enrollment için hazır tutulur.
-      const sample: CaptureSample = {
-        id: sampleId,
-        createdAt: new Date().toISOString(),
-        rawImageUri,
-        rawImageSize: {
-          width: capturedImage.width,
-          height: capturedImage.height,
-        },
-        detections,
-        fingerRois,
-        deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
-        fingerLabel: 'unknown',
-        sessionId: createId('session'),
-        qualityStatus: getCaptureQualityStatus(fingerRois),
-        accepted: false,
-      };
+        // Oturum çıktısı ile işleme hattının kullandığı fiziksel yönü cihaz üzerinde doğrularız.
+        console.info(
+          `[Fotoğraf kaynak] sensör=${physicalWidth}x${physicalHeight}, yön=${sourceOrientation}, işleme=${sourceImage.width}x${sourceImage.height}, ham=${photo.isRawPhoto}, hat=native`
+        );
+        // Yönlü native görüntü bağımsız olduğundan büyük kamera Photo nesnesini ROI işlemi başlamadan bırakırız.
+        photo.dispose();
+        photoDisposed = true;
 
-      const indexSaveStartedAt = getCurrentTimeMs();
-      await appendCaptureSample(sample);
-      const indexSaveDuration = getCurrentTimeMs() - indexSaveStartedAt;
-      console.info(
-        `[Fotoğraf süre] odak=${focusDuration}ms, çekim=${captureDuration}ms, geçici_kayıt=${temporarySaveDuration}ms, normalize=${normalizationDuration}ms, ham_kayıt=${rawSaveDuration}ms, model=${detectionDuration}ms, roi=${roiDuration}ms, indeks=${indexSaveDuration}ms, toplam=${getCurrentTimeMs() - processingStartedAt}ms`
-      );
-      showFeedback(
-        fingerRois.length > 0
-          ? createCaptureQualityFeedback(fingerRois)
-          : detections.length > 0
-            ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
-            : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
-      );
+        const sampleId = createId('sample');
+        const rawSaveStartedAt = getCurrentTimeMs();
+        const rawImageUri = await saveRawImage(`file://${picturePath}`, sampleId);
+        const rawSaveDuration = getCurrentTimeMs() - rawSaveStartedAt;
+        const detectionStartedAt = getCurrentTimeMs();
+        const detections = await tryDetectFingertipsFromImage(sourceImage, rawImageUri);
+        const detectionDuration = getCurrentTimeMs() - detectionStartedAt;
+        const roiStartedAt = getCurrentTimeMs();
+        const fingerRois = await tryExtractFingerRois({
+          imageUri: rawImageUri,
+          imageSize: {
+            width: sourceImage.width,
+            height: sourceImage.height,
+          },
+          detections,
+          sampleId,
+          sourceImage,
+        });
+        const roiDuration = getCurrentTimeMs() - roiStartedAt;
+
+        // Kayıt ekranı kutuları metadata'dan çizer; ROI dosyaları ileride enrollment için hazır tutulur.
+        const sample: CaptureSample = {
+          id: sampleId,
+          createdAt: new Date().toISOString(),
+          rawImageUri,
+          rawImageSize: {
+            width: sourceImage.width,
+            height: sourceImage.height,
+          },
+          detections,
+          fingerRois,
+          deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
+          fingerLabel: 'unknown',
+          sessionId: createId('session'),
+          qualityStatus: getCaptureQualityStatus(fingerRois),
+          accepted: false,
+        };
+
+        const indexSaveStartedAt = getCurrentTimeMs();
+        await appendCaptureSample(sample);
+        const indexSaveDuration = getCurrentTimeMs() - indexSaveStartedAt;
+        console.info(
+          `[Fotoğraf süre] odak=${focusDuration}ms, çekim=${captureDuration}ms, kamera_jpeg=${temporarySaveDuration}ms, yön=${orientationDuration}ms, ham_kayıt=${rawSaveDuration}ms, model=${detectionDuration}ms, roi=${roiDuration}ms, indeks=${indexSaveDuration}ms, toplam=${getCurrentTimeMs() - processingStartedAt}ms`
+        );
+        showFeedback(
+          fingerRois.length > 0
+            ? createCaptureQualityFeedback(fingerRois)
+            : detections.length > 0
+              ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
+              : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
+        );
+      } finally {
+        if (!photoDisposed) photo.dispose();
+      }
     } catch (error) {
       console.warn('Fotoğraf kaydedilemedi.', error);
       showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
+      sourceImage?.dispose();
       captureMeteringActiveRef.current = false;
       photoProcessingActive.setBlocking(false);
       liveDetectionPausedRef.current = modelStatus !== 'ready' || !isScreenFocused;
@@ -914,6 +953,16 @@ export default function CameraScreen() {
     if (!isGranted) {
       showFeedback('Kamera izni verilmedi.', false);
     }
+  }
+
+  // Kullanıcının aynı sahneyi flaşlı ve flaşsız çekerek kalite sonuçlarını karşılaştırmasını sağlar.
+  function handleToggleFlash() {
+    if (!activeCameraHasFlash) {
+      showFeedback('Bu kamera flaşı desteklemiyor.');
+      return;
+    }
+
+    setIsFlashEnabled((currentValue) => !currentValue);
   }
 
   return (
@@ -970,7 +1019,7 @@ export default function CameraScreen() {
                   `[Yakın odak] lens=${activeDevice.type}, sanal=${activeDevice.isVirtualDevice}, zoom=${closeUpZoom.toFixed(2)}`
                 );
                 console.info(
-                  `[Kamera 3A] AF=${activeDevice.supportsFocusMetering}, AE=${activeDevice.supportsExposureMetering}, AWB=${activeDevice.supportsWhiteBalanceMetering}, poz_kademesi=${exposureCompensationIndex.toFixed(0)} [${activeDevice.minExposureBias.toFixed(0)},${activeDevice.maxExposureBias.toFixed(0)}], düşük_ışık=${activeDevice.supportsLowLightBoost}`
+                  `[Kamera 3A] AF=${activeDevice.supportsFocusMetering}, AE=${activeDevice.supportsExposureMetering}, AWB=${activeDevice.supportsWhiteBalanceMetering}, flaş=${activeDevice.hasFlash}, poz_kademesi=${exposureCompensationIndex.toFixed(0)} [${activeDevice.minExposureBias.toFixed(0)},${activeDevice.maxExposureBias.toFixed(0)}], düşük_ışık=${activeDevice.supportsLowLightBoost}`
                 );
               } catch (error) {
                 console.warn('Yakın çekim kamera ayarları uygulanamadı.', error);
@@ -1002,6 +1051,28 @@ export default function CameraScreen() {
           <ThemedText type="smallBold" style={styles.modeText}>
             Canlı takip
           </ThemedText>
+          <Pressable
+            accessibilityLabel="Fotoğraf flaşı"
+            accessibilityRole="switch"
+            accessibilityState={{
+              checked: isFlashEnabled,
+              disabled: !activeCameraHasFlash || isTakingPhoto,
+            }}
+            disabled={!activeCameraHasFlash || isTakingPhoto}
+            onPress={handleToggleFlash}
+            style={[
+              styles.flashToggle,
+              isFlashEnabled && styles.flashToggleActive,
+              (!activeCameraHasFlash || isTakingPhoto) && styles.disabledButton,
+            ]}>
+            <ThemedText type="smallBold" style={styles.flashToggleText}>
+              {activeCameraHasFlash
+                ? isFlashEnabled
+                  ? 'Flaş açık'
+                  : 'Flaş kapalı'
+                : 'Flaş yok'}
+            </ThemedText>
+          </Pressable>
         </View>
 
         <View style={styles.bottomControl}>
@@ -1051,8 +1122,11 @@ const styles = StyleSheet.create({
   },
   topControl: {
     minHeight: 56,
+    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.three,
+    paddingHorizontal: Spacing.four,
     backgroundColor: 'rgba(0, 0, 0, 0.28)',
   },
   modeText: {
@@ -1060,6 +1134,23 @@ const styles = StyleSheet.create({
     textShadowColor: 'rgba(0, 0, 0, 0.75)',
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 3,
+  },
+  flashToggle: {
+    minHeight: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.55)',
+    borderRadius: 6,
+    paddingHorizontal: Spacing.three,
+    backgroundColor: 'rgba(0, 0, 0, 0.36)',
+  },
+  flashToggleActive: {
+    borderColor: '#F5B844',
+    backgroundColor: 'rgba(245, 184, 68, 0.22)',
+  },
+  flashToggleText: {
+    color: '#ffffff',
   },
   bottomControl: {
     minHeight: 132,

@@ -24,6 +24,13 @@ export type BiometricRejectionReason =
   | 'evidence-count'
   | 'source-resolution';
 
+// Minutiae template kabulünün görüntü kalitesinden sonraki ayrı ret nedenini taşır.
+export type MinutiaeRejectionReason =
+  | 'capture-quality'
+  | 'search-area'
+  | 'candidate-count'
+  | 'candidate-overflow';
+
 // Her parmak ROI'si için cihaz üzerinde hesaplanan ayrıntılı kalite sonucunu taşır.
 export type FingerprintQuality = {
   globalScore: number;
@@ -39,6 +46,8 @@ export type FingerprintQuality = {
   orientationCoherence: number;
   orientationReliableBlockRatio: number;
   orientationMedianCorrectionDegrees: number;
+  orientationDetailBlockSize?: number;
+  orientationDetailVerifiedRatio?: number;
   ridgePeriodicity: number;
   ridgeFrequencyConsistency: number;
   ridgeValidBlockRatio: number;
@@ -56,6 +65,11 @@ export type FingerprintQuality = {
   ridgeRejectionSummary: string;
   ridgeEnhancementGainPercent: number;
   ridgeEnhancementSupportedAreaRatio: number;
+  minutiaeStatus?: 'sufficient' | 'insufficient';
+  minutiaeRejectionReason?: MinutiaeRejectionReason;
+  minutiaeCandidateCount?: number;
+  minutiaeSearchableAreaRatio?: number;
+  minutiaeLargestRegionRatio?: number;
   status: 'good' | 'medium' | 'poor';
   message: string;
 };
@@ -87,6 +101,27 @@ export type DetectedObbBox = {
   }[];
 };
 
+// İskelet üzerinde tespit edilen ridge sonu ve çatallanma noktalarının desteklenen türleri.
+export type MinutiaType = 'ending' | 'bifurcation';
+
+// Tek bir minutia noktasını kanonik ROI'ye göre normalize koordinat, yön ve güvenle taşır.
+export type FingerprintMinutia = {
+  x: number;
+  y: number;
+  angleDegrees: number;
+  type: MinutiaType;
+  confidence: number;
+};
+
+// Enrollment öncesi ilk yerel biyometrik şablon, görüntüden bağımsız normalize minutiae listesini saklar.
+export type FingerprintTemplate = {
+  version: 'minutiae-v1';
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+  minutiae: FingerprintMinutia[];
+};
+
 // Model kutusundan çıkarılan tek parmak ROI'sinin dosya ve koordinat bilgisini taşır.
 export type FingerRoi = {
   id: string;
@@ -98,6 +133,8 @@ export type FingerRoi = {
   segmentedImageUri?: string;
   enhancedImageUri?: string;
   orientationImageUri?: string;
+  minutiaeImageUri?: string;
+  minutiaeTemplate?: FingerprintTemplate;
   sourcePixelWidth?: number;
   canonicalRotationDegrees?: number;
   silhouetteAxisDegrees?: number;

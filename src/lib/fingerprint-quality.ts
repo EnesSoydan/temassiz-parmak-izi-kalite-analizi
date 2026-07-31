@@ -7,6 +7,7 @@ import type {
 } from '@/types/biometrics';
 import {
   estimateOrientationField,
+  selectVerifiedFineOrientationBlocks,
   type OrientationBlock,
 } from '@/lib/orientation-field';
 import {
@@ -48,6 +49,9 @@ const MIN_BLOCK_MASK_COVERAGE = 0.6;
 
 // Kitaptaki yerel kalite yaklaşımına uygun, ayarlanabilir blok taban genişliği.
 const BASE_BLOCK_SIZE = 16;
+
+// Araştırma aşamasında kaba yön kararını bozmadan daha yerel ridge akışını sınayan ince ızgara.
+const EXPERIMENTAL_FINE_ORIENTATION_BLOCK_SIZE = 8;
 
 // Segmentasyon maskesi içindeki ROI'yi bloklara ayırarak parmak bazında kalite sonucu üretir.
 export function analyzeFingerprintQuality({
@@ -116,12 +120,35 @@ export function analyzeFingerprintQualityDetailed({
       : primaryScale;
   const analyzedScaleCount = shouldAnalyzeSecondaryScale ? 2 : 1;
   const { orientationBlocks, ridgeFrequency } = selectedScale;
+  const fineOrientationBlocks = estimateOrientationField({
+    grayscale: featureGrayscale,
+    mask,
+    width,
+    height,
+    blockSize: EXPERIMENTAL_FINE_ORIENTATION_BLOCK_SIZE,
+    minMaskCoverage: MIN_BLOCK_MASK_COVERAGE,
+  });
+  const verifiedFineOrientationBlocks = selectVerifiedFineOrientationBlocks({
+    fineBlocks: fineOrientationBlocks,
+    referenceBlocks: orientationBlocks,
+  });
+  const finePrimaryBlockCount = fineOrientationBlocks.filter(
+    (block) =>
+      (block.gridOffset ?? 0) === 0 && block.maskCoverage >= 0.85
+  ).length;
+  const fineOrientationVerifiedRatio = Math.round(
+    (verifiedFineOrientationBlocks.length /
+      Math.max(finePrimaryBlockCount, 1)) *
+      100
+  );
   const orientationVisualization = createOrientationVisualization({
     grayscale: featureGrayscale,
     mask,
     width,
     height,
     orientationBlocks,
+    detailCandidateBlocks: fineOrientationBlocks,
+    detailOrientationBlocks: verifiedFineOrientationBlocks,
     frequencyBlocks: ridgeFrequency.blocks,
   });
   const blocks: BlockQuality[] = [];
@@ -137,6 +164,8 @@ export function analyzeFingerprintQualityDetailed({
       enhancedPixels: undefined,
       enhancementSupportedAreaRatio: 0,
       orientationPixels: orientationVisualization.pixels,
+      minutiaeSupportMask: undefined,
+      minutiaeOrientationMask: undefined,
     };
   }
 
@@ -218,6 +247,12 @@ export function analyzeFingerprintQualityDetailed({
     height,
     frequencyBlocks: ridgeFrequency.blocks,
   });
+  const minutiaeOrientationMask = createReliableOrientationMask({
+    mask,
+    width,
+    height,
+    orientationBlocks,
+  });
 
   const quality: FingerprintQuality = {
     globalScore: clampScore(globalScore),
@@ -236,6 +271,8 @@ export function analyzeFingerprintQualityDetailed({
     ),
     orientationMedianCorrectionDegrees:
       orientationVisualization.medianAngularCorrectionDegrees,
+    orientationDetailBlockSize: EXPERIMENTAL_FINE_ORIENTATION_BLOCK_SIZE,
+    orientationDetailVerifiedRatio: fineOrientationVerifiedRatio,
     ridgePeriodicity,
     ridgeFrequencyConsistency,
     ridgeValidBlockRatio,
@@ -269,7 +306,47 @@ export function analyzeFingerprintQualityDetailed({
     enhancedPixels: enhancement.pixels,
     enhancementSupportedAreaRatio: enhancement.supportedAreaRatio,
     orientationPixels: orientationVisualization.pixels,
+    minutiaeSupportMask: enhancement.minutiaeSupportMask,
+    minutiaeOrientationMask,
   };
+}
+
+// Minutiae aramasının Gabor adacıklarına hapsolmaması için güvenilir yön bloklarından sürekli bir izin alanı üretir.
+function createReliableOrientationMask({
+  mask,
+  width,
+  height,
+  orientationBlocks,
+}: {
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  orientationBlocks: OrientationBlock[];
+}) {
+  const orientationMask = new Uint8Array(mask.length);
+
+  for (const block of orientationBlocks) {
+    const smoothedCoherence = block.smoothedCoherence ?? block.coherence;
+    if (
+      block.maskCoverage < 0.72 ||
+      block.coherence < 0.18 ||
+      smoothedCoherence < 0.34 ||
+      block.neighborhoodConsistency < 0.34
+    ) {
+      continue;
+    }
+
+    const right = Math.min(width, block.left + block.size);
+    const bottom = Math.min(height, block.top + block.size);
+    for (let y = Math.max(0, block.top); y < bottom; y += 1) {
+      for (let x = Math.max(0, block.left); x < right; x += 1) {
+        const index = y * width + x;
+        if (mask[index]) orientationMask[index] = 1;
+      }
+    }
+  }
+
+  return orientationMask;
 }
 
 // Segmentasyon geçersizse kaydı korurken kalite sonucunu açıkça başarısız işaretler.

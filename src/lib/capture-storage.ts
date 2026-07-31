@@ -1,5 +1,6 @@
 import * as FileSystem from 'expo-file-system/legacy';
 
+import { sortFingerRois } from '@/lib/finger-order';
 import type {
   CaptureSample,
   DetectionClassName,
@@ -15,6 +16,7 @@ const CANONICAL_ROI_DIR = `${ROOT_DIR}canonical-roi/`;
 const SEGMENTED_ROI_DIR = `${ROOT_DIR}segmented-roi/`;
 const ENHANCED_ROI_DIR = `${ROOT_DIR}enhanced-roi/`;
 const ORIENTATION_ROI_DIR = `${ROOT_DIR}orientation-roi/`;
+const MINUTIAE_ROI_DIR = `${ROOT_DIR}minutiae-roi/`;
 const PROCESSED_ROI_DIR = `${ROOT_DIR}processed-roi/`;
 const INDEX_FILE = `${ROOT_DIR}captures.json`;
 const CALIBRATION_SUMMARY_FILE = `${ROOT_DIR}quality-calibration-summary.json`;
@@ -28,6 +30,7 @@ export async function ensureCaptureStorage() {
   await ensureDirectory(SEGMENTED_ROI_DIR);
   await ensureDirectory(ENHANCED_ROI_DIR);
   await ensureDirectory(ORIENTATION_ROI_DIR);
+  await ensureDirectory(MINUTIAE_ROI_DIR);
   await ensureDirectory(PROCESSED_ROI_DIR);
 }
 
@@ -98,6 +101,15 @@ export async function createOrientationFingerRoiImageUri(
   return `${ORIENTATION_ROI_DIR}${sampleId}-${className}.jpg`;
 }
 
+// İskelet ve minutiae adaylarının doğrulama görseli için kalıcı dosya yolunu hazırlar.
+export async function createMinutiaeFingerRoiImageUri(
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  return `${MINUTIAE_ROI_DIR}${sampleId}-${className}.jpg`;
+}
+
 // Ön işlemden geçmiş ROI JPEG base64 verisini ayrı dosya olarak yazar.
 export async function saveProcessedRoiImage(base64: string, sampleId: string) {
   await ensureCaptureStorage();
@@ -117,15 +129,27 @@ export async function loadCaptureSamples(): Promise<CaptureSample[]> {
   }
 
   const text = await FileSystem.readAsStringAsync(INDEX_FILE);
-  return JSON.parse(text) as CaptureSample[];
+  const samples = JSON.parse(text) as CaptureSample[];
+
+  // Eski kayıtların metadata sırası farklı olsa da uygulamada aynı parmak düzenini kullanırız.
+  return samples.map(normalizeSampleFingerOrder);
 }
 
 // Yeni capture örneğini listenin başına ekler ve index dosyasını günceller.
 export async function appendCaptureSample(sample: CaptureSample) {
   const samples = await loadCaptureSamples();
-  const nextSamples = [sample, ...samples];
+  const nextSamples = [normalizeSampleFingerOrder(sample), ...samples];
   await FileSystem.writeAsStringAsync(INDEX_FILE, JSON.stringify(nextSamples, null, 2));
   return nextSamples;
+}
+
+// Bir kaydın parmak ROI metadata'sını dosya yollarına dokunmadan sabit sıraya getirir.
+function normalizeSampleFingerOrder(sample: CaptureSample): CaptureSample {
+  if (!sample.fingerRois) return sample;
+  return {
+    ...sample,
+    fingerRois: sortFingerRois(sample.fingerRois),
+  };
 }
 
 // Kullanıcının verdiği kalite etiketini yalnızca capture metadata'sında günceller.
@@ -179,6 +203,10 @@ export async function exportQualityCalibrationSummary() {
                 fingerRoi.quality.orientationReliableBlockRatio ?? 0,
               orientationMedianCorrectionDegrees:
                 fingerRoi.quality.orientationMedianCorrectionDegrees ?? 0,
+              orientationDetailBlockSize:
+                fingerRoi.quality.orientationDetailBlockSize ?? 0,
+              orientationDetailVerifiedRatio:
+                fingerRoi.quality.orientationDetailVerifiedRatio ?? 0,
               ridgePeriodicity: fingerRoi.quality.ridgePeriodicity,
               ridgeFrequencyConsistency:
                 fingerRoi.quality.ridgeFrequencyConsistency,
@@ -272,6 +300,11 @@ export async function deleteCaptureSample(sampleId: string) {
         // Orientation doğrulama haritası varsa parmak kaydıyla birlikte sileriz.
         if (fingerRoi.orientationImageUri) {
           await deleteFileIfExists(fingerRoi.orientationImageUri);
+        }
+
+        // Minutiae iskelet görseli varsa diğer parmak çıktılarıyla birlikte temizleriz.
+        if (fingerRoi.minutiaeImageUri) {
+          await deleteFileIfExists(fingerRoi.minutiaeImageUri);
         }
       })
     );

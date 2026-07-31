@@ -12,6 +12,9 @@ type RidgeEnhancementInput = {
   frequencyBlocks: RidgeFrequencyBlock[];
 };
 
+// Minutiae için yalnızca Gabor katkısının blok geçişlerinden yeterince uzakta olduğu alanı kabul ederiz.
+const MIN_MINUTIAE_ENHANCEMENT_WEIGHT = 0.08;
+
 // Yalnızca ham veride doğrulanmış ridge bloklarında yön ve periyoda uyarlanmış Gabor yanıtı üretir.
 export function createControlledRidgeEnhancement({
   grayscale,
@@ -38,6 +41,7 @@ export function createControlledRidgeEnhancement({
 
   const pixels = new Uint8Array(mask.length * 4);
   const enhancedGrayscale = new Uint8Array(mask.length);
+  const minutiaeSupportMask = new Uint8Array(mask.length);
   let supportedPixelCount = 0;
   let foregroundPixelCount = 0;
 
@@ -59,6 +63,12 @@ export function createControlledRidgeEnhancement({
       : 0;
     if (isForeground) foregroundPixelCount += 1;
     if (enhancementWeight > 0.08) supportedPixelCount += 1;
+    if (
+      isForeground &&
+      enhancementWeight >= MIN_MINUTIAE_ENHANCEMENT_WEIGHT
+    ) {
+      minutiaeSupportMask[index] = 1;
+    }
     enhancedGrayscale[index] = value;
     pixels[outputIndex] = value;
     pixels[outputIndex + 1] = value;
@@ -82,6 +92,7 @@ export function createControlledRidgeEnhancement({
     contrastBefore: contrastMeasurement.before,
     contrastAfter: contrastMeasurement.after,
     contrastGainPercent: contrastMeasurement.gainPercent,
+    minutiaeSupportMask,
   };
 }
 

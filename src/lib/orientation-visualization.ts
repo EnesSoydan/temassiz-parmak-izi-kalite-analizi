@@ -7,6 +7,8 @@ type OrientationVisualizationInput = {
   width: number;
   height: number;
   orientationBlocks: OrientationBlock[];
+  detailCandidateBlocks?: OrientationBlock[];
+  detailOrientationBlocks?: OrientationBlock[];
   frequencyBlocks?: RidgeFrequencyBlock[];
 };
 
@@ -17,6 +19,8 @@ export function createOrientationVisualization({
   width,
   height,
   orientationBlocks,
+  detailCandidateBlocks = [],
+  detailOrientationBlocks = [],
   frequencyBlocks = [],
 }: OrientationVisualizationInput) {
   const pixels = new Uint8Array(mask.length * 4);
@@ -34,23 +38,57 @@ export function createOrientationVisualization({
     pixels[outputIndex + 3] = 255;
   }
 
-  // İç blok çerçevesi yeşilse frekans kanıtı geçerli, kırmızıysa reddedilmiş, sarıysa yön adayı olamamıştır.
-  for (const block of primaryBlocks.filter((item) => item.maskCoverage >= 0.85)) {
-    const frequencyBlock = findFrequencyBlockForOrientationBlock(
-      block,
-      frequencyBlocks
-    );
-    const color: [number, number, number] = frequencyBlock
-      ? frequencyBlock.valid
+  const fineCandidateBlocks = detailCandidateBlocks.filter(
+    (block) => (block.gridOffset ?? 0) === 0 && block.maskCoverage >= 0.85
+  );
+  const verifiedFineBlockKeys = new Set(
+    detailOrientationBlocks.map(getOrientationBlockKey)
+  );
+
+  if (fineCandidateBlocks.length > 0) {
+    // Her 8x8 hücreyi kendi yerel yön güveni ve kaba yönle uyumuna göre ayrı çerçeveleriz.
+    for (const block of fineCandidateBlocks) {
+      const confidence = getOrientationBlockConfidence(block);
+      const color: [number, number, number] = verifiedFineBlockKeys.has(
+        getOrientationBlockKey(block)
+      )
         ? [47, 209, 107]
-        : [229, 72, 77]
-      : [245, 184, 68];
-    drawBlockOutline(pixels, mask, width, height, block, color);
+        : confidence >= 0.45
+          ? [229, 72, 77]
+          : [245, 184, 68];
+      drawBlockOutline(pixels, mask, width, height, block, color);
+    }
+  } else {
+    // İnce deney kapalıysa eski frekans kanıt çerçevelerini kaba yön ölçeğinde gösteririz.
+    for (const block of primaryBlocks.filter(
+      (item) => item.maskCoverage >= 0.85
+    )) {
+      const frequencyBlock = findFrequencyBlockForOrientationBlock(
+        block,
+        frequencyBlocks
+      );
+      const color: [number, number, number] = frequencyBlock
+        ? frequencyBlock.valid
+          ? [47, 209, 107]
+          : [229, 72, 77]
+        : [245, 184, 68];
+      drawBlockOutline(pixels, mask, width, height, block, color);
+    }
   }
 
-  for (const block of primaryBlocks) {
+  const directionBlocks =
+    fineCandidateBlocks.length > 0 ? fineCandidateBlocks : primaryBlocks;
+
+  // İnce ızgarada her hücrenin yönünü gösterir; doğrulanmayan çizgileri gri tutarak sonuçtan ayırırız.
+  for (const block of directionBlocks) {
     const confidence = getOrientationBlockConfidence(block);
-    const color = getOrientationColor(confidence);
+    const isVerifiedFineBlock = verifiedFineBlockKeys.has(
+      getOrientationBlockKey(block)
+    );
+    const color =
+      fineCandidateBlocks.length > 0 && !isVerifiedFineBlock
+        ? ([120, 130, 140] as [number, number, number])
+        : getOrientationColor(confidence);
     const centerX = block.left + block.size / 2;
     const centerY = block.top + block.size / 2;
     const halfLength = block.size * 0.34;
@@ -66,7 +104,8 @@ export function createOrientationVisualization({
       centerY - deltaY,
       centerX + deltaX,
       centerY + deltaY,
-      color
+      color,
+      block.size <= 10 ? 0 : 1
     );
   }
 
@@ -85,6 +124,11 @@ export function createOrientationVisualization({
       )
     ),
   };
+}
+
+// Aynı fiziksel ince hücreyi aday ve doğrulanmış listeler arasında kararlı biçimde eşleştirir.
+function getOrientationBlockKey(block: OrientationBlock) {
+  return `${block.left}:${block.top}:${block.size}:${block.gridOffset ?? 0}`;
 }
 
 // İki kaydırılmış ızgaradaki frekans ölçümünü aynı fiziksel ana yön hücresiyle eşleştirir.
@@ -164,7 +208,8 @@ function drawThickLine(
   startY: number,
   endX: number,
   endY: number,
-  color: [number, number, number]
+  color: [number, number, number],
+  thickness: number
 ) {
   const steps = Math.max(
     1,
@@ -176,9 +221,9 @@ function drawThickLine(
     const x = Math.round(startX + (endX - startX) * ratio);
     const y = Math.round(startY + (endY - startY) * ratio);
 
-    for (let offsetY = -1; offsetY <= 1; offsetY += 1) {
-      for (let offsetX = -1; offsetX <= 1; offsetX += 1) {
-        if (Math.abs(offsetX) + Math.abs(offsetY) > 1) continue;
+    for (let offsetY = -thickness; offsetY <= thickness; offsetY += 1) {
+      for (let offsetX = -thickness; offsetX <= thickness; offsetX += 1) {
+        if (Math.abs(offsetX) + Math.abs(offsetY) > thickness) continue;
         writeColorPixel(
           pixels,
           mask,

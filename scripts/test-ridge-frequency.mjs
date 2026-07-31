@@ -5,7 +5,10 @@ import {
   hasStrongLocalOrientationEvidence,
   shouldTrySecondaryRidgeScale,
 } from '../src/lib/fingerprint-quality-config.ts';
-import { estimateOrientationField } from '../src/lib/orientation-field.ts';
+import {
+  estimateOrientationField,
+  selectVerifiedFineOrientationBlocks,
+} from '../src/lib/orientation-field.ts';
 import { createOrientationVisualization } from '../src/lib/orientation-visualization.ts';
 import {
   estimateRidgeFrequency,
@@ -214,6 +217,48 @@ const countInflatedScale = selectPreferredRidgeScale(
     },
   }
 );
+const verifiedFineOrientationBlocks = selectVerifiedFineOrientationBlocks({
+  referenceBlocks: [
+    {
+      left: 16,
+      top: 16,
+      size: 24,
+      angleRadians: Math.PI / 2,
+      coherence: 0.9,
+      smoothedCoherence: 0.9,
+      neighborhoodConsistency: 0.9,
+      gradientEnergy: 500,
+      maskCoverage: 1,
+      gridOffset: 0,
+    },
+  ],
+  fineBlocks: [
+    {
+      left: 24,
+      top: 24,
+      size: 8,
+      angleRadians: Math.PI / 2,
+      coherence: 0.9,
+      smoothedCoherence: 0.9,
+      neighborhoodConsistency: 0.9,
+      gradientEnergy: 500,
+      maskCoverage: 1,
+      gridOffset: 0,
+    },
+    {
+      left: 16,
+      top: 24,
+      size: 8,
+      angleRadians: 0,
+      coherence: 0.9,
+      smoothedCoherence: 0.9,
+      neighborhoodConsistency: 0.9,
+      gradientEnergy: 500,
+      maskCoverage: 1,
+      gridOffset: 0,
+    },
+  ],
+});
 
 assert.ok(periodic.ridgePeriodicity >= 55, 'Düzenli ridge sinyali yüksek periyodiklik vermeli.');
 assert.ok(periodic.validBlockRatio >= 0.75, 'Düzenli ridge bloklarının çoğu geçerli olmalı.');
@@ -300,6 +345,16 @@ assert.equal(
   countInflatedScale.id,
   'primary',
   'Yalnızca daha çok küçük blok üretmek ikinci ölçeği seçmek için yeterli olmamalı.'
+);
+assert.equal(
+  verifiedFineOrientationBlocks.length,
+  1,
+  '8x8 yön katmanı kaba yönle uyuşan yerel çizgiyi tutup çelişen çizgiyi reddetmeli.'
+);
+assert.equal(
+  verifiedFineOrientationBlocks[0]?.size,
+  8,
+  'Doğrulanan deneysel yön çizgisi 8x8 bloktan gelmeli.'
 );
 
 // Orientation görselindeki gri tabandan farklı renkli yön çizgilerini sayar.
