@@ -20,6 +20,132 @@ export type SegmentationResult = {
   };
 };
 
+// RGBA ve segmentasyon maskesini aynı merkez etrafında döndürerek kanonik ROI düzeltmesi için kullanılır.
+export type RotatedRgbaMask = {
+  pixels: Uint8Array;
+  mask: Uint8Array;
+  width: number;
+  height: number;
+};
+
+// ROI kaynağını kırpmadan, döndürme sonrası oluşan yeni tuvale bilinear örneklemeyle taşır.
+export function rotateRgbaAndMask(
+  pixels: Uint8Array,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  degrees: number
+): RotatedRgbaMask {
+  const radians = (degrees * Math.PI) / 180;
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+  const rotatedWidth = Math.max(
+    1,
+    Math.ceil(Math.abs(width * cosine) + Math.abs(height * sine))
+  );
+  const rotatedHeight = Math.max(
+    1,
+    Math.ceil(Math.abs(width * sine) + Math.abs(height * cosine))
+  );
+  const outputPixels = new Uint8Array(rotatedWidth * rotatedHeight * 4);
+  const outputMask = new Uint8Array(rotatedWidth * rotatedHeight);
+  const sourceCenterX = (width - 1) / 2;
+  const sourceCenterY = (height - 1) / 2;
+  const targetCenterX = (rotatedWidth - 1) / 2;
+  const targetCenterY = (rotatedHeight - 1) / 2;
+
+  // Hedef pikseli ters dönüşümle kaynakta örnekleyerek ridge detayını mümkün olduğunca korur.
+  for (let targetY = 0; targetY < rotatedHeight; targetY += 1) {
+    for (let targetX = 0; targetX < rotatedWidth; targetX += 1) {
+      const targetDeltaX = targetX - targetCenterX;
+      const targetDeltaY = targetY - targetCenterY;
+      const sourceX =
+        sourceCenterX + cosine * targetDeltaX + sine * targetDeltaY;
+      const sourceY =
+        sourceCenterY - sine * targetDeltaX + cosine * targetDeltaY;
+      const outputPixelIndex = targetY * rotatedWidth + targetX;
+      const outputDataIndex = outputPixelIndex * 4;
+
+      if (
+        sourceX < 0 ||
+        sourceX > width - 1 ||
+        sourceY < 0 ||
+        sourceY > height - 1
+      ) {
+        outputPixels[outputDataIndex + 3] = 255;
+        continue;
+      }
+
+      const left = Math.floor(sourceX);
+      const top = Math.floor(sourceY);
+      const right = Math.min(left + 1, width - 1);
+      const bottom = Math.min(top + 1, height - 1);
+      const horizontalWeight = sourceX - left;
+      const verticalWeight = sourceY - top;
+      const samples = [
+        {
+          index: (top * width + left) * 4,
+          weight: (1 - horizontalWeight) * (1 - verticalWeight),
+        },
+        {
+          index: (top * width + right) * 4,
+          weight: horizontalWeight * (1 - verticalWeight),
+        },
+        {
+          index: (bottom * width + left) * 4,
+          weight: (1 - horizontalWeight) * verticalWeight,
+        },
+        {
+          index: (bottom * width + right) * 4,
+          weight: horizontalWeight * verticalWeight,
+        },
+      ];
+
+      for (let channel = 0; channel < 3; channel += 1) {
+        outputPixels[outputDataIndex + channel] = Math.round(
+          samples.reduce(
+            (sum, sample) => sum + pixels[sample.index + channel] * sample.weight,
+            0
+          )
+        );
+      }
+      outputPixels[outputDataIndex + 3] = 255;
+      const nearestX = Math.round(sourceX);
+      const nearestY = Math.round(sourceY);
+      outputMask[outputPixelIndex] = mask[nearestY * width + nearestX] ?? 0;
+    }
+  }
+
+  return {
+    pixels: outputPixels,
+    mask: outputMask,
+    width: rotatedWidth,
+    height: rotatedHeight,
+  };
+}
+
+// Düzeltilmiş kanonik RGBA tamponunu tam çözünürlükte JPEG olarak saklar.
+export async function saveRgbaImage({
+  pixels,
+  width,
+  height,
+  outputImageUri,
+  quality = 95,
+}: {
+  pixels: Uint8Array;
+  width: number;
+  height: number;
+  outputImageUri: string;
+  quality?: number;
+}) {
+  ensureJpegBufferShim();
+  const jpeg = encode({ data: pixels, width, height }, quality);
+  await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  return outputImageUri;
+}
+
 type YCrCbColor = {
   y: number;
   cr: number;
@@ -47,15 +173,29 @@ export async function segmentFingerRoiImage({
   roiImageUri,
   outputImageUri,
   sourceWidth,
+  persistOutput = true,
+  preparedImage,
 }: {
   roiImageUri: string;
-  outputImageUri: string;
+  outputImageUri?: string;
   sourceWidth: number;
+  persistOutput?: boolean;
+  preparedImage?: {
+    pixels: Uint8Array;
+    width: number;
+    height: number;
+  };
 }): Promise<SegmentationResult | null> {
   ensureJpegBufferShim();
 
   const decodeStartedAt = Date.now();
-  const image = await loadAnalysisImage(roiImageUri, sourceWidth);
+  const image = preparedImage
+    ? {
+        data: preparedImage.pixels,
+        width: preparedImage.width,
+        height: preparedImage.height,
+      }
+    : await loadAnalysisImage(roiImageUri, sourceWidth);
   const decodeMs = Date.now() - decodeStartedAt;
   const sourcePixels = new Uint8Array(image.data);
   const maskStartedAt = Date.now();
@@ -98,21 +238,36 @@ export async function segmentFingerRoiImage({
   const silhouetteAxisDegrees = estimateMaskPrincipalAxis(mask, image.width, image.height);
   const maskMs = Date.now() - maskStartedAt;
   console.info(`[ROI segmentasyon] yöntem=${method}, kapsam=${formatCoverage(coverage)}`);
-  const enhancementStartedAt = Date.now();
-  const segmentedPixels = createEnhancedSegmentedPixels(sourcePixels, mask, image.width, image.height);
-  const enhancementMs = Date.now() - enhancementStartedAt;
+  let enhancementMs = 0;
+  let encodeMs = 0;
+  let writeMs = 0;
 
-  const encodeStartedAt = Date.now();
-  const jpeg = encode({ data: segmentedPixels, width: image.width, height: image.height }, 95);
-  const encodeMs = Date.now() - encodeStartedAt;
-  const writeStartedAt = Date.now();
-  await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
-    encoding: FileSystem.EncodingType.Base64,
-  });
-  const writeMs = Date.now() - writeStartedAt;
+  // Karşılaştırma ROI'sinde yalnızca piksel ve maske gerekir; ikinci Seg JPEG'i üretmeyerek süreyi sınırlarız.
+  if (persistOutput && outputImageUri) {
+    const enhancementStartedAt = Date.now();
+    const segmentedPixels = createEnhancedSegmentedPixels(
+      sourcePixels,
+      mask,
+      image.width,
+      image.height
+    );
+    enhancementMs = Date.now() - enhancementStartedAt;
+
+    const encodeStartedAt = Date.now();
+    const jpeg = encode(
+      { data: segmentedPixels, width: image.width, height: image.height },
+      90
+    );
+    encodeMs = Date.now() - encodeStartedAt;
+    const writeStartedAt = Date.now();
+    await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    writeMs = Date.now() - writeStartedAt;
+  }
 
   return {
-    imageUri: outputImageUri,
+    imageUri: outputImageUri ?? roiImageUri,
     pixels: sourcePixels,
     mask,
     width: image.width,
@@ -691,24 +846,9 @@ function base64ToBytes(base64: string) {
   return bytes;
 }
 
-// JPEG encoder çıktısını dosyaya yazılabilecek base64 string'e dönüştürür.
+// JPEG encoder çıktısını native Buffer polyfill ile tek çağrıda base64 metnine dönüştürür.
 function bytesToBase64(bytes: Uint8Array) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let result = '';
-
-  for (let i = 0; i < bytes.length; i += 3) {
-    const byte1 = bytes[i] ?? 0;
-    const byte2 = bytes[i + 1] ?? 0;
-    const byte3 = bytes[i + 2] ?? 0;
-    const encoded = (byte1 << 16) | (byte2 << 8) | byte3;
-
-    result += chars[(encoded >> 18) & 63];
-    result += chars[(encoded >> 12) & 63];
-    result += i + 1 < bytes.length ? chars[(encoded >> 6) & 63] : '=';
-    result += i + 2 < bytes.length ? chars[encoded & 63] : '=';
-  }
-
-  return result;
+  return Buffer.from(bytes).toString('base64');
 }
 
 // 8-bit histogram üzerinden sıralama yapmadan maskeli alanın %4-%96 kontrast sınırlarını bulur.

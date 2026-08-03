@@ -12,6 +12,7 @@ import {
   type CameraRef as VisionCameraRef,
   type Constraint,
   type MeteringMode,
+  type Photo,
   useCameraDevice,
   useCameraPermission,
   useFrameOutput,
@@ -52,6 +53,12 @@ type LiveDetectionOverlayProps = {
 type LiveDetectionTrack = {
   detection: DetectedObbBox;
   missedUpdates: number;
+};
+
+type PreparedCapturePhoto = {
+  image: NitroImage;
+  temporaryPath: string;
+  preparationDurationMs: number;
 };
 
 // Mobil model için yeterli ayrıntıyı koruyan canlı kamera çözünürlüğü.
@@ -404,27 +411,113 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
 
-// Native model girdisi boş kalırsa yalnızca tespit için güvenilir JPEG yoluna geri düşer.
+// Kamera fotoğrafını yön bilgisi uygulanmış native görüntüye ve geçici JPEG yoluna dönüştürür.
+async function prepareCapturedPhoto(
+  photo: Photo,
+  lighting: 'flaşsız' | 'flaşlı'
+): Promise<PreparedCapturePhoto> {
+  const preparationStartedAt = getCurrentTimeMs();
+
+  try {
+    const image = await photo.toImageAsync();
+    // EXIF yönünü dosya pikseline uygularız; JPEG fallback ve ROI koordinatları aynı ekseni kullanır.
+    const temporaryPath = await image.saveToTemporaryFileAsync('jpg', 95);
+    console.info(
+      `[Fotoğraf kaynak] ışık=${lighting}, sensör=${photo.width}x${photo.height}, yön=${photo.orientation}, işleme=${image.width}x${image.height}, ham=${photo.isRawPhoto}, hat=native`
+    );
+    return {
+      image,
+      temporaryPath,
+      preparationDurationMs: getCurrentTimeMs() - preparationStartedAt,
+    };
+  } finally {
+    photo.dispose();
+  }
+}
+
+// Native model bir sınıfı kaçırırsa aynı sabit JPEG'i de tarayıp sınıf başına en güvenilir kutuyu tutar.
 async function tryDetectFingertipsFromImage(
   image: NitroImage,
   fallbackImageUri: string
 ) {
-  try {
-    const nativeDetections = await detectFingertipObbBoxesFromImage(image);
-    if (nativeDetections.length > 0) return nativeDetections;
+  let nativeDetections: DetectedObbBox[] = [];
 
-    console.info('[Fotoğraf model] native RGBA sonuç boş, JPEG yedeği deneniyor.');
-    return await detectFingertipObbBoxes(fallbackImageUri);
+  try {
+    nativeDetections = await detectFingertipObbBoxesFromImage(image);
+    if (nativeDetections.length >= 4) return nativeDetections;
   } catch (error) {
     console.warn('Parmak ucu modeli native görüntüyle çalıştırılamadı.', error);
+  }
 
-    try {
-      return await detectFingertipObbBoxes(fallbackImageUri);
-    } catch (fallbackError) {
-      console.warn('Parmak ucu modeli JPEG yedeğiyle de çalıştırılamadı.', fallbackError);
-      return [];
+  try {
+    const jpegDetections = await detectFingertipObbBoxes(fallbackImageUri);
+    return mergeBestDetections(nativeDetections, jpegDetections);
+  } catch (fallbackError) {
+    console.warn('Parmak ucu modeli JPEG yedeğiyle de çalıştırılamadı.', fallbackError);
+    return nativeDetections;
+  }
+}
+
+// Birden fazla model sonucundan her parmak sınıfının en güvenilir kutusunu seçer.
+function mergeBestDetections(...groups: DetectedObbBox[][]) {
+  const bestByClass = new Map<DetectedObbBox['className'], DetectedObbBox>();
+  for (const detection of groups.flat()) {
+    const current = bestByClass.get(detection.className);
+    if (!current || detection.confidence > current.confidence) {
+      bestByClass.set(detection.className, detection);
     }
   }
+  return [...bestByClass.values()];
+}
+
+// Her pozlamadaki aynı sınıfı karşılaştırıp daha güvenilir kutunun kaynağını taşır.
+function selectBestDetectionsAcrossExposure(
+  ambientDetections: DetectedObbBox[],
+  flashDetections: DetectedObbBox[]
+) {
+  const ambientByClass = new Map(
+    ambientDetections.map((detection) => [detection.className, detection])
+  );
+  const flashByClass = new Map(
+    flashDetections.map((detection) => [detection.className, detection])
+  );
+  const allClasses = new Set([
+    ...ambientByClass.keys(),
+    ...flashByClass.keys(),
+  ]);
+  const detections: DetectedObbBox[] = [];
+  const sourceByClassName = new Map<
+    DetectedObbBox['className'],
+    'ambient' | 'flash'
+  >();
+  const selectedFromFlash: DetectedObbBox['className'][] = [];
+
+  // Her parmak için en yüksek güveni seçmek, flaşta açılan serçe gibi durumları korur.
+  for (const className of allClasses) {
+    const ambient = ambientByClass.get(className);
+    const flash = flashByClass.get(className);
+    const selected = !ambient || (flash && flash.confidence > ambient.confidence)
+      ? flash
+      : ambient;
+
+    if (!selected) continue;
+    detections.push(selected);
+    const source = selected === flash ? 'flash' : 'ambient';
+    sourceByClassName.set(className, source);
+    if (source === 'flash') {
+      selectedFromFlash.push(className);
+    }
+  }
+
+  return { detections, sourceByClassName, selectedFromFlash };
+}
+
+// Model sonuçlarını çift çekim logunda kısa ve okunabilir biçimde gösterir.
+function formatDetectionSummary(detections: DetectedObbBox[]) {
+  if (detections.length === 0) return 'boş';
+  return detections
+    .map((detection) => `${detection.className}:${detection.confidence.toFixed(2)}`)
+    .join(',');
 }
 
 // ROI çıkarma hatası fotoğraf kaydını iptal etmesin diye çoklu parmak kırpmayı güvenli çalıştırır.
@@ -434,12 +527,24 @@ async function tryExtractFingerRois({
   detections,
   sampleId,
   sourceImage,
+  sourceImagesByClassName,
+  comparisonImagesByClassName,
+  comparisonDetectionsByClassName,
 }: {
   imageUri: string;
   imageSize: NonNullable<CaptureSample['rawImageSize']>;
   detections: DetectedObbBox[];
   sampleId: string;
   sourceImage?: NitroImage;
+  sourceImagesByClassName?: ReadonlyMap<DetectedObbBox['className'], NitroImage>;
+  comparisonImagesByClassName?: ReadonlyMap<
+    DetectedObbBox['className'],
+    NitroImage
+  >;
+  comparisonDetectionsByClassName?: ReadonlyMap<
+    DetectedObbBox['className'],
+    DetectedObbBox
+  >;
 }) {
   try {
     return await extractFingerRoisFromImage({
@@ -448,6 +553,9 @@ async function tryExtractFingerRois({
       detections,
       sampleId,
       sourceImage,
+      sourceImagesByClassName,
+      comparisonImagesByClassName,
+      comparisonDetectionsByClassName,
     });
   } catch (error) {
     console.warn('Parmak ROI görselleri çıkarılamadı.', error);
@@ -474,8 +582,8 @@ export default function CameraScreen() {
   const [isScreenFocused, setIsScreenFocused] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
-  // Flaş deneyi sırasında ilk çekimi doğrudan flaşlı başlatır; kullanıcı üst anahtardan kapatabilir.
-  const [isFlashEnabled, setIsFlashEnabled] = useState(true);
+  // Çift çekim deneyi varsayılan olarak açıktır; kullanıcı üst anahtardan tek çekime dönebilir.
+  const [isDualCaptureEnabled, setIsDualCaptureEnabled] = useState(true);
   const [liveDetections, setLiveDetections] = useState<DetectedObbBox[]>([]);
   const [liveDetectionFrame, setLiveDetectionFrame] = useState<LiveDetectionFrame | null>(null);
   const [modelStatus, setModelStatus] = useState<'loading' | 'ready' | 'error'>('loading');
@@ -604,7 +712,19 @@ export default function CameraScreen() {
         const image = HybridFrameConverter.convertFrameToImage(frame);
 
         try {
-          const resizedImage = image.resize(FINGERTIP_MODEL_SIZE, FINGERTIP_MODEL_SIZE);
+          // Worklet dışındaki JavaScript fonksiyonlarına senkron çağrı yapmamak için oran hesabı burada tutulur.
+          const inferenceScale = Math.min(
+            1,
+            FINGERTIP_MODEL_SIZE / Math.max(sourceWidth, sourceHeight)
+          );
+          const inferenceSize = {
+            width: Math.max(1, Math.round(sourceWidth * inferenceScale)),
+            height: Math.max(1, Math.round(sourceHeight * inferenceScale)),
+          };
+          const resizedImage = image.resize(
+            inferenceSize.width,
+            inferenceSize.height
+          );
 
           try {
             // Native ham tamponu görüntü serbest bırakılmadan önce bağımsız JavaScript belleğine kopyalar.
@@ -616,8 +736,8 @@ export default function CameraScreen() {
             scheduleOnRN(
               processLiveModelFrame,
               copiedPixels.buffer,
-              FINGERTIP_MODEL_SIZE,
-              FINGERTIP_MODEL_SIZE,
+              inferenceSize.width,
+              inferenceSize.height,
               sourceWidth,
               sourceHeight
             );
@@ -797,111 +917,192 @@ export default function CameraScreen() {
     // Odak ve gerçek deklanşör tamamlanana kadar kullanıcının elini kadrajda sabit tutmasını ister.
     showFeedback('Elini sabit tut, fotoğraf çekiliyor...', false);
     const processingStartedAt = getCurrentTimeMs();
-    let sourceImage: NitroImage | undefined;
+    let ambientSourceImage: NitroImage | undefined;
+    let flashSourceImage: NitroImage | undefined;
 
     try {
       const focusStartedAt = getCurrentTimeMs();
       await focusCameraBeforeCapture();
       const focusDuration = getCurrentTimeMs() - focusStartedAt;
 
-      const captureStartedAt = getCurrentTimeMs();
-      const shouldUseFlash =
-        isFlashEnabled &&
+      const shouldCaptureExposurePair =
+        isDualCaptureEnabled &&
         (cameraRef.current?.controller?.device.hasFlash ?? false);
-      const photo = await photoOutput.capturePhoto(
+
+      // İlk kareyi ortam ışığında alırız; ana kayıt ve kutu koordinatları bu kareyi temel alır.
+      const ambientCaptureStartedAt = getCurrentTimeMs();
+      const ambientPhoto = await photoOutput.capturePhoto(
         {
-          flashMode: shouldUseFlash ? 'on' : 'off',
+          flashMode: 'off',
           enableRedEyeReduction: false,
           enableShutterSound: false,
         },
         {}
       );
-      const captureDuration = getCurrentTimeMs() - captureStartedAt;
-      // Bu noktadan sonra bütün model ve ROI işlemleri sabit JPEG üzerinde çalışır; el artık çekilebilir.
-      showFeedback('Fotoğraf alındı, işleniyor...', false);
-      console.info(`[Çekim ışık] flaş=${shouldUseFlash ? 'on' : 'off'}`);
-      let picturePath: string;
-      const sourceOrientation = photo.orientation;
-      const physicalWidth = photo.width;
-      const physicalHeight = photo.height;
-      let photoDisposed = false;
+      const ambientCaptureDuration = getCurrentTimeMs() - ambientCaptureStartedAt;
+      const ambientPrepared = await prepareCapturedPhoto(ambientPhoto, 'flaşsız');
+      ambientSourceImage = ambientPrepared.image;
 
-      try {
-        // Kamera JPEG'ini yeniden kodlamadan saklar, yönlü işleme görüntüsünü aynı native fotoğraftan üretiriz.
-        const temporarySaveStartedAt = getCurrentTimeMs();
-        picturePath = await photo.saveToTemporaryFileAsync();
-        const temporarySaveDuration = getCurrentTimeMs() - temporarySaveStartedAt;
-        const orientationStartedAt = getCurrentTimeMs();
-        sourceImage = await photo.toImageAsync();
-        const orientationDuration = getCurrentTimeMs() - orientationStartedAt;
-
-        // Oturum çıktısı ile işleme hattının kullandığı fiziksel yönü cihaz üzerinde doğrularız.
-        console.info(
-          `[Fotoğraf kaynak] sensör=${physicalWidth}x${physicalHeight}, yön=${sourceOrientation}, işleme=${sourceImage.width}x${sourceImage.height}, ham=${photo.isRawPhoto}, hat=native`
-        );
-        // Yönlü native görüntü bağımsız olduğundan büyük kamera Photo nesnesini ROI işlemi başlamadan bırakırız.
-        photo.dispose();
-        photoDisposed = true;
-
-        const sampleId = createId('sample');
-        const rawSaveStartedAt = getCurrentTimeMs();
-        const rawImageUri = await saveRawImage(`file://${picturePath}`, sampleId);
-        const rawSaveDuration = getCurrentTimeMs() - rawSaveStartedAt;
-        const detectionStartedAt = getCurrentTimeMs();
-        const detections = await tryDetectFingertipsFromImage(sourceImage, rawImageUri);
-        const detectionDuration = getCurrentTimeMs() - detectionStartedAt;
-        const roiStartedAt = getCurrentTimeMs();
-        const fingerRois = await tryExtractFingerRois({
-          imageUri: rawImageUri,
-          imageSize: {
-            width: sourceImage.width,
-            height: sourceImage.height,
+      let flashPrepared: PreparedCapturePhoto | undefined;
+      let flashCaptureDuration = 0;
+      if (shouldCaptureExposurePair) {
+        // İkinci deklanşör tamamlanana kadar elin çekilmemesi gerekir; flaş yalnızca bu fotoğrafta patlar.
+        showFeedback('Elini sabit tut, ikinci fotoğraf çekiliyor...', false);
+        const flashCaptureStartedAt = getCurrentTimeMs();
+        const flashPhoto = await photoOutput.capturePhoto(
+          {
+            flashMode: 'on',
+            enableRedEyeReduction: false,
+            enableShutterSound: false,
           },
-          detections,
-          sampleId,
-          sourceImage,
-        });
-        const roiDuration = getCurrentTimeMs() - roiStartedAt;
-
-        // Kayıt ekranı kutuları metadata'dan çizer; ROI dosyaları ileride enrollment için hazır tutulur.
-        const sample: CaptureSample = {
-          id: sampleId,
-          createdAt: new Date().toISOString(),
-          rawImageUri,
-          rawImageSize: {
-            width: sourceImage.width,
-            height: sourceImage.height,
-          },
-          detections,
-          fingerRois,
-          deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
-          fingerLabel: 'unknown',
-          sessionId: createId('session'),
-          qualityStatus: getCaptureQualityStatus(fingerRois),
-          accepted: false,
-        };
-
-        const indexSaveStartedAt = getCurrentTimeMs();
-        await appendCaptureSample(sample);
-        const indexSaveDuration = getCurrentTimeMs() - indexSaveStartedAt;
-        console.info(
-          `[Fotoğraf süre] odak=${focusDuration}ms, çekim=${captureDuration}ms, kamera_jpeg=${temporarySaveDuration}ms, yön=${orientationDuration}ms, ham_kayıt=${rawSaveDuration}ms, model=${detectionDuration}ms, roi=${roiDuration}ms, indeks=${indexSaveDuration}ms, toplam=${getCurrentTimeMs() - processingStartedAt}ms`
+          {}
         );
-        showFeedback(
-          fingerRois.length > 0
-            ? createCaptureQualityFeedback(fingerRois)
-            : detections.length > 0
-              ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
-              : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
-        );
-      } finally {
-        if (!photoDisposed) photo.dispose();
+        flashCaptureDuration = getCurrentTimeMs() - flashCaptureStartedAt;
+        flashPrepared = await prepareCapturedPhoto(flashPhoto, 'flaşlı');
+        flashSourceImage = flashPrepared.image;
       }
+
+      // İki gerçek deklanşör de tamamlandı; bundan sonraki işlemler yalnızca sabit JPEG'lerde yapılır.
+      showFeedback('Fotoğraflar alındı, işleniyor...', false);
+      const sampleId = createId('sample');
+      const rawSaveStartedAt = getCurrentTimeMs();
+      const rawImageUri = await saveRawImage(
+        `file://${ambientPrepared.temporaryPath}`,
+        sampleId
+      );
+      const flashImageUri = flashPrepared
+        ? await saveRawImage(
+            `file://${flashPrepared.temporaryPath}`,
+            `${sampleId}-flash`
+          )
+        : undefined;
+      const rawSaveDuration = getCurrentTimeMs() - rawSaveStartedAt;
+
+      const detectionStartedAt = getCurrentTimeMs();
+      const ambientDetections = await tryDetectFingertipsFromImage(
+        ambientSourceImage,
+        rawImageUri
+      );
+      const flashDetections =
+        flashSourceImage && flashImageUri
+          ? await tryDetectFingertipsFromImage(flashSourceImage, flashImageUri)
+          : [];
+      const {
+        detections,
+        sourceByClassName,
+        selectedFromFlash,
+      } =
+        selectBestDetectionsAcrossExposure(ambientDetections, flashDetections);
+      const detectionDuration = getCurrentTimeMs() - detectionStartedAt;
+      console.info(
+        `[Çift çekim] flaşsız=${formatDetectionSummary(ambientDetections)}, flaşlı=${formatDetectionSummary(flashDetections)}, seçilen=${formatDetectionSummary(detections)}, flaş_kaynağı=${selectedFromFlash.join(',') || 'yok'}`
+      );
+
+      // Her tespiti kendi çekildiği native görüntüyle eşleştirerek hareketten doğan yanlış crop riskini azaltırız.
+      const sourceImagesByClassName = new Map<
+        DetectedObbBox['className'],
+        NitroImage
+      >();
+      for (const detection of detections) {
+        if (
+          sourceByClassName.get(detection.className) === 'flash' &&
+          flashSourceImage
+        ) {
+          sourceImagesByClassName.set(detection.className, flashSourceImage);
+        } else {
+          sourceImagesByClassName.set(detection.className, ambientSourceImage);
+        }
+      }
+
+      // Her seçilen parmak için karşı pozlamadaki eş kutuyu ayrıca taşırız.
+      const comparisonImagesByClassName = new Map<
+        DetectedObbBox['className'],
+        NitroImage
+      >();
+      const comparisonDetectionsByClassName = new Map<
+        DetectedObbBox['className'],
+        DetectedObbBox
+      >();
+      const ambientByClassName = new Map(
+        ambientDetections.map((detection) => [detection.className, detection])
+      );
+      const flashByClassName = new Map(
+        flashDetections.map((detection) => [detection.className, detection])
+      );
+      for (const detection of detections) {
+        const selectedSource = sourceByClassName.get(detection.className);
+        const comparisonDetection =
+          selectedSource === 'flash'
+            ? ambientByClassName.get(detection.className)
+            : flashByClassName.get(detection.className);
+        const comparisonImage =
+          selectedSource === 'flash' ? ambientSourceImage : flashSourceImage;
+        if (comparisonDetection && comparisonImage) {
+          comparisonDetectionsByClassName.set(
+            detection.className,
+            comparisonDetection
+          );
+          comparisonImagesByClassName.set(detection.className, comparisonImage);
+        }
+      }
+
+      const roiStartedAt = getCurrentTimeMs();
+      const fingerRois = await tryExtractFingerRois({
+        imageUri: rawImageUri,
+        imageSize: {
+          width: ambientSourceImage.width,
+          height: ambientSourceImage.height,
+        },
+        detections,
+        sampleId,
+        sourceImage: ambientSourceImage,
+        sourceImagesByClassName,
+        comparisonImagesByClassName,
+        comparisonDetectionsByClassName,
+      });
+      const roiDuration = getCurrentTimeMs() - roiStartedAt;
+
+      // Ham çift korunur; bu aşamada pikseller birleştirilmeden yalnızca eksik sınıf tamamlanır.
+      const sample: CaptureSample = {
+        id: sampleId,
+        createdAt: new Date().toISOString(),
+        rawImageUri,
+        exposurePair:
+          flashImageUri
+            ? { ambientImageUri: rawImageUri, flashImageUri }
+            : undefined,
+        rawImageSize: {
+          width: ambientSourceImage.width,
+          height: ambientSourceImage.height,
+        },
+        detections,
+        fingerRois,
+        deviceModel: Device.modelName ?? 'Bilinmeyen cihaz',
+        fingerLabel: 'unknown',
+        sessionId: createId('session'),
+        qualityStatus: getCaptureQualityStatus(fingerRois),
+        accepted: false,
+      };
+
+      const indexSaveStartedAt = getCurrentTimeMs();
+      await appendCaptureSample(sample);
+      const indexSaveDuration = getCurrentTimeMs() - indexSaveStartedAt;
+      console.info(
+        `[Fotoğraf süre] odak=${focusDuration}ms, flaşsız_çekim=${ambientCaptureDuration}ms, flaşlı_çekim=${flashCaptureDuration}ms, hazırlık=${ambientPrepared.preparationDurationMs + (flashPrepared?.preparationDurationMs ?? 0)}ms, ham_kayıt=${rawSaveDuration}ms, model=${detectionDuration}ms, roi=${roiDuration}ms, indeks=${indexSaveDuration}ms, toplam=${getCurrentTimeMs() - processingStartedAt}ms`
+      );
+      showFeedback(
+        fingerRois.length > 0
+          ? createCaptureQualityFeedback(fingerRois)
+          : detections.length > 0
+            ? 'Fotoğraf kutularıyla birlikte kaydedildi.'
+            : 'Fotoğraf kaydedildi, model parmak ucu bulamadı.'
+      );
     } catch (error) {
       console.warn('Fotoğraf kaydedilemedi.', error);
       showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
-      sourceImage?.dispose();
+      ambientSourceImage?.dispose();
+      flashSourceImage?.dispose();
       captureMeteringActiveRef.current = false;
       photoProcessingActive.setBlocking(false);
       liveDetectionPausedRef.current = modelStatus !== 'ready' || !isScreenFocused;
@@ -956,13 +1157,13 @@ export default function CameraScreen() {
   }
 
   // Kullanıcının aynı sahneyi flaşlı ve flaşsız çekerek kalite sonuçlarını karşılaştırmasını sağlar.
-  function handleToggleFlash() {
+  function handleToggleDualCapture() {
     if (!activeCameraHasFlash) {
       showFeedback('Bu kamera flaşı desteklemiyor.');
       return;
     }
 
-    setIsFlashEnabled((currentValue) => !currentValue);
+    setIsDualCaptureEnabled((currentValue) => !currentValue);
   }
 
   return (
@@ -1052,25 +1253,25 @@ export default function CameraScreen() {
             Canlı takip
           </ThemedText>
           <Pressable
-            accessibilityLabel="Fotoğraf flaşı"
+            accessibilityLabel="Çift pozlama çekimi"
             accessibilityRole="switch"
             accessibilityState={{
-              checked: isFlashEnabled,
+              checked: isDualCaptureEnabled,
               disabled: !activeCameraHasFlash || isTakingPhoto,
             }}
             disabled={!activeCameraHasFlash || isTakingPhoto}
-            onPress={handleToggleFlash}
+            onPress={handleToggleDualCapture}
             style={[
               styles.flashToggle,
-              isFlashEnabled && styles.flashToggleActive,
+              isDualCaptureEnabled && styles.flashToggleActive,
               (!activeCameraHasFlash || isTakingPhoto) && styles.disabledButton,
             ]}>
             <ThemedText type="smallBold" style={styles.flashToggleText}>
               {activeCameraHasFlash
-                ? isFlashEnabled
-                  ? 'Flaş açık'
-                  : 'Flaş kapalı'
-                : 'Flaş yok'}
+                ? isDualCaptureEnabled
+                  ? 'Çift çekim açık'
+                  : 'Tek çekim'
+                : 'Çift çekim yok'}
             </ThemedText>
           </Pressable>
         </View>

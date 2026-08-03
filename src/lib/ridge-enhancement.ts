@@ -308,17 +308,63 @@ export async function saveRidgeEnhancedImage({
   width,
   height,
   outputImageUri,
+  maximumWidth = 256,
+  quality = 88,
 }: {
   pixels: Uint8Array;
   width: number;
   height: number;
   outputImageUri: string;
+  maximumWidth?: number;
+  quality?: number;
 }) {
-  const jpeg = encode({ data: pixels, width, height }, 95);
+  ensureJpegBufferShim();
+
+  // Teknik galeri görsellerini küçültür; kalite ve minutiae hesapları bundan önce tam analiz tamponunda yapılmıştır.
+  const preview = resizeTechnicalPreview(pixels, width, height, maximumWidth);
+  const jpeg = encode(
+    { data: preview.pixels, width: preview.width, height: preview.height },
+    quality
+  );
   await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
     encoding: FileSystem.EncodingType.Base64,
   });
   return outputImageUri;
+}
+
+// jpeg-js React Native ortamında global Buffer beklediği için kodlamadan önce polyfill'i hazırlar.
+function ensureJpegBufferShim() {
+  const globalScope = globalThis as typeof globalThis & { Buffer?: typeof Buffer };
+  if (globalScope.Buffer) return;
+  globalScope.Buffer = Buffer;
+}
+
+// RGBA teknik çıktıyı en-boy oranını koruyarak en fazla hedef genişliğe örnekler.
+function resizeTechnicalPreview(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+  maximumWidth: number
+) {
+  if (width <= maximumWidth) return { pixels, width, height };
+  const targetWidth = maximumWidth;
+  const targetHeight = Math.max(1, Math.round((height * targetWidth) / width));
+  const resized = new Uint8Array(targetWidth * targetHeight * 4);
+
+  for (let y = 0; y < targetHeight; y += 1) {
+    const sourceY = Math.min(Math.floor((y * height) / targetHeight), height - 1);
+    for (let x = 0; x < targetWidth; x += 1) {
+      const sourceX = Math.min(Math.floor((x * width) / targetWidth), width - 1);
+      const sourceIndex = (sourceY * width + sourceX) * 4;
+      const targetIndex = (y * targetWidth + x) * 4;
+      resized[targetIndex] = pixels[sourceIndex];
+      resized[targetIndex + 1] = pixels[sourceIndex + 1];
+      resized[targetIndex + 2] = pixels[sourceIndex + 2];
+      resized[targetIndex + 3] = pixels[sourceIndex + 3];
+    }
+  }
+
+  return { pixels: resized, width: targetWidth, height: targetHeight };
 }
 
 // jpeg-js çıktısını React Native ve Node ortamlarında güvenli base64 metnine çevirir.

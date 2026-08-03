@@ -1,8 +1,15 @@
-import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
 import { decode } from 'jpeg-js';
-import type { Image as NitroImage } from 'react-native-nitro-image';
+import {
+  Images,
+  type Image as NitroImage,
+} from 'react-native-nitro-image';
 
 import { getFingertipObbRuntime } from '@/lib/onnx-model';
+import {
+  createLetterboxTransform,
+  mapModelPointToNormalizedImage,
+  type LetterboxTransform,
+} from '@/lib/roi-geometry';
 import type { DetectedObbBox, DetectionClassName } from '@/types/biometrics';
 
 export const FINGERTIP_MODEL_SIZE = 480;
@@ -33,8 +40,7 @@ type RawObbCandidate = DetectedObbBox & {
 
 type TensorImage = {
   tensorData: Float32Array;
-  width: number;
-  height: number;
+  transform: LetterboxTransform;
 };
 
 // Nitro Image'in Android/iOS tarafında üretebileceği ham piksel sıralarını tanımlar.
@@ -53,54 +59,34 @@ export type ModelPixelFormat =
 
 // Ham el fotoğrafını mobil modele uygun kare RGB tensor'a çevirir.
 async function createModelInputTensor(imageUri: string): Promise<TensorImage> {
-  const resized = await manipulateAsync(
-    imageUri,
-    [{ resize: { width: FINGERTIP_MODEL_SIZE, height: FINGERTIP_MODEL_SIZE } }],
-    {
-      base64: true,
-      compress: 1,
-      format: SaveFormat.JPEG,
-    }
-  );
-
-  if (!resized.base64) {
-    throw new Error('Model girdisi için base64 görüntü üretilemedi.');
+  const image = await Images.loadFromFileAsync(toNativeFilePath(imageUri));
+  try {
+    return await createModelInputFromImage(image);
+  } finally {
+    image.dispose();
   }
-
-  const image = decode(base64ToBytes(resized.base64), { useTArray: true });
-
-  return {
-    tensorData: createTensorFromRgbaPixels(image.data, image.width, image.height),
-    width: image.width,
-    height: image.height,
-  };
 }
 
 // Fotoğrafı ONNX Runtime'a gönderir ve model çıktısını çizilebilir OBB kutularına dönüştürür.
 export async function detectFingertipObbBoxes(imageUri: string): Promise<DetectedObbBox[]> {
   const tensorImage = await createModelInputTensor(imageUri);
-  return runFingertipModel(tensorImage.tensorData, PHOTO_DETECTION_THRESHOLD);
+  return runFingertipModel(
+    tensorImage.tensorData,
+    PHOTO_DETECTION_THRESHOLD,
+    tensorImage.transform
+  );
 }
 
 // Kameranın yönü düzeltilmiş native görüntüsünü JPEG'e çevirmeden model boyutuna indirip modele gönderir.
 export async function detectFingertipObbBoxesFromImage(
   image: NitroImage
 ): Promise<DetectedObbBox[]> {
-  const resized = await image.resizeAsync(FINGERTIP_MODEL_SIZE, FINGERTIP_MODEL_SIZE);
-
-  try {
-    const pixels = await resized.toRawPixelDataAsync(false);
-    // Galaxy cihazında Nitro Image BGRA bildirse de gerçek byte sırası canlı kanal testinde RGBA olarak doğrulandı.
-    const tensorData = createTensorFromRawPixels(
-      pixels.buffer,
-      pixels.width,
-      pixels.height,
-      'RGBA'
-    );
-    return runFingertipModel(tensorData, PHOTO_DETECTION_THRESHOLD);
-  } finally {
-    resized.dispose();
-  }
+  const tensorImage = await createModelInputFromImage(image);
+  return runFingertipModel(
+    tensorImage.tensorData,
+    PHOTO_DETECTION_THRESHOLD,
+    tensorImage.transform
+  );
 }
 
 // Canlı kameradan gelen kare ham RGB piksel verisini dosya oluşturmadan ONNX modeline gönderir.
@@ -110,14 +96,15 @@ export async function detectFingertipObbBoxesFromRawPixels(
   height: number,
   pixelFormat: ModelPixelFormat
 ): Promise<DetectedObbBox[]> {
-  if (width !== FINGERTIP_MODEL_SIZE || height !== FINGERTIP_MODEL_SIZE) {
-    throw new Error(
-      `Canlı model girdisi ${FINGERTIP_MODEL_SIZE}x${FINGERTIP_MODEL_SIZE} olmalı; ${width}x${height} geldi.`
-    );
-  }
-
-  const tensorData = createTensorFromRawPixels(buffer, width, height, pixelFormat);
-  return runFingertipModel(tensorData, LIVE_DETECTION_THRESHOLD);
+  const transform = createLetterboxTransform(width, height, FINGERTIP_MODEL_SIZE);
+  const tensorData = createLetterboxedTensorFromRawPixels(
+    buffer,
+    width,
+    height,
+    pixelFormat,
+    transform
+  );
+  return runFingertipModel(tensorData, LIVE_DETECTION_THRESHOLD, transform);
 }
 
 // Canlı frame'in JPEG verisini fotoğrafla aynı RGBA çözümleme yolundan geçirerek modele gönderir.
@@ -126,19 +113,23 @@ export async function detectFingertipObbBoxesFromEncodedJpeg(
   width: number,
   height: number
 ): Promise<DetectedObbBox[]> {
-  if (width !== FINGERTIP_MODEL_SIZE || height !== FINGERTIP_MODEL_SIZE) {
-    throw new Error(
-      `Canlı JPEG girdisi ${FINGERTIP_MODEL_SIZE}x${FINGERTIP_MODEL_SIZE} olmalı; ${width}x${height} geldi.`
-    );
-  }
-
   const image = decode(new Uint8Array(buffer), { useTArray: true });
-  const tensorData = createTensorFromRgbaPixels(image.data, image.width, image.height);
-  return runFingertipModel(tensorData, LIVE_DETECTION_THRESHOLD);
+  const transform = createLetterboxTransform(image.width, image.height, FINGERTIP_MODEL_SIZE);
+  const tensorData = createLetterboxedTensorFromRgbaPixels(
+    image.data,
+    image.width,
+    image.height,
+    transform
+  );
+  return runFingertipModel(tensorData, LIVE_DETECTION_THRESHOLD, transform);
 }
 
 // Hazırlanmış CHW tensor verisini mevcut ONNX oturumunda çalıştırıp OBB sonuçlarını döndürür.
-async function runFingertipModel(tensorData: Float32Array, detectionThreshold: number) {
+async function runFingertipModel(
+  tensorData: Float32Array,
+  detectionThreshold: number,
+  transform: LetterboxTransform
+) {
   const { ort, session } = await getFingertipObbRuntime();
   const inputTensor = new ort.Tensor('float32', tensorData, [
     1,
@@ -163,34 +154,53 @@ async function runFingertipModel(tensorData: Float32Array, detectionThreshold: n
     throw new Error(`Desteklenmeyen ONNX çıktı şekli: ${outputTensor.dims.join('x')}.`);
   }
 
-  return parseObbOutput(outputTensor.data, outputChannels, detectionThreshold);
+  return parseObbOutput(
+    outputTensor.data,
+    outputChannels,
+    detectionThreshold,
+    transform
+  );
 }
 
 // JPEG çözücünün ürettiği RGBA piksellerini modelin beklediği normalize CHW RGB dizisine çevirir.
-function createTensorFromRgbaPixels(
+function createLetterboxedTensorFromRgbaPixels(
   pixels: Uint8Array | Uint8ClampedArray,
   width: number,
-  height: number
+  height: number,
+  transform: LetterboxTransform
 ) {
-  const pixelCount = width * height;
-  const tensorData = new Float32Array(pixelCount * 3);
-
-  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
-    const sourceIndex = pixel * 4;
-    tensorData[pixel] = (pixels[sourceIndex] ?? 0) / 255;
-    tensorData[pixelCount + pixel] = (pixels[sourceIndex + 1] ?? 0) / 255;
-    tensorData[pixelCount * 2 + pixel] = (pixels[sourceIndex + 2] ?? 0) / 255;
+  const tensorData = createFilledModelTensor(114);
+  for (let targetY = 0; targetY < transform.scaledHeight; targetY += 1) {
+    const sourceY = Math.min(
+      Math.floor((targetY * height) / transform.scaledHeight),
+      height - 1
+    );
+    for (let targetX = 0; targetX < transform.scaledWidth; targetX += 1) {
+      const sourceX = Math.min(
+        Math.floor((targetX * width) / transform.scaledWidth),
+        width - 1
+      );
+      const sourceIndex = (sourceY * width + sourceX) * 4;
+      writeModelPixel(
+        tensorData,
+        transform.padX + targetX,
+        transform.padY + targetY,
+        pixels[sourceIndex] ?? 0,
+        pixels[sourceIndex + 1] ?? 0,
+        pixels[sourceIndex + 2] ?? 0
+      );
+    }
   }
-
   return tensorData;
 }
 
 // Nitro Image piksel sırasını okuyup modelin beklediği normalize CHW RGB dizisine dönüştürür.
-function createTensorFromRawPixels(
+function createLetterboxedTensorFromRawPixels(
   buffer: ArrayBuffer,
   width: number,
   height: number,
-  pixelFormat: ModelPixelFormat
+  pixelFormat: ModelPixelFormat,
+  transform: LetterboxTransform
 ) {
   const channelLayout = getPixelChannelLayout(pixelFormat);
   const pixels = new Uint8Array(buffer);
@@ -201,16 +211,83 @@ function createTensorFromRawPixels(
     throw new Error(`Canlı piksel tamponu eksik: ${pixels.length}/${expectedLength} byte.`);
   }
 
-  const tensorData = new Float32Array(pixelCount * 3);
+  const tensorData = createFilledModelTensor(114);
 
-  for (let pixel = 0; pixel < pixelCount; pixel += 1) {
-    const sourceIndex = pixel * channelLayout.bytesPerPixel;
-    tensorData[pixel] = (pixels[sourceIndex + channelLayout.red] ?? 0) / 255;
-    tensorData[pixelCount + pixel] = (pixels[sourceIndex + channelLayout.green] ?? 0) / 255;
-    tensorData[pixelCount * 2 + pixel] = (pixels[sourceIndex + channelLayout.blue] ?? 0) / 255;
+  for (let targetY = 0; targetY < transform.scaledHeight; targetY += 1) {
+    const sourceY = Math.min(
+      Math.floor((targetY * height) / transform.scaledHeight),
+      height - 1
+    );
+    for (let targetX = 0; targetX < transform.scaledWidth; targetX += 1) {
+      const sourceX = Math.min(
+        Math.floor((targetX * width) / transform.scaledWidth),
+        width - 1
+      );
+      const sourceIndex = (sourceY * width + sourceX) * channelLayout.bytesPerPixel;
+      writeModelPixel(
+        tensorData,
+        transform.padX + targetX,
+        transform.padY + targetY,
+        pixels[sourceIndex + channelLayout.red] ?? 0,
+        pixels[sourceIndex + channelLayout.green] ?? 0,
+        pixels[sourceIndex + channelLayout.blue] ?? 0
+      );
+    }
   }
 
   return tensorData;
+}
+
+async function createModelInputFromImage(image: NitroImage): Promise<TensorImage> {
+  const transform = createLetterboxTransform(
+    image.width,
+    image.height,
+    FINGERTIP_MODEL_SIZE
+  );
+  const resized = await image.resizeAsync(transform.scaledWidth, transform.scaledHeight);
+
+  try {
+    const pixels = await resized.toRawPixelDataAsync(false);
+    return {
+      tensorData: createLetterboxedTensorFromRawPixels(
+        pixels.buffer,
+        pixels.width,
+        pixels.height,
+        'RGBA',
+        transform
+      ),
+      transform,
+    };
+  } finally {
+    resized.dispose();
+  }
+}
+
+function createFilledModelTensor(backgroundValue: number) {
+  const pixelCount = FINGERTIP_MODEL_SIZE * FINGERTIP_MODEL_SIZE;
+  const normalizedBackground = backgroundValue / 255;
+  const tensorData = new Float32Array(pixelCount * 3);
+  tensorData.fill(normalizedBackground);
+  return tensorData;
+}
+
+function writeModelPixel(
+  tensorData: Float32Array,
+  x: number,
+  y: number,
+  red: number,
+  green: number,
+  blue: number
+) {
+  const pixel = y * FINGERTIP_MODEL_SIZE + x;
+  const pixelCount = FINGERTIP_MODEL_SIZE * FINGERTIP_MODEL_SIZE;
+  tensorData[pixel] = red / 255;
+  tensorData[pixelCount + pixel] = green / 255;
+  tensorData[pixelCount * 2 + pixel] = blue / 255;
+}
+
+function toNativeFilePath(uri: string) {
+  return decodeURIComponent(uri.replace(/^file:\/\//, ''));
 }
 
 // Platforma göre değişebilen ARGB/BGRA benzeri piksel dizilimlerinin RGB indislerini belirler.
@@ -246,7 +323,8 @@ function getPixelChannelLayout(pixelFormat: ModelPixelFormat) {
 function parseObbOutput(
   output: Float32Array,
   outputChannels: number,
-  detectionThreshold: number
+  detectionThreshold: number,
+  transform: LetterboxTransform
 ): DetectedObbBox[] {
   const anchorCount = Math.floor(output.length / outputChannels);
   const modelClassCount = outputChannels - 5;
@@ -265,8 +343,16 @@ function parseObbOutput(
       continue;
     }
 
-    const points = createNormalizedObbPoints(centerX, centerY, width, height, angle);
+    const points = createNormalizedObbPoints(
+      centerX,
+      centerY,
+      width,
+      height,
+      angle,
+      transform
+    );
     const axisAlignedBox = getAxisAlignedBox(points);
+    const center = mapModelPointToNormalizedImage(centerX, centerY, transform);
 
     candidates.push({
       id: `obb-${anchor}`,
@@ -274,14 +360,14 @@ function parseObbOutput(
       className: CLASS_NAMES[classResult.fingerClassId] ?? 'unknown',
       confidence: classResult.confidence,
       center: {
-        x: clamp01(centerX / FINGERTIP_MODEL_SIZE),
-        y: clamp01(centerY / FINGERTIP_MODEL_SIZE),
+        x: center.x,
+        y: center.y,
       },
       size: {
-        width: clamp01(width / FINGERTIP_MODEL_SIZE),
-        height: clamp01(height / FINGERTIP_MODEL_SIZE),
+        width: Math.max(0, axisAlignedBox.right - axisAlignedBox.left),
+        height: Math.max(0, axisAlignedBox.bottom - axisAlignedBox.top),
       },
-      angle,
+      angle: getPhysicalAngle(points, transform),
       points,
       axisAlignedBox,
     });
@@ -331,7 +417,14 @@ function normalizeModelScore(score: number) {
 }
 
 // Merkez, boyut ve açı bilgisinden normalize edilmiş dört OBB köşesi üretir.
-function createNormalizedObbPoints(centerX: number, centerY: number, width: number, height: number, angle: number) {
+function createNormalizedObbPoints(
+  centerX: number,
+  centerY: number,
+  width: number,
+  height: number,
+  angle: number,
+  transform: LetterboxTransform
+) {
   const halfWidth = width / 2;
   const halfHeight = height / 2;
   const cos = Math.cos(angle);
@@ -343,10 +436,39 @@ function createNormalizedObbPoints(centerX: number, centerY: number, width: numb
     { x: -halfWidth, y: halfHeight },
   ];
 
-  return corners.map((corner) => ({
-    x: clamp01((centerX + corner.x * cos - corner.y * sin) / FINGERTIP_MODEL_SIZE),
-    y: clamp01((centerY + corner.x * sin + corner.y * cos) / FINGERTIP_MODEL_SIZE),
-  }));
+  return corners.map((corner) =>
+    mapModelPointToNormalizedImage(
+      centerX + corner.x * cos - corner.y * sin,
+      centerY + corner.x * sin + corner.y * cos,
+      transform
+    )
+  );
+}
+
+function getPhysicalAngle(
+  points: DetectedObbBox['points'],
+  transform: LetterboxTransform
+) {
+  const edges = points.map((point, index) => {
+    const next = points[(index + 1) % points.length];
+    const deltaX = (next?.x ?? point.x) - point.x;
+    const deltaY = (next?.y ?? point.y) - point.y;
+    return {
+      length: Math.hypot(
+        deltaX * transform.sourceWidth,
+        deltaY * transform.sourceHeight
+      ),
+      deltaX,
+      deltaY,
+    };
+  });
+  const longEdge = [...edges].sort((first, second) => second.length - first.length)[0];
+  if (!longEdge) return 0;
+
+  return Math.atan2(
+    longEdge.deltaY * transform.sourceHeight,
+    longEdge.deltaX * transform.sourceWidth
+  );
 }
 
 // OBB kutuları arasında hızlı NMS yapmak için köşelerden eksene hizalı çevre kutusu çıkarır.
@@ -554,51 +676,4 @@ function calculateIoU(
   const union = firstArea + secondArea - intersection;
 
   return union <= 0 ? 0 : intersection / union;
-}
-
-// Değeri görüntü oranı olarak 0-1 aralığında tutar.
-function clamp01(value: number) {
-  return Math.min(Math.max(value, 0), 1);
-}
-
-// React Native tarafında Buffer'a ihtiyaç duymadan base64 string'i byte dizisine çevirir.
-function base64ToBytes(base64: string) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  const lookup = new Uint8Array(256);
-
-  for (let i = 0; i < chars.length; i += 1) {
-    lookup[chars.charCodeAt(i)] = i;
-  }
-
-  const clean = base64.replace(/[^A-Za-z0-9+/=]/g, '');
-  const padding = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0;
-  const length = Math.floor((clean.length * 3) / 4) - padding;
-  const bytes = new Uint8Array(length);
-  let byteIndex = 0;
-
-  // Base64 her dört karakterde üç byte üretir; padding varsa son byte'ları atlarız.
-  for (let i = 0; i < clean.length; i += 4) {
-    const encoded =
-      (lookup[clean.charCodeAt(i)] << 18) |
-      (lookup[clean.charCodeAt(i + 1)] << 12) |
-      (lookup[clean.charCodeAt(i + 2)] << 6) |
-      lookup[clean.charCodeAt(i + 3)];
-
-    if (byteIndex < length) {
-      bytes[byteIndex] = (encoded >> 16) & 255;
-      byteIndex += 1;
-    }
-
-    if (byteIndex < length) {
-      bytes[byteIndex] = (encoded >> 8) & 255;
-      byteIndex += 1;
-    }
-
-    if (byteIndex < length) {
-      bytes[byteIndex] = encoded & 255;
-      byteIndex += 1;
-    }
-  }
-
-  return bytes;
 }

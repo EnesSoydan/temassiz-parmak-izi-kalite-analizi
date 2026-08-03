@@ -122,6 +122,26 @@ export type FingerprintTemplate = {
   minutiae: FingerprintMinutia[];
 };
 
+// Aynı parmağın flaşsız ve flaşlı kanonik ROI'leri arasındaki yerel kalite karşılaştırmasını taşır.
+export type ExposurePairComparison = {
+  alignmentConfidence: number;
+  ambientBetterBlockRatio: number;
+  flashBetterBlockRatio: number;
+  comparableBlockCount: number;
+  ambientGlareRatio: number;
+  flashGlareRatio: number;
+  centerFlashBetterBlockRatio: number;
+  outerAmbientBetterBlockRatio: number;
+  ambientMeanScore: number;
+  flashMeanScore: number;
+  alignmentShiftX: number;
+  alignmentShiftY: number;
+  alignmentScale: number;
+  alignmentRotationDegrees: number;
+  recommendation: 'ambient' | 'flash' | 'complementary' | 'unaligned';
+  processingSource?: 'ambient' | 'flash' | 'local';
+};
+
 // Model kutusundan çıkarılan tek parmak ROI'sinin dosya ve koordinat bilgisini taşır.
 export type FingerRoi = {
   id: string;
@@ -130,15 +150,21 @@ export type FingerRoi = {
   confidence: number;
   imageUri?: string;
   canonicalImageUri?: string;
+  ambientCanonicalImageUri?: string;
+  flashCanonicalImageUri?: string;
+  alignedCanonicalImageUri?: string;
+  canonicalSource?: 'ambient' | 'flash' | 'single';
   segmentedImageUri?: string;
   enhancedImageUri?: string;
   orientationImageUri?: string;
   minutiaeImageUri?: string;
   minutiaeTemplate?: FingerprintTemplate;
+  exposureComparison?: ExposurePairComparison;
   sourcePixelWidth?: number;
   canonicalRotationDegrees?: number;
   silhouetteAxisDegrees?: number;
   canonicalResidualDegrees?: number;
+  silhouetteCorrectionDegrees?: number;
   quality?: FingerprintQuality;
   maskPolygon?: {
     x: number;
@@ -167,6 +193,10 @@ export type CaptureSample = {
   id: string;
   createdAt: string;
   rawImageUri: string;
+  exposurePair?: {
+    ambientImageUri: string;
+    flashImageUri: string;
+  };
   roiImageUri?: string;
   processedRoiImageUri?: string;
   roiCrop?: {

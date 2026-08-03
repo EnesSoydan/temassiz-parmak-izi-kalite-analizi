@@ -57,6 +57,8 @@
     "lint": "expo lint",
     "test:ridge": "node --experimental-strip-types scripts/test-ridge-frequency.mjs",
     "test:minutiae": "node --experimental-strip-types scripts/test-minutiae.mjs",
+    "test:exposure": "node --experimental-strip-types scripts/test-exposure-pair.mjs",
+    "test:roi": "node --experimental-strip-types scripts/test-roi-alignment.mjs",
     "postinstall": "patch-package"
   },
   "private": true

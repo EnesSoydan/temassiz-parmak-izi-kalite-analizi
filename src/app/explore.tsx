@@ -1,6 +1,12 @@
 import * as Device from 'expo-device';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
+import {
+  manipulateAsync,
+  FlipType,
+  SaveFormat,
+  type Action,
+} from 'expo-image-manipulator';
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
 import {
@@ -48,6 +54,42 @@ function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function getExifOrientation(asset: ImagePicker.ImagePickerAsset) {
+  const exif = asset.exif as
+    | Record<string, number | string | undefined>
+    | undefined;
+  return Number(exif?.Orientation ?? exif?.orientation ?? 1);
+}
+
+function getExifOrientationActions(orientation: number): Action[] {
+  switch (orientation) {
+    case 2:
+      return [{ flip: FlipType.Horizontal }];
+    case 3:
+      return [{ rotate: 180 }];
+    case 4:
+      return [{ flip: FlipType.Vertical }];
+    case 5:
+      return [{ flip: FlipType.Horizontal }, { rotate: 270 }];
+    case 6:
+      return [{ rotate: 90 }];
+    case 7:
+      return [{ flip: FlipType.Horizontal }, { rotate: 90 }];
+    case 8:
+      return [{ rotate: 270 }];
+    default:
+      return [];
+  }
+}
+
+async function normalizePickedImage(asset: ImagePicker.ImagePickerAsset) {
+  const actions = getExifOrientationActions(getExifOrientation(asset));
+  return manipulateAsync(asset.uri, actions, {
+    compress: 1,
+    format: SaveFormat.JPEG,
+  });
+}
+
 // Parmak sınıf adlarını ROI önizlemelerinde kısa Türkçe etiketlere çevirir.
 function formatFingerRoiClass(className: FingerRoi['className']) {
   if (className === 'index') return 'işaret';
@@ -60,6 +102,8 @@ function formatFingerRoiClass(className: FingerRoi['className']) {
 type RoiInspectionVariant =
   | 'roi'
   | 'canonical'
+  | 'alignedCanonical'
+  | 'flashCanonical'
   | 'segmented'
   | 'orientation'
   | 'enhanced'
@@ -71,12 +115,20 @@ const ROI_INSPECTION_OPTIONS: {
   label: string;
 }[] = [
   { value: 'roi', label: 'ROI' },
-  { value: 'canonical', label: 'Kanonik' },
+  { value: 'canonical', label: 'Flaşsız' },
+  { value: 'alignedCanonical', label: 'Hizalı' },
+  { value: 'flashCanonical', label: 'Flaşlı' },
   { value: 'segmented', label: 'Seg' },
   { value: 'orientation', label: 'Yön' },
   { value: 'enhanced', label: 'Ridge' },
   { value: 'minutiae', label: 'Minutiae' },
 ];
+
+const ROI_THUMBNAIL_WIDTH = 52;
+const ROI_VARIANT_COUNT = ROI_INSPECTION_OPTIONS.length;
+const ROI_PREVIEW_WIDTH =
+  ROI_VARIANT_COUNT * ROI_THUMBNAIL_WIDTH +
+  (ROI_VARIANT_COUNT - 1) * Spacing.one;
 
 // Seçilen inceleme sürümünün parmak ROI metadata'sındaki dosya yolunu döndürür.
 function getRoiInspectionUri(
@@ -84,11 +136,26 @@ function getRoiInspectionUri(
   variant: RoiInspectionVariant
 ) {
   if (variant === 'roi') return fingerRoi.imageUri;
-  if (variant === 'canonical') return fingerRoi.canonicalImageUri;
+  if (variant === 'canonical') {
+    return fingerRoi.ambientCanonicalImageUri ?? fingerRoi.canonicalImageUri;
+  }
+  if (variant === 'alignedCanonical') return fingerRoi.alignedCanonicalImageUri;
+  if (variant === 'flashCanonical') return fingerRoi.flashCanonicalImageUri;
   if (variant === 'segmented') return fingerRoi.segmentedImageUri;
   if (variant === 'orientation') return fingerRoi.orientationImageUri;
   if (variant === 'enhanced') return fingerRoi.enhancedImageUri;
   return fingerRoi.minutiaeImageUri;
+}
+
+// Eski tek poz kayıtlarında kanonik etiketini korur, çift pozda kaynağı flaşsız olarak belirtir.
+function getRoiInspectionLabel(
+  fingerRoi: FingerRoi,
+  option: (typeof ROI_INSPECTION_OPTIONS)[number]
+) {
+  if (option.value === 'canonical' && !fingerRoi.flashCanonicalImageUri) {
+    return 'Kanonik';
+  }
+  return option.label;
 }
 
 // Tek bir kaydın ham fotoğrafını, ROI çiftlerini ve kalite durumlarını gösterir.
@@ -202,11 +269,13 @@ function CaptureCard({
                   </View>
 
                   <View style={styles.roiImageColumn}>
-                    {fingerRoi.canonicalImageUri ? (
+                    {getRoiInspectionUri(fingerRoi, 'canonical') ? (
                       <Pressable
                         onPress={() => openInspection(fingerRoi, 'canonical')}>
                         <Image
-                          source={{ uri: fingerRoi.canonicalImageUri }}
+                          source={{
+                            uri: getRoiInspectionUri(fingerRoi, 'canonical'),
+                          }}
                           style={styles.roiImage}
                           contentFit="cover"
                         />
@@ -219,7 +288,58 @@ function CaptureCard({
                       </View>
                     )}
                     <ThemedText type="small" style={styles.roiVariantLabel}>
-                      Kanonik
+                      {getRoiInspectionLabel(
+                        fingerRoi,
+                        ROI_INSPECTION_OPTIONS.find(
+                          (option) => option.value === 'canonical'
+                        ) ?? ROI_INSPECTION_OPTIONS[1]
+                      )}
+                    </ThemedText>
+                  </View>
+
+                  <View style={styles.roiImageColumn}>
+                    {fingerRoi.alignedCanonicalImageUri ? (
+                      <Pressable
+                        onPress={() =>
+                          openInspection(fingerRoi, 'alignedCanonical')
+                        }>
+                        <Image
+                          source={{ uri: fingerRoi.alignedCanonicalImageUri }}
+                          style={styles.roiImage}
+                          contentFit="cover"
+                        />
+                      </Pressable>
+                    ) : (
+                      <View style={[styles.roiImage, styles.emptySegmentImage]}>
+                        <ThemedText type="small" style={styles.emptySegmentText}>
+                          Yok
+                        </ThemedText>
+                      </View>
+                    )}
+                    <ThemedText type="small" style={styles.roiVariantLabel}>
+                      Hizalı
+                    </ThemedText>
+                  </View>
+
+                  <View style={styles.roiImageColumn}>
+                    {fingerRoi.flashCanonicalImageUri ? (
+                      <Pressable
+                        onPress={() => openInspection(fingerRoi, 'flashCanonical')}>
+                        <Image
+                          source={{ uri: fingerRoi.flashCanonicalImageUri }}
+                          style={styles.roiImage}
+                          contentFit="cover"
+                        />
+                      </Pressable>
+                    ) : (
+                      <View style={[styles.roiImage, styles.emptySegmentImage]}>
+                        <ThemedText type="small" style={styles.emptySegmentText}>
+                          Yok
+                        </ThemedText>
+                      </View>
+                    )}
+                    <ThemedText type="small" style={styles.roiVariantLabel}>
+                      Flaşlı
                     </ThemedText>
                   </View>
 
@@ -448,7 +568,7 @@ function CaptureCard({
                     <ThemedText
                       type="smallBold"
                       style={styles.inspectionTitle}>
-                      {option.label}
+                      {getRoiInspectionLabel(inspection.fingerRoi, option)}
                     </ThemedText>
                   </Pressable>
                 ))
@@ -583,6 +703,7 @@ export default function RecordsScreen() {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
         allowsEditing: false,
+        exif: true,
         quality: 1,
         selectionLimit: 1,
       });
@@ -596,13 +717,14 @@ export default function RecordsScreen() {
       const asset = result.assets[0];
       setFeedback('Görsel işleniyor...');
       const sampleId = createId('gallery');
-      const rawImageUri = await saveRawImage(asset.uri, sampleId);
+      const normalizedAsset = await normalizePickedImage(asset);
+      const rawImageUri = await saveRawImage(normalizedAsset.uri, sampleId);
       const detections = await detectFingertipObbBoxes(rawImageUri);
       const fingerRois = await tryExtractFingerRois({
         imageUri: rawImageUri,
         imageSize: {
-          width: asset.width,
-          height: asset.height,
+          width: normalizedAsset.width,
+          height: normalizedAsset.height,
         },
         detections,
         sampleId,
@@ -614,8 +736,8 @@ export default function RecordsScreen() {
         createdAt: new Date().toISOString(),
         rawImageUri,
         rawImageSize: {
-          width: asset.width,
-          height: asset.height,
+          width: normalizedAsset.width,
+          height: normalizedAsset.height,
         },
         detections,
         fingerRois,
@@ -752,7 +874,7 @@ const styles = StyleSheet.create({
     paddingRight: Spacing.two,
   },
   roiPreview: {
-    width: 336,
+    width: ROI_PREVIEW_WIDTH,
     gap: Spacing.one,
   },
   roiImagePair: {
@@ -760,11 +882,11 @@ const styles = StyleSheet.create({
     gap: Spacing.one,
   },
   roiImageColumn: {
-    width: 52,
+    width: ROI_THUMBNAIL_WIDTH,
     gap: Spacing.half,
   },
   roiImage: {
-    width: 52,
+    width: ROI_THUMBNAIL_WIDTH,
     height: 72,
     overflow: 'hidden',
     borderRadius: 6,
