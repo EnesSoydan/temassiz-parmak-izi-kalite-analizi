@@ -12,6 +12,7 @@ type MinutiaeExtractionInput = {
   width: number;
   height: number;
   ridgePeriodPixels: number;
+  minimumSupportConfidence?: number;
 };
 
 type PixelPoint = {
@@ -39,6 +40,21 @@ export type MinutiaeExtractionResult = {
   supportCoverage: number;
   searchableAreaRatio: number;
   largestSearchableRegionRatio: number;
+  crossingNumberCandidateCount: number;
+  branchValidatedCandidateCount: number;
+  suppressionCandidateCount: number;
+  endingCandidateCount: number;
+  bifurcationCandidateCount: number;
+  confidenceHistogram: number[];
+};
+
+export type MinutiaeDetectionDiagnostics = {
+  crossingNumberCandidateCount: number;
+  branchValidatedCandidateCount: number;
+  suppressionCandidateCount: number;
+  endingCandidateCount: number;
+  bifurcationCandidateCount: number;
+  confidenceHistogram: number[];
 };
 
 // Zhang-Suen inceltmesinin bozuk görüntüde sınırsız dönmesini engeller.
@@ -65,6 +81,7 @@ export function extractFingerprintMinutiae({
   width,
   height,
   ridgePeriodPixels,
+  minimumSupportConfidence = 76,
 }: MinutiaeExtractionInput): MinutiaeExtractionResult {
   const grayscale = rgbaToGrayscale(pixels, width, height);
   const foregroundDistance = createMaskDistanceMap(mask, width, height);
@@ -128,7 +145,7 @@ export function extractFingerprintMinutiae({
     height,
     Math.max(8, Math.round(period * 1.8))
   );
-  const rawCandidates = detectMinutiaeFromSkeleton({
+  const detection = detectMinutiaeFromSkeletonDetailed({
     skeleton: thinning.skeleton,
     maskDistance: candidateDistance,
     foregroundDistance,
@@ -136,7 +153,9 @@ export function extractFingerprintMinutiae({
     height,
     ridgePeriodPixels: period,
     supportConfidence: stableSearchArea.supportConfidence,
+    minimumSupportConfidence,
   });
+  const rawCandidates = detection.candidates;
   const minutiae = rawCandidates.slice(0, MAX_MINUTIAE_COUNT).map(
     (candidate): FingerprintMinutia => ({
       x: round(candidate.x / Math.max(width - 1, 1), 5),
@@ -147,11 +166,12 @@ export function extractFingerprintMinutiae({
     })
   );
   const template: FingerprintTemplate = {
-    version: 'minutiae-v1',
+    version: 'minutiae-v2',
     width,
     height,
     ridgePeriodPixels: round(period, 1),
     minutiae,
+    coordinateFrame: 'homography-canonical',
   };
 
   return {
@@ -174,6 +194,7 @@ export function extractFingerprintMinutiae({
     supportCoverage: calculateMaskCoverage(candidateMask, mask),
     searchableAreaRatio: searchableRegion.totalRatio,
     largestSearchableRegionRatio: searchableRegion.largestRegionRatio,
+    ...detection.diagnostics,
   };
 }
 
@@ -186,6 +207,7 @@ export function detectMinutiaeFromSkeleton({
   width,
   height,
   ridgePeriodPixels,
+  minimumSupportConfidence = 76,
 }: {
   skeleton: Uint8Array;
   maskDistance: Uint16Array;
@@ -194,8 +216,44 @@ export function detectMinutiaeFromSkeleton({
   width: number;
   height: number;
   ridgePeriodPixels: number;
+  minimumSupportConfidence?: number;
+}) {
+  return detectMinutiaeFromSkeletonDetailed({
+    skeleton,
+    maskDistance,
+    foregroundDistance,
+    supportConfidence,
+    width,
+    height,
+    ridgePeriodPixels,
+    minimumSupportConfidence,
+  }).candidates;
+}
+
+export function detectMinutiaeFromSkeletonDetailed({
+  skeleton,
+  maskDistance,
+  foregroundDistance = maskDistance,
+  supportConfidence,
+  width,
+  height,
+  ridgePeriodPixels,
+  minimumSupportConfidence = 76,
+}: {
+  skeleton: Uint8Array;
+  maskDistance: Uint16Array;
+  foregroundDistance?: Uint16Array;
+  supportConfidence?: Uint8Array;
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+  minimumSupportConfidence?: number;
 }) {
   const candidates: MinutiaCandidate[] = [];
+  let crossingNumberCandidateCount = 0;
+  let branchValidatedCandidateCount = 0;
+  let endingCandidateCount = 0;
+  let bifurcationCandidateCount = 0;
   const boundaryMargin = getCandidateBoundaryMargin(ridgePeriodPixels);
   const foregroundBoundaryMargin =
     getForegroundBoundaryMargin(ridgePeriodPixels);
@@ -220,6 +278,7 @@ export function detectMinutiaeFromSkeleton({
             ? 'bifurcation'
             : null;
       if (!type) continue;
+      crossingNumberCandidateCount += 1;
 
       const minimumBranchLength =
         type === 'bifurcation'
@@ -271,7 +330,15 @@ export function detectMinutiaeFromSkeleton({
         )
       );
       // Genişletilmiş arama alanının dış kuşağındaki zayıf topoloji, template'e aday olarak taşınmaz.
-      if (supportConfidence && confidence < 76) continue;
+      if (
+        supportConfidence &&
+        confidence < minimumSupportConfidence
+      ) {
+        continue;
+      }
+      branchValidatedCandidateCount += 1;
+      if (type === 'ending') endingCandidateCount += 1;
+      if (type === 'bifurcation') bifurcationCandidateCount += 1;
 
       candidates.push({
         x,
@@ -290,10 +357,30 @@ export function detectMinutiaeFromSkeleton({
     }
   }
 
-  return suppressNearbyCandidates(
-    rejectUnstableCandidatePairs(candidates, ridgePeriodPixels),
+  const stabilityValidatedCandidates = rejectUnstableCandidatePairs(
+    candidates,
     ridgePeriodPixels
   );
+  const suppressedCandidates = suppressNearbyCandidates(
+    stabilityValidatedCandidates,
+    ridgePeriodPixels
+  );
+  const confidenceHistogram = new Array<number>(10).fill(0);
+  for (const candidate of suppressedCandidates) {
+    confidenceHistogram[Math.min(9, Math.floor(candidate.confidence / 10))] += 1;
+  }
+
+  return {
+    candidates: suppressedCandidates,
+    diagnostics: {
+      crossingNumberCandidateCount,
+      branchValidatedCandidateCount,
+      suppressionCandidateCount: suppressedCandidates.length,
+      endingCandidateCount,
+      bifurcationCandidateCount,
+      confidenceHistogram,
+    },
+  };
 }
 
 // Parçalı kalite maskesinin sınırında kesilmiş ridge'lerin sahte son sayılmasını önleyen güvenlik payını hesaplar.

@@ -68,6 +68,12 @@ export type FingerprintQuality = {
   minutiaeStatus?: 'sufficient' | 'insufficient';
   minutiaeRejectionReason?: MinutiaeRejectionReason;
   minutiaeCandidateCount?: number;
+  minutiaeCrossingNumberCandidateCount?: number;
+  minutiaeBranchValidatedCandidateCount?: number;
+  minutiaeSuppressionCandidateCount?: number;
+  minutiaeEndingCandidateCount?: number;
+  minutiaeBifurcationCandidateCount?: number;
+  minutiaeConfidenceHistogram?: number[];
   minutiaeSearchableAreaRatio?: number;
   minutiaeLargestRegionRatio?: number;
   status: 'good' | 'medium' | 'poor';
@@ -79,6 +85,16 @@ export type QualityCalibrationLabel = 'good' | 'borderline' | 'bad';
 
 // OBB modelinin desteklediği parmak ucu sınıf adları.
 export type DetectionClassName = 'index' | 'middle' | 'pinky' | 'ring' | 'unknown';
+
+// Enrollment ve 1:N eşleştirmede modelin gerçekten ayırt ettiği dört parmak konumu.
+export const FINGERPRINT_POSITIONS = ['index', 'middle', 'ring', 'pinky'] as const;
+export type FingerprintPosition = (typeof FINGERPRINT_POSITIONS)[number];
+
+export function isFingerprintPosition(
+  className: DetectionClassName
+): className is FingerprintPosition {
+  return className !== 'unknown';
+}
 
 // Modelden gelen açılı kutuyu görüntüye oranlı dört köşe noktasıyla taşır.
 export type DetectedObbBox = {
@@ -115,14 +131,17 @@ export type FingerprintMinutia = {
 
 // Enrollment öncesi ilk yerel biyometrik şablon, görüntüden bağımsız normalize minutiae listesini saklar.
 export type FingerprintTemplate = {
-  version: 'minutiae-v1';
+  version: 'minutiae-v1' | 'minutiae-v2';
   width: number;
   height: number;
   ridgePeriodPixels: number;
   minutiae: FingerprintMinutia[];
+  coordinateFrame?: 'source-roi' | 'homography-canonical';
+  ridgeScaleFactor?: number;
+  textureDescriptor?: number[];
 };
 
-// Aynı parmağın flaşsız ve flaşlı kanonik ROI'leri arasındaki yerel kalite karşılaştırmasını taşır.
+// Eski çift çekim kayıtlarının metadata'sını okuyabilmek için geriye dönük tip.
 export type ExposurePairComparison = {
   alignmentConfidence: number;
   ambientBetterBlockRatio: number;
@@ -150,11 +169,13 @@ export type FingerRoi = {
   confidence: number;
   imageUri?: string;
   canonicalImageUri?: string;
+  // Eski çift çekim kayıtlarında bulunabilir; yeni kayıtlar yalnızca canonicalImageUri yazar.
   ambientCanonicalImageUri?: string;
   flashCanonicalImageUri?: string;
   alignedCanonicalImageUri?: string;
   canonicalSource?: 'ambient' | 'flash' | 'single';
   segmentedImageUri?: string;
+  maskImageUri?: string;
   enhancedImageUri?: string;
   orientationImageUri?: string;
   minutiaeImageUri?: string;
@@ -162,6 +183,22 @@ export type FingerRoi = {
   exposureComparison?: ExposurePairComparison;
   sourcePixelWidth?: number;
   canonicalRotationDegrees?: number;
+  homography?: [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  homographySourceSize?: { width: number; height: number };
+  homographyTargetSize?: { width: number; height: number };
+  ridgeScaleFactor?: number;
+  coordinateFrame?: 'source-roi' | 'homography-canonical';
+  perspectiveCorrected?: boolean;
   silhouetteAxisDegrees?: number;
   canonicalResidualDegrees?: number;
   silhouetteCorrectionDegrees?: number;
@@ -193,6 +230,7 @@ export type CaptureSample = {
   id: string;
   createdAt: string;
   rawImageUri: string;
+  // Eski çift çekim kayıtlarını silebilmek için korunur; yeni kayıtlar bu alanı yazmaz.
   exposurePair?: {
     ambientImageUri: string;
     flashImageUri: string;
@@ -214,6 +252,12 @@ export type CaptureSample = {
   detections?: DetectedObbBox[];
   fingerRois?: FingerRoi[];
   deviceModel?: string;
+  pipelineVersion?: 'roi-homography-ridge-v2';
+  captureConditions?: {
+    flash: 'on' | 'off';
+    estimatedDistanceCm?: number;
+    estimatedHandAngleDegrees?: number;
+  };
   fingerLabel: FingerLabel;
   sessionId: string;
   qualityStatus: QualityStatus;
@@ -226,18 +270,109 @@ export type Person = {
   id: string;
   displayName: string;
   createdAt: string;
+  schemaVersion: 1;
 };
 
-// Bir kişinin belirli parmağı için kabul edilmiş capture örneklerini gruplayan enrollment modeli.
+// Bir kişinin belirli parmağı için kabul edilmiş minutiae şablonunu taşıyan enrollment modeli.
 export type Enrollment = {
   id: string;
   personId: string;
-  fingerLabel: FingerLabel;
-  samples: string[];
-  templateVersion: string;
+  fingerPosition: FingerprintPosition;
+  template: FingerprintTemplate;
+  qualitySnapshot: {
+    overallScore: number;
+    biometricStatus: 'sufficient';
+    ridgeScore: number;
+    orientationScore: number;
+  };
+  sourceCaptureId: string;
+  createdAt: string;
+  sampleIndex?: 0 | 1 | 2;
+  coordinateFrame?: 'source-roi' | 'homography-canonical';
+  templateVersion: FingerprintTemplate['version'];
 };
 
-// 1:N arama sonucunda aday kişiyi skor ve sıralama bilgisiyle döndürecek tip.
+// Şifreli yerel veritabanının düz metin içeriği; dosyaya yazılmadan önce AES-GCM ile korunur.
+export type BiometricDatabase = {
+  schemaVersion: 1;
+  people: Person[];
+  enrollments: Enrollment[];
+  updatedAt: string;
+};
+
+export type FingerMatchStatus =
+  | 'matched'
+  | 'no-match'
+  | 'insufficient'
+  | 'missing';
+
+export type FingerMatchFailureReason =
+  | 'probe-missing'
+  | 'enrollment-missing'
+  | 'not-enough-probe-minutiae'
+  | 'not-enough-enrollment-minutiae'
+  | 'matched-minutiae-below-threshold'
+  | 'coverage-below-threshold'
+  | 'template-version-mismatch';
+
+// Tek bir parmak karşılaştırmasının karar ve hata ayıklama için güvenli özeti.
+export type FingerMatchResult = {
+  fingerPosition: FingerprintPosition;
+  status: FingerMatchStatus;
+  score: number;
+  matchedMinutiae: number;
+  coverage: number;
+  probeUsableMinutiae: number;
+  enrollmentUsableMinutiae: number;
+  minimumUsableMinutiae: number;
+  minimumMatchedMinutiae: number;
+  minimumCoverage: number;
+  failureReasons: FingerMatchFailureReason[];
+  transform?: {
+    rotationDegrees: number;
+    scale: number;
+    translationX: number;
+    translationY: number;
+  };
+  graphRelationScore?: number;
+  confidenceScore?: number;
+  distanceScore?: number;
+  textureScore?: number;
+};
+
+export type PersonCandidateResult = {
+  personId: string;
+  displayName: string;
+  score: number;
+  matchedFingerCount: number;
+  totalMatchedMinutiae: number;
+  averageCoverage: number;
+  fingerResults: FingerMatchResult[];
+};
+
+// 1:N arama sonucunda aday kişiyi skor ve parmak kanıtlarıyla döndüren tip.
+export type PersonMatchResult = {
+  personId: string;
+  displayName: string;
+  accepted: boolean;
+  score: number;
+  matchedFingerCount: number;
+  totalMatchedMinutiae: number;
+  averageCoverage: number;
+  fingerResults: FingerMatchResult[];
+  candidateResults: PersonCandidateResult[];
+  validProbeFingerPositions: FingerprintPosition[];
+  reason:
+    | 'accepted'
+    | 'no-people'
+    | 'no-valid-probe'
+    | 'no-match'
+    | 'insufficient-multi-finger-evidence'
+    | 'ambiguous'
+    | 'conflicting-evidence';
+};
+
+// Eski kalite sıralama prototipinin geriye dönük sonucu.
 export type SearchResult = {
   personId: string;
   score: number;

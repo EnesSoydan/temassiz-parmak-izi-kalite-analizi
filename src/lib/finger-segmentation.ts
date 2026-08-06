@@ -1,7 +1,14 @@
+import { Buffer } from 'buffer';
 import * as FileSystem from 'expo-file-system/legacy';
 import { manipulateAsync, SaveFormat } from 'expo-image-manipulator';
-import { Buffer } from 'buffer';
 import { decode, encode } from 'jpeg-js';
+import {
+  createQuadToRectangleHomography,
+  type HomographyMatrix,
+  warpRgbaImageByHomography,
+} from '@/lib/roi-geometry';
+import { encodeGrayscalePng } from '@/lib/png-encoder';
+import { inferLearnedFingerMask } from '@/lib/onnx-segmentation';
 
 export type SegmentationResult = {
   imageUri: string;
@@ -11,6 +18,11 @@ export type SegmentationResult = {
   height: number;
   coverage: number;
   silhouetteAxisDegrees: number;
+  perspectiveCorrected: boolean;
+  homography?: HomographyMatrix;
+  homographySourceSize?: { width: number; height: number };
+  homographyTargetSize?: { width: number; height: number };
+  ridgeScaleFactor: number;
   timings: {
     decodeMs: number;
     maskMs: number;
@@ -146,6 +158,26 @@ export async function saveRgbaImage({
   return outputImageUri;
 }
 
+export async function saveMaskPng({
+  mask,
+  width,
+  height,
+  outputImageUri,
+}: {
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  outputImageUri: string;
+}) {
+  ensureJpegBufferShim();
+  await FileSystem.writeAsStringAsync(
+    outputImageUri,
+    bytesToBase64(encodeGrayscalePng(mask, width, height)),
+    { encoding: FileSystem.EncodingType.Base64 }
+  );
+  return outputImageUri;
+}
+
 type YCrCbColor = {
   y: number;
   cr: number;
@@ -153,7 +185,7 @@ type YCrCbColor = {
 };
 
 // Saf JavaScript piksel işlemini kısa tutmak için analiz çözünürlüğünü sınırlarız.
-const MAX_ANALYSIS_WIDTH = 384;
+const MAX_ANALYSIS_WIDTH = 480;
 
 // Parmak silüeti için ten rengi aralığını merkezdeki örnekle birlikte kullanırız.
 const SKIN_RANGE = {
@@ -172,12 +204,15 @@ const MAX_MASK_COVERAGE = 0.995;
 export async function segmentFingerRoiImage({
   roiImageUri,
   outputImageUri,
+  outputMaskImageUri,
   sourceWidth,
   persistOutput = true,
   preparedImage,
+  sourcePolygon,
 }: {
   roiImageUri: string;
   outputImageUri?: string;
+  outputMaskImageUri?: string;
   sourceWidth: number;
   persistOutput?: boolean;
   preparedImage?: {
@@ -185,6 +220,7 @@ export async function segmentFingerRoiImage({
     width: number;
     height: number;
   };
+  sourcePolygon?: { x: number; y: number }[];
 }): Promise<SegmentationResult | null> {
   ensureJpegBufferShim();
 
@@ -197,37 +233,102 @@ export async function segmentFingerRoiImage({
       }
     : await loadAnalysisImage(roiImageUri, sourceWidth);
   const decodeMs = Date.now() - decodeStartedAt;
-  const sourcePixels = new Uint8Array(image.data);
-  const maskStartedAt = Date.now();
-  const targetColor = sampleCenterSkinColor(sourcePixels, image.width, image.height);
-  const skinMask = cleanAndSelectMask(
-    createSkinMask(sourcePixels, image.width, image.height, targetColor),
-    image.width,
-    image.height
-  );
-  const skinCoverage = calculateMaskCoverage(skinMask, image.width, image.height);
-  let mask = skinMask;
-  let coverage = skinCoverage;
-  let method = 'ten';
+  let sourcePixels = new Uint8Array(image.data);
+  let width = image.width;
+  let height = image.height;
+  let perspectiveCorrected = false;
+  let homography: HomographyMatrix | undefined;
+  let homographySourceSize: { width: number; height: number } | undefined;
+  let homographyTargetSize: { width: number; height: number } | undefined;
 
-  // Sabit YCrCb ten aralığı beyaz dengesi nedeniyle kaçırırsa merkez rengine göre ikinci maske deneriz.
-  if (!isValidMaskCoverage(skinCoverage)) {
-    const adaptiveMask = cleanAndSelectMask(
-      createAdaptiveCenterMask(sourcePixels, image.width, image.height, targetColor),
-      image.width,
-      image.height
-    );
-    const adaptiveCoverage = calculateMaskCoverage(adaptiveMask, image.width, image.height);
-
-    if (isValidMaskCoverage(adaptiveCoverage)) {
-      mask = adaptiveMask;
-      coverage = adaptiveCoverage;
-      method = 'uyarlanabilir';
-    } else {
-      console.info(
-        `[ROI segmentasyon] sonuç=yok, ten=${formatCoverage(skinCoverage)}, uyarlanabilir=${formatCoverage(adaptiveCoverage)}`
+  if (!preparedImage && sourcePolygon?.length === 4) {
+    try {
+      const polygon = sourcePolygon.map((point) => ({
+        x: point.x * Math.max(image.width - 1, 1),
+        y: point.y * Math.max(image.height - 1, 1),
+      }));
+      const edgeLengths = polygon.map((point, index) => {
+        const next = polygon[(index + 1) % polygon.length];
+        return Math.hypot(next.x - point.x, next.y - point.y);
+      });
+      const longEdge = Math.max(edgeLengths[0], edgeLengths[1], edgeLengths[2], edgeLengths[3]);
+      const shortEdge = Math.min(edgeLengths[0], edgeLengths[1], edgeLengths[2], edgeLengths[3]);
+      height = MAX_ANALYSIS_WIDTH;
+      width = Math.max(
+        64,
+        Math.min(
+          height,
+          Math.round((height * shortEdge) / Math.max(longEdge, 1))
+        )
       );
-      return null;
+      homography = createQuadToRectangleHomography(
+        polygon,
+        width,
+        height,
+        'vertical'
+      );
+      homographySourceSize = { width: image.width, height: image.height };
+      homographyTargetSize = { width, height };
+      sourcePixels = warpRgbaImageByHomography({
+        pixels: sourcePixels,
+        width: image.width,
+        height: image.height,
+        matrix: homography,
+        targetWidth: width,
+        targetHeight: height,
+      });
+      perspectiveCorrected = true;
+    } catch {
+      // Bozuk veya kendini kesen OBB dörtgeninde eski ROI tamponuyla güvenli şekilde devam edilir.
+      width = image.width;
+      height = image.height;
+    }
+  }
+
+  const maskStartedAt = Date.now();
+  const learnedResult = await inferLearnedFingerMask({
+    pixels: sourcePixels,
+    width,
+    height,
+  });
+  let mask: Uint8Array;
+  let coverage: number;
+  let method = 'öğrenilmiş-onnx';
+
+  if (learnedResult && isValidMaskCoverage(learnedResult.coverage)) {
+    mask = learnedResult.mask;
+    coverage = learnedResult.coverage;
+  } else {
+    const targetColor = sampleCenterSkinColor(sourcePixels, width, height);
+    const skinMask = cleanAndSelectMask(
+      createSkinMask(sourcePixels, width, height, targetColor),
+      width,
+      height
+    );
+    const skinCoverage = calculateMaskCoverage(skinMask, width, height);
+    mask = skinMask;
+    coverage = skinCoverage;
+    method = 'ten';
+
+    // Sabit YCrCb ten aralığı beyaz dengesi nedeniyle kaçırırsa merkez rengine göre ikinci maske deneriz.
+    if (!isValidMaskCoverage(skinCoverage)) {
+      const adaptiveMask = cleanAndSelectMask(
+        createAdaptiveCenterMask(sourcePixels, width, height, targetColor),
+        width,
+        height
+      );
+      const adaptiveCoverage = calculateMaskCoverage(adaptiveMask, width, height);
+
+      if (isValidMaskCoverage(adaptiveCoverage)) {
+        mask = adaptiveMask;
+        coverage = adaptiveCoverage;
+        method = 'uyarlanabilir';
+      } else {
+        console.info(
+          `[ROI segmentasyon] sonuç=yok, ten=${formatCoverage(skinCoverage)}, uyarlanabilir=${formatCoverage(adaptiveCoverage)}`
+        );
+        return null;
+      }
     }
   }
 
@@ -235,7 +336,7 @@ export async function segmentFingerRoiImage({
     return null;
   }
 
-  const silhouetteAxisDegrees = estimateMaskPrincipalAxis(mask, image.width, image.height);
+  const silhouetteAxisDegrees = estimateMaskPrincipalAxis(mask, width, height);
   const maskMs = Date.now() - maskStartedAt;
   console.info(`[ROI segmentasyon] yöntem=${method}, kapsam=${formatCoverage(coverage)}`);
   let enhancementMs = 0;
@@ -243,26 +344,35 @@ export async function segmentFingerRoiImage({
   let writeMs = 0;
 
   // Karşılaştırma ROI'sinde yalnızca piksel ve maske gerekir; ikinci Seg JPEG'i üretmeyerek süreyi sınırlarız.
-  if (persistOutput && outputImageUri) {
+  if (persistOutput && (outputImageUri || outputMaskImageUri)) {
     const enhancementStartedAt = Date.now();
     const segmentedPixels = createEnhancedSegmentedPixels(
       sourcePixels,
       mask,
-      image.width,
-      image.height
+      width,
+      height
     );
     enhancementMs = Date.now() - enhancementStartedAt;
 
     const encodeStartedAt = Date.now();
-    const jpeg = encode(
-      { data: segmentedPixels, width: image.width, height: image.height },
-      90
-    );
-    encodeMs = Date.now() - encodeStartedAt;
     const writeStartedAt = Date.now();
-    await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
-      encoding: FileSystem.EncodingType.Base64,
-    });
+    if (outputImageUri) {
+      const jpeg = encode(
+        { data: segmentedPixels, width, height },
+        90
+      );
+      await FileSystem.writeAsStringAsync(outputImageUri, bytesToBase64(jpeg.data), {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    }
+    if (outputMaskImageUri) {
+      await FileSystem.writeAsStringAsync(
+        outputMaskImageUri,
+        bytesToBase64(encodeGrayscalePng(mask, width, height)),
+        { encoding: FileSystem.EncodingType.Base64 }
+      );
+    }
+    encodeMs = Date.now() - encodeStartedAt;
     writeMs = Date.now() - writeStartedAt;
   }
 
@@ -270,10 +380,15 @@ export async function segmentFingerRoiImage({
     imageUri: outputImageUri ?? roiImageUri,
     pixels: sourcePixels,
     mask,
-    width: image.width,
-    height: image.height,
+    width,
+    height,
     coverage,
     silhouetteAxisDegrees,
+    perspectiveCorrected,
+    homography,
+    homographySourceSize,
+    homographyTargetSize,
+    ridgeScaleFactor: 1,
     timings: {
       decodeMs,
       maskMs,
@@ -325,7 +440,7 @@ function estimateMaskPrincipalAxis(
 }
 
 // Segmentasyon çıktısını yalnızca silüet değil, ridge dokusunu daha görünür yapan gri görüntü olarak üretir.
-function createEnhancedSegmentedPixels(
+export function createEnhancedSegmentedPixels(
   sourcePixels: Uint8Array,
   mask: Uint8Array,
   width: number,

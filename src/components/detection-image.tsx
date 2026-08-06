@@ -1,7 +1,7 @@
 import { Image } from 'expo-image';
 import { useState } from 'react';
 import { LayoutChangeEvent, StyleSheet, View } from 'react-native';
-import Svg, { G, Rect, Text as SvgText } from 'react-native-svg';
+import Svg, { G, Polygon, Text as SvgText } from 'react-native-svg';
 
 import type { CaptureSample, DetectedObbBox } from '@/types/biometrics';
 
@@ -37,22 +37,20 @@ export function DetectionImage({
       {layout.width > 0 && layout.height > 0 && (
         <Svg pointerEvents="none" style={StyleSheet.absoluteFill}>
           {detections.map((detection) => {
-            const box = getAxisAlignedScreenBox(detection, imageFrame);
+            const polygon = getScreenObbPolygon(detection, imageFrame);
 
             return (
               <G key={detection.id}>
-                <Rect
-                  x={box.x}
-                  y={box.y}
-                  width={box.width}
-                  height={box.height}
+                <Polygon
+                  points={polygon.points}
                   fill="rgba(47, 209, 107, 0.10)"
                   stroke="#2FD16B"
                   strokeWidth={2}
+                  strokeLinejoin="round"
                 />
                 <SvgText
-                  x={box.x + box.width / 2}
-                  y={Math.max(box.y - 4, 12)}
+                  x={polygon.labelX}
+                  y={polygon.labelY}
                   fill="#ffffff"
                   fontSize={9}
                   fontWeight="700"
@@ -68,8 +66,8 @@ export function DetectionImage({
   );
 }
 
-// Normalize OBB noktalarını ekrana taşıyıp sade, eksene hizalı bir kutuya dönüştürür.
-function getAxisAlignedScreenBox(
+// Normalize OBB köşelerini görsel üzerindeki gerçek çokgen ve etiket konumuna taşır.
+function getScreenObbPolygon(
   detection: DetectedObbBox,
   imageFrame: { x: number; y: number; width: number; height: number }
 ) {
@@ -81,14 +79,11 @@ function getAxisAlignedScreenBox(
   const yValues = screenPoints.map((point) => point.y);
   const left = Math.min(...xValues);
   const top = Math.min(...yValues);
-  const right = Math.max(...xValues);
-  const bottom = Math.max(...yValues);
 
   return {
-    x: left,
-    y: top,
-    width: right - left,
-    height: bottom - top,
+    points: screenPoints.map((point) => `${point.x},${point.y}`).join(' '),
+    labelX: (left + Math.max(...xValues)) / 2,
+    labelY: Math.max(top - 4, 12),
   };
 }
 

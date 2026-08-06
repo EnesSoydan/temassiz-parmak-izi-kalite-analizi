@@ -13,10 +13,9 @@ const ROOT_DIR = `${FileSystem.documentDirectory ?? ''}fingerprint-captures/`;
 const RAW_DIR = `${ROOT_DIR}raw/`;
 const ROI_DIR = `${ROOT_DIR}roi/`;
 const CANONICAL_ROI_DIR = `${ROOT_DIR}canonical-roi/`;
-const AMBIENT_CANONICAL_ROI_DIR = `${ROOT_DIR}ambient-canonical-roi/`;
-const FLASH_CANONICAL_ROI_DIR = `${ROOT_DIR}flash-canonical-roi/`;
 const ALIGNED_CANONICAL_ROI_DIR = `${ROOT_DIR}aligned-canonical-roi/`;
 const SEGMENTED_ROI_DIR = `${ROOT_DIR}segmented-roi/`;
+const MASK_ROI_DIR = `${ROOT_DIR}mask-roi/`;
 const ENHANCED_ROI_DIR = `${ROOT_DIR}enhanced-roi/`;
 const ORIENTATION_ROI_DIR = `${ROOT_DIR}orientation-roi/`;
 const MINUTIAE_ROI_DIR = `${ROOT_DIR}minutiae-roi/`;
@@ -30,10 +29,9 @@ export async function ensureCaptureStorage() {
   await ensureDirectory(RAW_DIR);
   await ensureDirectory(ROI_DIR);
   await ensureDirectory(CANONICAL_ROI_DIR);
-  await ensureDirectory(AMBIENT_CANONICAL_ROI_DIR);
-  await ensureDirectory(FLASH_CANONICAL_ROI_DIR);
   await ensureDirectory(ALIGNED_CANONICAL_ROI_DIR);
   await ensureDirectory(SEGMENTED_ROI_DIR);
+  await ensureDirectory(MASK_ROI_DIR);
   await ensureDirectory(ENHANCED_ROI_DIR);
   await ensureDirectory(ORIENTATION_ROI_DIR);
   await ensureDirectory(MINUTIAE_ROI_DIR);
@@ -80,30 +78,7 @@ export async function saveCanonicalFingerRoiImage(
   return targetUri;
 }
 
-// Flaşsız kanonik ROI'yi seçilen ana kaynak flaşlı olsa bile ayrı dosyada saklar.
-export async function saveAmbientCanonicalFingerRoiImage(
-  sourceUri: string,
-  sampleId: string,
-  className: DetectionClassName
-) {
-  await ensureCaptureStorage();
-  const targetUri = `${AMBIENT_CANONICAL_ROI_DIR}${sampleId}-${className}.jpg`;
-  await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
-  return targetUri;
-}
-
 // Aynı parmağın flaşlı kareden dikleştirilmiş kanonik ROI'sini görsel karşılaştırma için ayrı saklar.
-export async function saveFlashCanonicalFingerRoiImage(
-  sourceUri: string,
-  sampleId: string,
-  className: DetectionClassName
-) {
-  await ensureCaptureStorage();
-  const targetUri = `${FLASH_CANONICAL_ROI_DIR}${sampleId}-${className}.jpg`;
-  await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
-  return targetUri;
-}
-
 // Silüet düzeltmesi uygulanmış kanonik ROI'nin ayrı doğrulama görüntüsünü saklar.
 export async function createAlignedCanonicalFingerRoiImageUri(
   sampleId: string,
@@ -113,7 +88,6 @@ export async function createAlignedCanonicalFingerRoiImageUri(
   return `${ALIGNED_CANONICAL_ROI_DIR}${sampleId}-${className}.jpg`;
 }
 
-// Flaşlı ve flaşsız kanonik ROI'lerden seçilen veya birleştirilen işleme kaynağını saklar.
 // Segmentasyon çıktısının yazılacağı kalıcı dosya yolunu hazırlar.
 export async function createSegmentedFingerRoiImageUri(
   sampleId: string,
@@ -121,6 +95,15 @@ export async function createSegmentedFingerRoiImageUri(
 ) {
   await ensureCaptureStorage();
   return `${SEGMENTED_ROI_DIR}${sampleId}-${className}.jpg`;
+}
+
+// Distal falanks maskesini eğitim manifesti için PNG olarak saklar.
+export async function createMaskFingerRoiImageUri(
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  return `${MASK_ROI_DIR}${sampleId}-${className}.png`;
 }
 
 // Yön ve frekans destekli ridge iyileştirme çıktısının kalıcı yolunu hazırlar.
@@ -225,6 +208,9 @@ export async function exportQualityCalibrationSummary() {
           fingerRoi.canonicalResidualDegrees ?? null,
         silhouetteCorrectionDegrees:
           fingerRoi.silhouetteCorrectionDegrees ?? null,
+        coordinateFrame: fingerRoi.coordinateFrame ?? null,
+        perspectiveCorrected: fingerRoi.perspectiveCorrected ?? false,
+        ridgeScaleFactor: fingerRoi.ridgeScaleFactor ?? 1,
         quality: fingerRoi.quality
           ? {
               globalScore: fingerRoi.quality.globalScore,
@@ -265,6 +251,20 @@ export async function exportQualityCalibrationSummary() {
                 fingerRoi.quality.biometricRequiredValidBlockCount ?? 0,
               biometricRejectionReasons:
                 fingerRoi.quality.biometricRejectionReasons ?? [],
+              minutiaeCandidateCount:
+                fingerRoi.quality.minutiaeCandidateCount ?? 0,
+              minutiaeCrossingNumberCandidateCount:
+                fingerRoi.quality.minutiaeCrossingNumberCandidateCount ?? 0,
+              minutiaeBranchValidatedCandidateCount:
+                fingerRoi.quality.minutiaeBranchValidatedCandidateCount ?? 0,
+              minutiaeSuppressionCandidateCount:
+                fingerRoi.quality.minutiaeSuppressionCandidateCount ?? 0,
+              minutiaeEndingCandidateCount:
+                fingerRoi.quality.minutiaeEndingCandidateCount ?? 0,
+              minutiaeBifurcationCandidateCount:
+                fingerRoi.quality.minutiaeBifurcationCandidateCount ?? 0,
+              minutiaeConfidenceHistogram:
+                fingerRoi.quality.minutiaeConfidenceHistogram ?? [],
               ridgeEnhancementGainPercent:
                 fingerRoi.quality.ridgeEnhancementGainPercent ?? 0,
               ridgeEnhancementSupportedAreaRatio:
@@ -301,7 +301,7 @@ export async function deleteCaptureSample(sampleId: string) {
     await deleteFileIfExists(sample.rawImageUri);
   }
 
-  // Çift çekim deneyi varsa aynı kayda ait ikinci ham fotoğrafı da temizleriz.
+  // Eski çift çekim kayıtları varsa geriye dönük ikinci ham fotoğrafı da temizleriz.
   if (sample?.exposurePair?.flashImageUri) {
     await deleteFileIfExists(sample.exposurePair.flashImageUri);
   }
@@ -328,7 +328,7 @@ export async function deleteCaptureSample(sampleId: string) {
           await deleteFileIfExists(fingerRoi.ambientCanonicalImageUri);
         }
 
-        // Flaşlı kanonik ROI varsa flaşsız eş görüntüsüyle birlikte temizleriz.
+        // Eski çift çekim kayıtlarından kalan kanonik ROI dosyasını da temizleriz.
         if (fingerRoi.flashCanonicalImageUri) {
           await deleteFileIfExists(fingerRoi.flashCanonicalImageUri);
         }
@@ -340,6 +340,10 @@ export async function deleteCaptureSample(sampleId: string) {
         // Segmentasyonlu ROI varsa normal ROI ile birlikte temizleriz.
         if (fingerRoi.segmentedImageUri) {
           await deleteFileIfExists(fingerRoi.segmentedImageUri);
+        }
+
+        if (fingerRoi.maskImageUri) {
+          await deleteFileIfExists(fingerRoi.maskImageUri);
         }
 
         // Ridge iyileştirme çıktısı varsa aynı kaydın diğer ROI dosyalarıyla birlikte sileriz.

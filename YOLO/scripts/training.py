@@ -40,7 +40,7 @@ from ultralytics.models.yolo.obb.train import OBBTrainer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = PROJECT_ROOT / "final_hands_yolo11n_obb" / "weights" / "best.pt"
+DEFAULT_MODEL = PROJECT_ROOT / "runs" / "fingertip_obb" / "brightness_distance_obb" / "weights" / "best.pt"
 DEFAULT_RUNS_DIR = PROJECT_ROOT / "runs" / "fingertip_obb"
 DATA_YAML = PROJECT_ROOT / "YOLO" / "datasets" / "merged_hands_fingertip_obb" / "data.yaml"
 

@@ -1,0 +1,8 @@
+# RTX 4060 için doğrulanmış yerel veri hazırlama ortamı.
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+ultralytics==8.4.115
+opencv-python==5.0.0.93
+pillow==12.2.0
+onnx==1.22.0
+onnxruntime-gpu==1.24.3

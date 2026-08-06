@@ -42,7 +42,8 @@
         "expo-asset",
         {
           "assets": [
-            "./assets/models/fingertip_obb.onnx"
+            "./assets/models/fingertip_obb.onnx",
+            "./assets/models/fingertip_segmentation.onnx"
           ]
         }
       ],
@@ -52,7 +53,8 @@
           "photosPermission": "Model testi için seçtiğin el görseline erişmemize izin ver.",
           "microphonePermission": false
         }
-      ]
+      ],
+      "expo-secure-store"
     ],
     "experiments": {
       "typedRoutes": true,

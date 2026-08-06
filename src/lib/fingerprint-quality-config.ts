@@ -18,6 +18,7 @@ export const FINGERPRINT_QUALITY_THRESHOLDS = {
   captureMediumValidRatio: 8,
   biometricValidRatio: 22,
   biometricScore: 70,
+  biometricPinkyScore: 65,
   biometricOrientation: 45,
   biometricPeriodicity: 55,
   biometricFrequencyConsistency: 50,

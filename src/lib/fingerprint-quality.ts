@@ -17,6 +17,7 @@ import {
   shouldTrySecondaryRidgeScale,
 } from '@/lib/fingerprint-quality-config';
 import { createOrientationVisualization } from '@/lib/orientation-visualization';
+import { createMaskedClaheGrayscale as createMaskedClaheGrayscaleCore } from '@/lib/clahe';
 import { createControlledRidgeEnhancement } from '@/lib/ridge-enhancement';
 import {
   estimateRidgeFrequency,
@@ -231,6 +232,7 @@ export function analyzeFingerprintQualityDetailed({
     ridgeCandidateBlockCount: ridgeFrequency.candidateBlockCount,
   });
   const biometricAssessment = getFingerprintBiometricAssessment({
+    fingerClass,
     globalScore,
     orientationCoherence,
     ridgePeriodicity,
@@ -616,8 +618,6 @@ function preprocessFingerprintGrayscale(
 ) {
   const radius = Math.max(5, Math.min(12, Math.round(Math.min(width, height) / 12)));
   const normalized = new Uint8Array(grayscale.length);
-  const histogram = new Uint32Array(256);
-  let valueCount = 0;
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
@@ -630,26 +630,25 @@ function preprocessFingerprintGrayscale(
       const bottom = Math.min(height - 1, y + radius);
       const area = (right - left + 1) * (bottom - top + 1);
       const localMean = readIntegralSum(integral, width, left, top, right, bottom) / area;
-      const value = clampByte(128 + (grayscale[index] - localMean) * 1.65);
+      const value = clampByte(128 + (grayscale[index] - localMean) * 1.3);
 
       normalized[index] = value;
-      histogram[value] += 1;
-      valueCount += 1;
     }
   }
 
-  const low = getHistogramPercentile(histogram, valueCount, 0.04);
-  const high = getHistogramPercentile(histogram, valueCount, 0.96);
-  const range = Math.max(high - low, 12);
+  const adaptive = createMaskedClaheGrayscaleCore(normalized, mask, width, height);
 
   for (let index = 0; index < normalized.length; index += 1) {
     if (!mask[index]) continue;
-    normalized[index] = clampByte(((normalized[index] - low) / range) * 255);
+    normalized[index] = clampByte(
+      normalized[index] * 0.68 + adaptive[index] * 0.32
+    );
   }
 
   return normalized;
 }
 
+// Yerel kontrastı artırır; clip limit parlama bölgelerinin histogramı domine etmesini engeller.
 // 8-bit histogramdan sıralı diziyle aynı enterpolasyonlu yüzdelik değerini hesaplar.
 function getHistogramPercentile(histogram: Uint32Array, count: number, percentile: number) {
   if (count === 0) return 0;
@@ -837,6 +836,7 @@ function getFingerprintCaptureStatus({
 
 // Gelecekte enrollment için kullanılacak sıkı karar, ham ridge kanıtı ve kaynak çözünürlüğünü birlikte ister.
 export function getFingerprintBiometricAssessment({
+  fingerClass,
   globalScore,
   orientationCoherence,
   ridgePeriodicity,
@@ -846,6 +846,7 @@ export function getFingerprintBiometricAssessment({
   ridgeCandidateBlockCount,
   sourceResolutionScore,
 }: {
+  fingerClass?: DetectionClassName;
   globalScore: number;
   orientationCoherence: number;
   ridgePeriodicity: number;
@@ -860,6 +861,10 @@ export function getFingerprintBiometricAssessment({
 } {
   const minimums = getScaleAwareEvidenceMinimums(ridgeCandidateBlockCount);
   const reasons: BiometricRejectionReason[] = [];
+  const minimumBiometricScore =
+    fingerClass === 'pinky'
+      ? QUALITY_THRESHOLDS.biometricPinkyScore
+      : QUALITY_THRESHOLDS.biometricScore;
   // Yaygın ve doğrulanmış yerel ridge akışı, kıvrımlı parmak ucunda düşük kalan global yön özetini telafi edebilir.
   const hasStrongLocalEvidence = hasStrongLocalOrientationEvidence({
     ridgePeriodicity,
@@ -870,7 +875,7 @@ export function getFingerprintBiometricAssessment({
   });
 
   // Her başarısız koşulu ayrı saklayarak tek bir "insufficient" sonucunun nedenini görünür kılarız.
-  if (globalScore < QUALITY_THRESHOLDS.biometricScore) reasons.push('global-score');
+  if (globalScore < minimumBiometricScore) reasons.push('global-score');
   if (
     orientationCoherence < QUALITY_THRESHOLDS.biometricOrientation &&
     !hasStrongLocalEvidence

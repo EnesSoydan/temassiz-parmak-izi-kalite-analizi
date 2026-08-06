@@ -11,6 +11,7 @@ import { useFocusEffect } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
 import {
   FlatList,
+  Alert,
   Modal,
   Platform,
   Pressable,
@@ -28,6 +29,11 @@ import { WebBadge } from '@/components/web-badge';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
+  clearBiometricDatabase,
+  deletePerson,
+  loadBiometricDatabase,
+} from '@/lib/biometric-database';
+import {
   appendCaptureSample,
   deleteCaptureSample,
   exportQualityCalibrationSummary,
@@ -42,10 +48,13 @@ import {
   formatFingerprintQualityStatus,
   getCaptureQualityStatus,
 } from '@/lib/fingerprint-quality';
+import { FINGERPRINT_POSITIONS } from '@/types/biometrics';
 import type {
   CaptureSample,
   DetectedObbBox,
   FingerRoi,
+  Enrollment,
+  Person,
   QualityCalibrationLabel,
 } from '@/types/biometrics';
 
@@ -103,7 +112,6 @@ type RoiInspectionVariant =
   | 'roi'
   | 'canonical'
   | 'alignedCanonical'
-  | 'flashCanonical'
   | 'segmented'
   | 'orientation'
   | 'enhanced'
@@ -115,9 +123,8 @@ const ROI_INSPECTION_OPTIONS: {
   label: string;
 }[] = [
   { value: 'roi', label: 'ROI' },
-  { value: 'canonical', label: 'Flaşsız' },
+  { value: 'canonical', label: 'Flaşlı' },
   { value: 'alignedCanonical', label: 'Hizalı' },
-  { value: 'flashCanonical', label: 'Flaşlı' },
   { value: 'segmented', label: 'Seg' },
   { value: 'orientation', label: 'Yön' },
   { value: 'enhanced', label: 'Ridge' },
@@ -136,29 +143,15 @@ function getRoiInspectionUri(
   variant: RoiInspectionVariant
 ) {
   if (variant === 'roi') return fingerRoi.imageUri;
-  if (variant === 'canonical') {
-    return fingerRoi.ambientCanonicalImageUri ?? fingerRoi.canonicalImageUri;
-  }
+  if (variant === 'canonical') return fingerRoi.canonicalImageUri;
   if (variant === 'alignedCanonical') return fingerRoi.alignedCanonicalImageUri;
-  if (variant === 'flashCanonical') return fingerRoi.flashCanonicalImageUri;
   if (variant === 'segmented') return fingerRoi.segmentedImageUri;
   if (variant === 'orientation') return fingerRoi.orientationImageUri;
   if (variant === 'enhanced') return fingerRoi.enhancedImageUri;
   return fingerRoi.minutiaeImageUri;
 }
 
-// Eski tek poz kayıtlarında kanonik etiketini korur, çift pozda kaynağı flaşsız olarak belirtir.
-function getRoiInspectionLabel(
-  fingerRoi: FingerRoi,
-  option: (typeof ROI_INSPECTION_OPTIONS)[number]
-) {
-  if (option.value === 'canonical' && !fingerRoi.flashCanonicalImageUri) {
-    return 'Kanonik';
-  }
-  return option.label;
-}
-
-// Tek bir kaydın ham fotoğrafını, ROI çiftlerini ve kalite durumlarını gösterir.
+// Tek bir kaydın flaşlı ham fotoğrafını, ROI çıktısını ve kalite durumlarını gösterir.
 function CaptureCard({
   sample,
   onDelete,
@@ -288,12 +281,7 @@ function CaptureCard({
                       </View>
                     )}
                     <ThemedText type="small" style={styles.roiVariantLabel}>
-                      {getRoiInspectionLabel(
-                        fingerRoi,
-                        ROI_INSPECTION_OPTIONS.find(
-                          (option) => option.value === 'canonical'
-                        ) ?? ROI_INSPECTION_OPTIONS[1]
-                      )}
+                      Flaşlı
                     </ThemedText>
                   </View>
 
@@ -318,28 +306,6 @@ function CaptureCard({
                     )}
                     <ThemedText type="small" style={styles.roiVariantLabel}>
                       Hizalı
-                    </ThemedText>
-                  </View>
-
-                  <View style={styles.roiImageColumn}>
-                    {fingerRoi.flashCanonicalImageUri ? (
-                      <Pressable
-                        onPress={() => openInspection(fingerRoi, 'flashCanonical')}>
-                        <Image
-                          source={{ uri: fingerRoi.flashCanonicalImageUri }}
-                          style={styles.roiImage}
-                          contentFit="cover"
-                        />
-                      </Pressable>
-                    ) : (
-                      <View style={[styles.roiImage, styles.emptySegmentImage]}>
-                        <ThemedText type="small" style={styles.emptySegmentText}>
-                          Yok
-                        </ThemedText>
-                      </View>
-                    )}
-                    <ThemedText type="small" style={styles.roiVariantLabel}>
-                      Flaşlı
                     </ThemedText>
                   </View>
 
@@ -568,7 +534,7 @@ function CaptureCard({
                     <ThemedText
                       type="smallBold"
                       style={styles.inspectionTitle}>
-                      {getRoiInspectionLabel(inspection.fingerRoi, option)}
+                      {option.label}
                     </ThemedText>
                   </Pressable>
                 ))
@@ -610,8 +576,87 @@ async function tryExtractFingerRois({
   }
 }
 
+function PersonRegistry({
+  people,
+  enrollments,
+  onDelete,
+  onClear,
+  selectedPersonId,
+  onSelect,
+}: {
+  people: Person[];
+  enrollments: Enrollment[];
+  onDelete: (person: Person) => void;
+  onClear: () => void;
+  selectedPersonId: string | null;
+  onSelect: (personId: string) => void;
+}) {
+  return (
+    <ThemedView style={styles.peopleCard}>
+      <View style={styles.peopleHeader}>
+        <View style={styles.headerText}>
+          <ThemedText type="subtitle" style={styles.peopleTitle}>
+            Kimlik kayıtları
+          </ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">
+            {people.length === 0
+              ? 'Henüz kayıtlı kişi yok.'
+              : `${people.length} kişi, şablonlar şifreli yerelde tutuluyor.`}
+          </ThemedText>
+        </View>
+        {people.length > 0 ? (
+          <Pressable style={styles.resetPeopleButton} onPress={onClear}>
+            <ThemedText type="smallBold" style={styles.deleteText}>
+              Tümünü sıfırla
+            </ThemedText>
+          </Pressable>
+        ) : null}
+      </View>
+
+      {people.map((person) => {
+        const personEnrollments = enrollments.filter(
+          (enrollment) => enrollment.personId === person.id
+        );
+        return (
+          <View
+            key={person.id}
+            style={[
+              styles.personRow,
+              selectedPersonId === person.id && styles.personRowSelected,
+            ]}>
+            <Pressable
+              style={styles.personDetails}
+              onPress={() => onSelect(person.id)}>
+              <ThemedText type="smallBold">{person.displayName}</ThemedText>
+              <ThemedText type="small" themeColor="textSecondary">
+                {FINGERPRINT_POSITIONS.map((position) => {
+                  const exists = personEnrollments.some(
+                    (enrollment) => enrollment.fingerPosition === position
+                  );
+                  return `${formatFingerRoiClass(position)}: ${exists ? 'hazır' : 'eksik'}`;
+                }).join(' · ')}
+              </ThemedText>
+              <ThemedText type="small" themeColor="textSecondary">
+                Kayıt görüntülerini görmek için dokun
+              </ThemedText>
+            </Pressable>
+            <Pressable hitSlop={12} onPress={() => onDelete(person)}>
+              <ThemedText type="smallBold" style={styles.deleteText}>
+                Sil
+              </ThemedText>
+            </Pressable>
+          </View>
+        );
+      })}
+    </ThemedView>
+  );
+}
+
 export default function RecordsScreen() {
   const [samples, setSamples] = useState<CaptureSample[]>([]);
+  const [people, setPeople] = useState<Person[]>([]);
+  const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
+  const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState('Kayıtlar yükleniyor...');
   const [isPickingImage, setIsPickingImage] = useState(false);
   const safeAreaInsets = useSafeAreaInsets();
@@ -623,9 +668,16 @@ export default function RecordsScreen() {
 
   // Kayıtlar sekmesi açıldığında cihaz içindeki fotoğraf listesini yeniden okur.
   const loadSamples = useCallback(() => {
-    loadCaptureSamples()
-      .then((storedSamples) => {
+    Promise.all([loadCaptureSamples(), loadBiometricDatabase()])
+      .then(([storedSamples, database]) => {
         setSamples(storedSamples);
+        setPeople(database.people);
+        setEnrollments(database.enrollments);
+        setSelectedPersonId((currentId) =>
+          currentId && database.people.some((person) => person.id === currentId)
+            ? currentId
+            : null
+        );
         setFeedback(
           storedSamples.length === 0 ? 'Henüz kayıt yok.' : `${storedSamples.length} fotoğraf`
         );
@@ -636,6 +688,55 @@ export default function RecordsScreen() {
   }, []);
 
   useFocusEffect(loadSamples);
+
+  function handleDeletePerson(person: Person) {
+    Alert.alert(
+      `${person.displayName} silinsin mi?`,
+      'Kişiye ait dört biyometrik şablon da silinecek.',
+      [
+        { text: 'Vazgeç', style: 'cancel' },
+        {
+          text: 'Sil',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const database = await deletePerson(person.id);
+              setPeople(database.people);
+              setEnrollments(database.enrollments);
+              setFeedback(`${person.displayName} silindi.`);
+            } catch {
+              setFeedback('Kişi silinemedi.');
+            }
+          },
+        },
+      ]
+    );
+  }
+
+  function handleClearPeople() {
+    Alert.alert(
+      'Tüm biyometrik kayıtlar silinsin mi?',
+      'Bu işlem kayıtlı kişileri ve dört parmak şablonlarını kaldırır.',
+      [
+        { text: 'Vazgeç', style: 'cancel' },
+        {
+          text: 'Tümünü sil',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await clearBiometricDatabase();
+              setPeople([]);
+              setEnrollments([]);
+              setSelectedPersonId(null);
+              setFeedback('Biyometrik kayıtlar sıfırlandı.');
+            } catch {
+              setFeedback('Biyometrik kayıtlar sıfırlanamadı.');
+            }
+          },
+        },
+      ]
+    );
+  }
 
   // Kaydı önce ekrandan kaldırır, dosya silme başarısız olursa eski listeyi geri yükler.
   async function handleDelete(sampleId: string) {
@@ -772,6 +873,21 @@ export default function RecordsScreen() {
     },
   });
 
+  const selectedPerson = people.find((person) => person.id === selectedPersonId);
+  const selectedEnrollmentSamples = selectedPerson
+    ? [...
+        new Map(
+          enrollments
+            .filter((enrollment) => enrollment.personId === selectedPerson.id)
+            .sort((first, second) => (first.sampleIndex ?? 0) - (second.sampleIndex ?? 0))
+            .map((enrollment) => [
+              enrollment.sourceCaptureId,
+              samples.find((sample) => sample.id === enrollment.sourceCaptureId),
+            ])
+        ).values(),
+      ].filter((sample): sample is CaptureSample => Boolean(sample))
+    : [];
+
   return (
     <FlatList
       data={samples}
@@ -792,28 +908,59 @@ export default function RecordsScreen() {
       windowSize={3}
       removeClippedSubviews={Platform.OS === 'android'}
       ListHeaderComponent={
-        <View style={styles.header}>
-          <View style={styles.headerText}>
-            <ThemedText type="subtitle">Kayıtlar</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">
-              {feedback}
-            </ThemedText>
-          </View>
-
-          <View style={styles.headerActions}>
-            <Pressable style={styles.summaryButton} onPress={handleExportCalibration}>
-              <ThemedText type="smallBold">Özet</ThemedText>
-            </Pressable>
-            <Pressable
-              style={[styles.galleryButton, isPickingImage && styles.disabledButton]}
-              disabled={isPickingImage}
-              onPress={handlePickImage}>
-              <ThemedText type="smallBold">
-                {isPickingImage ? 'İşleniyor...' : 'Galeriden seç'}
+        <>
+          <PersonRegistry
+            people={people}
+            enrollments={enrollments}
+            onDelete={handleDeletePerson}
+            onClear={handleClearPeople}
+            selectedPersonId={selectedPersonId}
+            onSelect={setSelectedPersonId}
+          />
+          {selectedPerson ? (
+            <View style={styles.enrollmentPreview}>
+              <ThemedText type="subtitle">
+                {selectedPerson.displayName} · enrollment çekimleri ({selectedEnrollmentSamples.length}/3)
               </ThemedText>
-            </Pressable>
+              {selectedEnrollmentSamples.length > 0 ? (
+                selectedEnrollmentSamples.map((sample) => (
+                  <CaptureCard
+                    key={`enrollment-${sample.id}`}
+                    sample={sample}
+                    onDelete={handleDelete}
+                    onCalibrationLabel={handleCalibrationLabel}
+                  />
+                ))
+              ) : (
+                <ThemedText type="small" themeColor="textSecondary">
+                  Kaynak çekim geçmişinde bulunamadı.
+                </ThemedText>
+              )}
+            </View>
+          ) : null}
+          <View style={styles.header}>
+            <View style={styles.headerText}>
+              <ThemedText type="subtitle">Kayıtlar</ThemedText>
+              <ThemedText type="small" themeColor="textSecondary">
+                {feedback}
+              </ThemedText>
+            </View>
+
+            <View style={styles.headerActions}>
+              <Pressable style={styles.summaryButton} onPress={handleExportCalibration}>
+                <ThemedText type="smallBold">Özet</ThemedText>
+              </Pressable>
+              <Pressable
+                style={[styles.galleryButton, isPickingImage && styles.disabledButton]}
+                disabled={isPickingImage}
+                onPress={handlePickImage}>
+                <ThemedText type="smallBold">
+                  {isPickingImage ? 'İşleniyor...' : 'Galeriden seç'}
+                </ThemedText>
+              </Pressable>
+            </View>
           </View>
-        </View>
+        </>
       }
       ListFooterComponent={Platform.OS === 'web' ? <WebBadge /> : null}
     />
@@ -831,6 +978,50 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     gap: Spacing.four,
     paddingHorizontal: Spacing.four,
+  },
+  peopleCard: {
+    gap: Spacing.two,
+    borderRadius: 8,
+    padding: Spacing.three,
+  },
+  peopleHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+  },
+  peopleTitle: {
+    fontSize: 22,
+    lineHeight: 28,
+  },
+  resetPeopleButton: {
+    minHeight: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    backgroundColor: 'rgba(220, 60, 60, 0.12)',
+    paddingHorizontal: Spacing.two,
+  },
+  personRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: 'rgba(127, 127, 127, 0.25)',
+    paddingTop: Spacing.two,
+  },
+  personRowSelected: {
+    borderRadius: 6,
+    backgroundColor: 'rgba(32, 138, 239, 0.12)',
+    paddingHorizontal: Spacing.two,
+  },
+  personDetails: {
+    flex: 1,
+    gap: Spacing.half,
+  },
+  enrollmentPreview: {
+    gap: Spacing.two,
   },
   header: {
     minHeight: 52,

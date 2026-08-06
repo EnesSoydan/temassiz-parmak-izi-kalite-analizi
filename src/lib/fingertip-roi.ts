@@ -6,27 +6,24 @@ import {
 import {
   createAlignedCanonicalFingerRoiImageUri,
   createEnhancedFingerRoiImageUri,
+  createMaskFingerRoiImageUri,
   createMinutiaeFingerRoiImageUri,
   createOrientationFingerRoiImageUri,
   createSegmentedFingerRoiImageUri,
-  saveAmbientCanonicalFingerRoiImage,
   saveCanonicalFingerRoiImage,
-  saveFlashCanonicalFingerRoiImage,
   saveFingerRoiImage,
 } from '@/lib/capture-storage';
 import {
+  createEnhancedSegmentedPixels,
   rotateRgbaAndMask,
+  saveMaskPng,
   saveRgbaImage,
   segmentFingerRoiImage,
 } from '@/lib/finger-segmentation';
 import {
-  selectExposureProcessingSource,
-  type ExposureProcessingResult,
-} from '@/lib/exposure-pair-analysis';
-import {
-  convertNitroPixelsToRgba,
-  type NitroPixelFormat,
-} from '@/lib/nitro-pixel-data';
+  calculateRidgeScaleFactor,
+  rescaleRgbaAndMask,
+} from '@/lib/ridge-scale';
 import {
   analyzeFingerprintQualityDetailed,
   createSegmentationFailureQuality,
@@ -41,6 +38,7 @@ import {
   type MinutiaeExtractionResult,
 } from '@/lib/minutiae-extraction';
 import { saveRidgeEnhancedImage } from '@/lib/ridge-enhancement';
+import { createRidgeTextureDescriptor } from '@/lib/texture-descriptor';
 import type {
   CaptureSample,
   DetectedObbBox,
@@ -61,6 +59,8 @@ const MIN_TEMPLATE_MINUTIAE_COUNT = 8;
 const MAX_TEMPLATE_MINUTIAE_COUNT = 60;
 const MIN_SEARCHABLE_AREA_RATIO = 0.015;
 const MIN_LARGEST_SEARCHABLE_REGION_RATIO = 0.008;
+// Gabor destek alanının sınırındaki orta güvenli adayları da kontrollü biçimde template'e alır.
+const MINUTIAE_SUPPORT_CONFIDENCE_FLOOR = 70;
 
 // Canlı veya fotoğraf model kutularından parmak başına normalize ROI planı üretir.
 export function createFingerRoiPlans(
@@ -81,48 +81,14 @@ export async function extractFingerRoisFromImage({
   detections,
   sampleId,
   sourceImage,
-  sourceImagesByClassName,
-  comparisonImagesByClassName,
-  comparisonDetectionsByClassName,
 }: {
   imageUri: string;
   imageSize: ImageSize;
   detections: DetectedObbBox[];
   sampleId: string;
   sourceImage?: NitroImage;
-  sourceImagesByClassName?: ReadonlyMap<DetectedObbBox['className'], NitroImage>;
-  comparisonImagesByClassName?: ReadonlyMap<
-    DetectedObbBox['className'],
-    NitroImage
-  >;
-  comparisonDetectionsByClassName?: ReadonlyMap<
-    DetectedObbBox['className'],
-    DetectedObbBox
-  >;
 }) {
-  const getImageSizeForClass = (
-    className: DetectedObbBox['className'],
-    imagesByClassName?: ReadonlyMap<DetectedObbBox['className'], NitroImage>
-  ): ImageSize => {
-    const image = imagesByClassName?.get(className);
-    return image ? { width: image.width, height: image.height } : imageSize;
-  };
-  const roiPlans = sortFingerRois(
-    detections.flatMap((detection) =>
-      createFingerRoiPlans(
-        [detection],
-        getImageSizeForClass(detection.className, sourceImagesByClassName)
-      )
-    )
-  );
-  const comparisonPlansByClass = new Map<string, FingerRoi>();
-  for (const [className, detection] of comparisonDetectionsByClassName ?? []) {
-    const plan = createFingerRoiPlans(
-      [detection],
-      getImageSizeForClass(className, comparisonImagesByClassName)
-    )[0];
-    if (plan) comparisonPlansByClass.set(className, plan);
-  }
+  const roiPlans = createFingerRoiPlans(detections, imageSize);
   const processingStartedAt = Date.now();
   // Kamera çekiminde bellekteki yönlü görüntüyü, galeri akışında ise dosyadan yüklenen tek native görüntüyü paylaşırız.
   const sharedSourceImage =
@@ -133,9 +99,7 @@ export async function extractFingerRoisFromImage({
     roiPlans,
     ROI_PROCESSING_CONCURRENCY,
     async (roiPlan) => {
-      // Çift çekimde eksik sınıf flaşlı kareden geldiyse yalnızca o parmağı doğru kaynaktan kırparız.
-      const roiSourceImage =
-        sourceImagesByClassName?.get(roiPlan.className) ?? sharedSourceImage;
+      const roiSourceImage = sharedSourceImage;
       const fingerStartedAt = Date.now();
       const cropStartedAt = Date.now();
 
@@ -164,110 +128,21 @@ export async function extractFingerRoisFromImage({
         roiPlan.className
       );
       const saveMs = Date.now() - saveStartedAt;
-      let exposureComparison: FingerRoi['exposureComparison'];
-      let exposureFusion: ExposureProcessingResult | undefined;
-      let ambientCanonicalImageUri: string | undefined;
-      let flashCanonicalImageUri: string | undefined;
-      const exposureCompareStartedAt = Date.now();
-      const comparisonPlan = comparisonPlansByClass.get(roiPlan.className);
-      const comparisonSourceImage = comparisonImagesByClassName?.get(
-        roiPlan.className
-      );
-      const selectedSourceIsFlash = roiSourceImage !== sharedSourceImage;
-
       // Aynı sınıf iki karede de varsa küçük native tamponları doğrudan karşılaştırır, ikinci JPEG decode etmez.
-      if (
-        comparisonSourceImage && comparisonPlan
-      ) {
-        const comparisonCrop = await comparisonSourceImage.cropAsync(
-          comparisonPlan.crop.originX,
-          comparisonPlan.crop.originY,
-          comparisonPlan.crop.originX + comparisonPlan.crop.width,
-          comparisonPlan.crop.originY + comparisonPlan.crop.height
-        );
-        try {
-          const comparisonCanonical = await createCanonicalFingerRoi(
-            comparisonCrop,
-            comparisonPlan
-          );
-          try {
-            const ambientCanonicalImage = selectedSourceIsFlash
-              ? comparisonCanonical.image
-              : canonical.image;
-            const flashCanonicalImage = selectedSourceIsFlash
-              ? canonical.image
-              : comparisonCanonical.image;
-            if (selectedSourceIsFlash) {
-              const ambientCanonicalPath =
-                await ambientCanonicalImage.saveToTemporaryFileAsync('jpg', 95);
-              ambientCanonicalImageUri = await saveAmbientCanonicalFingerRoiImage(
-                toFileUri(ambientCanonicalPath),
-                sampleId,
-                roiPlan.className
-              );
-              flashCanonicalImageUri = canonicalImageUri;
-            } else {
-              ambientCanonicalImageUri = canonicalImageUri;
-              const flashCanonicalPath =
-                await flashCanonicalImage.saveToTemporaryFileAsync('jpg', 95);
-              flashCanonicalImageUri = await saveFlashCanonicalFingerRoiImage(
-                toFileUri(flashCanonicalPath),
-                sampleId,
-                roiPlan.className
-              );
-            }
-            const exposurePair = await createCanonicalExposurePair(
-              ambientCanonicalImage,
-              flashCanonicalImage
-            );
-            exposureFusion = selectExposureProcessingSource(
-              exposurePair.ambient,
-              exposurePair.flash,
-            );
-            exposureComparison = exposureFusion.comparison;
-          } finally {
-            if (comparisonCanonical.image !== comparisonCrop) {
-              comparisonCanonical.image.dispose();
-            }
-          }
-        } finally {
-          comparisonCrop.dispose();
-        }
-        console.info(
-          `[Poz karşılaştırma] parmak=${roiPlan.className}, hizalama=${exposureComparison.alignmentConfidence}%, blok=${exposureComparison.comparableBlockCount}, flaşsız_iyi=${exposureComparison.ambientBetterBlockRatio}%, flaşlı_iyi=${exposureComparison.flashBetterBlockRatio}%, merkez_flaş=${exposureComparison.centerFlashBetterBlockRatio}%, dış_flaşsız=${exposureComparison.outerAmbientBetterBlockRatio}%, parlama=${exposureComparison.ambientGlareRatio}%/${exposureComparison.flashGlareRatio}%, öneri=${exposureComparison.recommendation}`
-        );
-        console.info(
-          `[Poz yerel seçim] parmak=${roiPlan.className}, kaynak=${exposureFusion.processingSource}, flaş_oranı=${exposureFusion.flashPixelRatio}%`
-        );
-        console.info(
-          `[Poz kaynak] parmak=${roiPlan.className}, biyometri_kaynağı=${exposureFusion.processingSource}, birleşik=kapalı`
-        );
-        console.info(
-          `[Poz hizalama] parmak=${roiPlan.className}, kayma=${exposureComparison.alignmentShiftX}/${exposureComparison.alignmentShiftY}, ölçek=${exposureComparison.alignmentScale.toFixed(3)}, dönüş=${exposureComparison.alignmentRotationDegrees.toFixed(1)}°, güven=${exposureComparison.alignmentConfidence}%`
-        );
-      } else if (comparisonSourceImage) {
-        const processingSource =
-          roiSourceImage === comparisonSourceImage ? 'flash' : 'ambient';
-        console.info(
-          `[Poz birleştirme] parmak=${roiPlan.className}, işleme_kaynağı=${processingSource}, flaş_katkısı=${processingSource === 'flash' ? 100 : 0}%, neden=tek_tespit`
-        );
-      }
-      const exposureCompareMs = Date.now() - exposureCompareStartedAt;
       const processedRoi = await tryProcessFingerRoi({
-        roiImageUri: canonicalImageUri,
+        // Perspektif düzeltmesi OBB köşeleriyle ham eksen ROI'si üzerinde yapılır; native döndürme yalnızca debug önizlemesidir.
+        roiImageUri: savedImageUri,
         sampleId,
         className: roiPlan.className,
         sourceWidth: canonical.sourcePixelWidth,
         canonicalRotationDegrees: canonical.rotationDegrees,
-        exposureComparison,
-        exposureCompareMs,
-        preparedImage: exposureFusion,
+        sourcePolygon: roiPlan.normalizedMaskPolygon,
       });
 
       const timings = processedRoi.timings;
       console.info(
         timings
-          ? `[ROI süre] parmak=${roiPlan.className}, kırpma=${cropMs}ms, kayıt=${saveMs}ms, çözme=${timings.decodeMs}ms, maske=${timings.maskMs}ms, iyileştirme=${timings.enhancementMs}ms, jpeg=${timings.encodeMs}ms, seg_yazma=${timings.writeMs}ms, kalite=${timings.qualityMs}ms, poz=${timings.exposureCompareMs}ms, teknik_yazma=${timings.technicalWriteMs}ms, toplam=${Date.now() - fingerStartedAt}ms`
+          ? `[ROI süre] parmak=${roiPlan.className}, kırpma=${cropMs}ms, kayıt=${saveMs}ms, çözme=${timings.decodeMs}ms, maske=${timings.maskMs}ms, iyileştirme=${timings.enhancementMs}ms, jpeg=${timings.encodeMs}ms, seg_yazma=${timings.writeMs}ms, kalite=${timings.qualityMs}ms, teknik_yazma=${timings.technicalWriteMs}ms, toplam=${Date.now() - fingerStartedAt}ms`
           : `[ROI süre] parmak=${roiPlan.className}, kırpma=${cropMs}ms, kayıt=${saveMs}ms, segmentasyon=başarısız, toplam=${Date.now() - fingerStartedAt}ms`
       );
 
@@ -281,24 +156,25 @@ export async function extractFingerRoisFromImage({
         ...roiPlan,
         imageUri: savedImageUri,
         canonicalImageUri,
-        flashCanonicalImageUri,
         segmentedImageUri: processedRoi.segmentedImageUri,
+        maskImageUri: processedRoi.maskImageUri,
         enhancedImageUri: processedRoi.enhancedImageUri,
         orientationImageUri: processedRoi.orientationImageUri,
         minutiaeImageUri: processedRoi.minutiaeImageUri,
-        ambientCanonicalImageUri,
         alignedCanonicalImageUri: processedRoi.alignedCanonicalImageUri,
-        canonicalSource: (comparisonSourceImage
-          ? selectedSourceIsFlash
-            ? 'flash'
-            : 'ambient'
-          : 'single') as FingerRoi['canonicalSource'],
+        canonicalSource: sourceImage ? ('flash' as const) : ('single' as const),
         minutiaeTemplate: processedRoi.minutiaeTemplate,
-        exposureComparison: processedRoi.exposureComparison,
         sourcePixelWidth: canonical.sourcePixelWidth,
         canonicalRotationDegrees: canonical.rotationDegrees,
+        homography: processedRoi.homography,
+        homographySourceSize: processedRoi.homographySourceSize,
+        homographyTargetSize: processedRoi.homographyTargetSize,
+        ridgeScaleFactor: processedRoi.ridgeScaleFactor,
+        coordinateFrame: processedRoi.coordinateFrame,
+        perspectiveCorrected: processedRoi.perspectiveCorrected,
         silhouetteAxisDegrees: processedRoi.silhouetteAxisDegrees,
         canonicalResidualDegrees: processedRoi.canonicalResidualDegrees,
+        silhouetteCorrectionDegrees: processedRoi.silhouetteCorrectionDegrees,
         quality: processedRoi.quality,
       };
     }
@@ -342,23 +218,20 @@ async function tryProcessFingerRoi({
   className,
   sourceWidth,
   canonicalRotationDegrees,
-  exposureComparison,
-  exposureCompareMs,
-  preparedImage,
+  sourcePolygon,
 }: {
   roiImageUri: string;
   sampleId: string;
   className: FingerRoi['className'];
   sourceWidth: number;
   canonicalRotationDegrees: number;
-  exposureComparison?: FingerRoi['exposureComparison'];
-  exposureCompareMs: number;
-  preparedImage?: Pick<ExposureProcessingResult, 'pixels' | 'width' | 'height'>;
+  sourcePolygon?: { x: number; y: number }[];
 }) {
   try {
     const alignedCanonicalImageUri =
       await createAlignedCanonicalFingerRoiImageUri(sampleId, className);
     const outputImageUri = await createSegmentedFingerRoiImageUri(sampleId, className);
+    const outputMaskImageUri = await createMaskFingerRoiImageUri(sampleId, className);
     const enhancedImageUri = await createEnhancedFingerRoiImageUri(sampleId, className);
     const orientationImageUri = await createOrientationFingerRoiImageUri(
       sampleId,
@@ -371,12 +244,16 @@ async function tryProcessFingerRoi({
     let result = await segmentFingerRoiImage({
       roiImageUri,
       outputImageUri,
+      outputMaskImageUri,
       sourceWidth,
-      preparedImage,
+      sourcePolygon,
     });
 
     if (!result) {
-      return { quality: createSegmentationFailureQuality() };
+      return {
+        quality: createSegmentationFailureQuality(),
+        perspectiveCorrected: false,
+      };
     }
 
     // OBB ilk yönü verir; silüet bundan belirgin sapıyorsa ROI tamponunu sınırlı açıyla ikinci kez hizalarız.
@@ -410,8 +287,16 @@ async function tryProcessFingerRoi({
         preparedImage: correctedBuffers,
       });
       if (correctedResult) {
+        const originalHomography = result.homography;
+        const originalHomographySourceSize = result.homographySourceSize;
+        const originalHomographyTargetSize = result.homographyTargetSize;
+        const originalPerspectiveCorrection = result.perspectiveCorrected;
         result = {
           ...correctedResult,
+          homography: originalHomography,
+          homographySourceSize: originalHomographySourceSize,
+          homographyTargetSize: originalHomographyTargetSize,
+          perspectiveCorrected: originalPerspectiveCorrection,
           timings: {
             decodeMs: result.timings.decodeMs + correctedResult.timings.decodeMs,
             maskMs: result.timings.maskMs + correctedResult.timings.maskMs,
@@ -425,14 +310,87 @@ async function tryProcessFingerRoi({
       console.info(
         `[ROI hizalama] silüet_düzeltmesi=${silhouetteCorrectionDegrees.toFixed(1)}°, önceki_sapma=${initialResidualDegrees.toFixed(1)}°, yeni_sapma=${normalizeAxisRotation(result.silhouetteAxisDegrees - 90).toFixed(1)}°`
       );
+    } else {
+      // Ek düzeltme gerekmese de kanonik görüntüyü aynı fiziksel bölgenin hizalı debug çıktısı olarak saklarız.
+      await saveRgbaImage({
+        pixels: result.pixels,
+        width: result.width,
+        height: result.height,
+        outputImageUri: alignedCanonicalImageUri,
+        quality: 95,
+      });
     }
 
+    console.info(
+      `[ROI homografi] parmak=${className}, durum=${result.perspectiveCorrected ? 'uygulandı' : 'yedek'}`
+    );
+    await saveMaskPng({
+      mask: result.mask,
+      width: result.width,
+      height: result.height,
+      outputImageUri: outputMaskImageUri,
+    });
+
     const qualityStartedAt = Date.now();
-    const analysis = analyzeFingerprintQualityDetailed({
+    let analysis = analyzeFingerprintQualityDetailed({
       ...result,
       sourcePixelWidth: sourceWidth,
       fingerClass: className,
     });
+    const measuredRidgePeriod = analysis.quality.ridgeMedianPeriodPixels;
+    const ridgeScaleFactor = calculateRidgeScaleFactor(measuredRidgePeriod);
+    if (Math.abs(ridgeScaleFactor - 1) >= 0.08) {
+      const scaled = rescaleRgbaAndMask({
+        pixels: result.pixels,
+        mask: result.mask,
+        width: result.width,
+        height: result.height,
+        scaleFactor: ridgeScaleFactor,
+      });
+      result = {
+        ...result,
+        pixels: scaled.pixels,
+        mask: scaled.mask,
+        width: scaled.width,
+        height: scaled.height,
+        ridgeScaleFactor: scaled.scaleFactor,
+      };
+      await saveRgbaImage({
+        pixels: result.pixels,
+        width: result.width,
+        height: result.height,
+        outputImageUri: alignedCanonicalImageUri,
+        quality: 95,
+      });
+      if (result.imageUri !== roiImageUri) {
+        await saveRgbaImage({
+          pixels: createEnhancedSegmentedPixels(
+            result.pixels,
+            result.mask,
+            result.width,
+            result.height
+          ),
+          width: result.width,
+          height: result.height,
+          outputImageUri: result.imageUri,
+          quality: 90,
+        });
+      }
+      await saveMaskPng({
+        mask: result.mask,
+        width: result.width,
+        height: result.height,
+        outputImageUri: outputMaskImageUri,
+      });
+      analysis = analyzeFingerprintQualityDetailed({
+        ...result,
+        sourcePixelWidth: sourceWidth,
+        fingerClass: className,
+      });
+      console.info(
+        `[Ridge ölçek] parmak=${className}, önce=${measuredRidgePeriod.toFixed(1)}px, sonra=${analysis.quality.ridgeMedianPeriodPixels.toFixed(1)}px, katsayı=${ridgeScaleFactor.toFixed(2)}`
+      );
+    }
     const quality = analysis.quality;
     const qualityMs = Date.now() - qualityStartedAt;
     let savedEnhancedImageUri: string | undefined;
@@ -441,9 +399,8 @@ async function tryProcessFingerRoi({
     let minutiaeTemplate: FingerRoi['minutiaeTemplate'];
     let minutiaeVisualization: Uint8Array | undefined;
 
-    // Teknik Nokta görüntüsü kalite kararından bağımsız üretilir; template kabulü aşağıdaki ayrı kapıda yapılır.
+    // Teknik Nokta görüntüsü kalite yetersiz olsa bile üretilir; yalnızca template kabulü aşağıdaki ayrı kapıda yapılır.
     if (
-      quality.biometricStatus === 'sufficient' &&
       analysis.enhancedPixels &&
       analysis.minutiaeSupportMask &&
       analysis.minutiaeOrientationMask &&
@@ -458,12 +415,23 @@ async function tryProcessFingerRoi({
         width: result.width,
         height: result.height,
         ridgePeriodPixels: quality.ridgeMedianPeriodPixels,
+        minimumSupportConfidence: MINUTIAE_SUPPORT_CONFIDENCE_FLOOR,
       });
       minutiaeVisualization = minutiae.visualizationPixels;
       const minutiaeAssessment = assessMinutiaeTemplate(quality, minutiae);
       quality.minutiaeStatus = minutiaeAssessment.status;
       quality.minutiaeRejectionReason = minutiaeAssessment.reason;
       quality.minutiaeCandidateCount = minutiae.template.minutiae.length;
+      quality.minutiaeCrossingNumberCandidateCount =
+        minutiae.crossingNumberCandidateCount;
+      quality.minutiaeBranchValidatedCandidateCount =
+        minutiae.branchValidatedCandidateCount;
+      quality.minutiaeSuppressionCandidateCount =
+        minutiae.suppressionCandidateCount;
+      quality.minutiaeEndingCandidateCount = minutiae.endingCandidateCount;
+      quality.minutiaeBifurcationCandidateCount =
+        minutiae.bifurcationCandidateCount;
+      quality.minutiaeConfidenceHistogram = minutiae.confidenceHistogram;
       quality.minutiaeSearchableAreaRatio = Math.round(
         minutiae.searchableAreaRatio * 100
       );
@@ -471,7 +439,19 @@ async function tryProcessFingerRoi({
         minutiae.largestSearchableRegionRatio * 100
       );
       if (minutiaeAssessment.status === 'sufficient') {
-        minutiaeTemplate = minutiae.template;
+        minutiaeTemplate = {
+          ...minutiae.template,
+          textureDescriptor: createRidgeTextureDescriptor({
+            pixels: analysis.enhancedPixels,
+            mask: result.mask,
+            width: result.width,
+            height: result.height,
+          }),
+          ridgeScaleFactor: result.ridgeScaleFactor,
+          coordinateFrame: result.perspectiveCorrected
+            ? 'homography-canonical'
+            : 'source-roi',
+        };
       }
       const endingCount = minutiae.template.minutiae.filter(
         (item) => item.type === 'ending'
@@ -479,7 +459,7 @@ async function tryProcessFingerRoi({
       const bifurcationCount =
         minutiae.template.minutiae.length - endingCount;
       console.info(
-        `[Minutiae] parmak=${className}, durum=${minutiaeAssessment.status}, ret=${minutiaeAssessment.reason ?? 'yok'}, toplam=${minutiae.template.minutiae.length}, son=${endingCount}, çatallanma=${bifurcationCount}, ham_aday=${minutiae.rawCandidateCount}, iskelet=${minutiae.skeletonPixelCount}, mikro_delik=${minutiae.filledHolePixelCount}, küçük_bileşen=${minutiae.removedComponentPixelCount}, budanan=${minutiae.prunedPixelCount}, bağlanan=${minutiae.bridgedPixelCount}, destek=${Math.round(minutiae.supportCoverage * 100)}%, aranabilir=${Math.round(minutiae.searchableAreaRatio * 100)}%, büyük_bölge=${Math.round(minutiae.largestSearchableRegionRatio * 100)}%, ridge_oranı=${Math.round(minutiae.binaryRidgeRatio * 100)}%, inceltme=${minutiae.thinningIterations}, süre=${Date.now() - minutiaeStartedAt}ms`
+        `[Minutiae] parmak=${className}, durum=${minutiaeAssessment.status}, ret=${minutiaeAssessment.reason ?? 'yok'}, toplam=${minutiae.template.minutiae.length}, son=${endingCount}, çatallanma=${bifurcationCount}, crossing=${minutiae.crossingNumberCandidateCount}, branch=${minutiae.branchValidatedCandidateCount}, suppression=${minutiae.suppressionCandidateCount}, ham_aday=${minutiae.rawCandidateCount}, iskelet=${minutiae.skeletonPixelCount}, mikro_delik=${minutiae.filledHolePixelCount}, küçük_bileşen=${minutiae.removedComponentPixelCount}, budanan=${minutiae.prunedPixelCount}, bağlanan=${minutiae.bridgedPixelCount}, destek=${Math.round(minutiae.supportCoverage * 100)}%, aranabilir=${Math.round(minutiae.searchableAreaRatio * 100)}%, büyük_bölge=${Math.round(minutiae.largestSearchableRegionRatio * 100)}%, ridge_oranı=${Math.round(minutiae.binaryRidgeRatio * 100)}%, inceltme=${minutiae.thinningIterations}, conf=${minutiae.confidenceHistogram.join('/')}, süre=${Date.now() - minutiaeStartedAt}ms`
       );
     } else {
       quality.minutiaeStatus = 'insufficient';
@@ -549,15 +529,20 @@ async function tryProcessFingerRoi({
 
     return {
       segmentedImageUri: result.imageUri,
-      alignedCanonicalImageUri:
-        silhouetteCorrectionDegrees !== 0
-          ? alignedCanonicalImageUri
-          : undefined,
+      maskImageUri: outputMaskImageUri,
+      alignedCanonicalImageUri,
       enhancedImageUri: savedEnhancedImageUri,
       orientationImageUri: savedOrientationImageUri,
       minutiaeImageUri: savedMinutiaeImageUri,
       minutiaeTemplate,
-      exposureComparison,
+      homography: result.homography,
+      homographySourceSize: result.homographySourceSize,
+      homographyTargetSize: result.homographyTargetSize,
+      ridgeScaleFactor: result.ridgeScaleFactor,
+      perspectiveCorrected: result.perspectiveCorrected,
+      coordinateFrame: result.perspectiveCorrected
+        ? ('homography-canonical' as const)
+        : ('source-roi' as const),
       silhouetteAxisDegrees: result.silhouetteAxisDegrees,
       canonicalResidualDegrees,
       silhouetteCorrectionDegrees,
@@ -565,13 +550,15 @@ async function tryProcessFingerRoi({
       timings: {
         ...result.timings,
         qualityMs,
-        exposureCompareMs,
         technicalWriteMs,
       },
     };
   } catch (error) {
     console.warn('Parmak ROI segmentasyonu uygulanamadı.', error);
-    return { quality: createSegmentationFailureQuality() };
+    return {
+      quality: createSegmentationFailureQuality(),
+      perspectiveCorrected: false,
+    };
   }
 }
 
@@ -644,79 +631,6 @@ async function createCanonicalFingerRoi(cropped: NitroImage, roiPlan: FingerRoi)
 }
 
 // Kanonik çifti analiz çözünürlüğünde RGBA tamponlarına taşıyıp karşılaştırma ve gerçek poz birleşimini birlikte üretir.
-async function createCanonicalExposurePair(
-  ambientImage: NitroImage,
-  flashImage: NitroImage
-) {
-  const targetWidth = Math.min(384, ambientImage.width);
-  const targetHeight = Math.max(
-    1,
-    Math.round((ambientImage.height * targetWidth) / Math.max(ambientImage.width, 1))
-  );
-  const [ambientPreview, flashPreview] = await Promise.all([
-    ambientImage.resizeAsync(targetWidth, targetHeight),
-    flashImage.resizeAsync(targetWidth, targetHeight),
-  ]);
-
-  try {
-    const [ambientRaw, flashRaw] = await Promise.all([
-      ambientPreview.toRawPixelDataAsync(false),
-      flashPreview.toRawPixelDataAsync(false),
-    ]);
-    const ambientInput = createExposureAnalysisInput(
-      new Uint8Array(ambientRaw.buffer),
-      ambientRaw.width,
-      ambientRaw.height,
-      ambientRaw.pixelFormat
-    );
-    const flashInput = createExposureAnalysisInput(
-      new Uint8Array(flashRaw.buffer),
-      flashRaw.width,
-      flashRaw.height,
-      flashRaw.pixelFormat
-    );
-    if (ambientInput.redBlueCorrected || flashInput.redBlueCorrected) {
-      console.info(
-        `[Poz piksel] flaşsız=${ambientRaw.pixelFormat}${ambientInput.redBlueCorrected ? '/RB-düzeltildi' : ''}, flaşlı=${flashRaw.pixelFormat}${flashInput.redBlueCorrected ? '/RB-düzeltildi' : ''}`
-      );
-    }
-    return { ambient: ambientInput, flash: flashInput };
-  } finally {
-    ambientPreview.dispose();
-    flashPreview.dispose();
-  }
-}
-
-// Nitro kanal sırasını ortak RGBA biçimine çevirip siyah dönüş köşelerini karşılaştırma dışında bırakır.
-function createExposureAnalysisInput(
-  source: Uint8Array,
-  width: number,
-  height: number,
-  pixelFormat: NitroPixelFormat
-) {
-  const normalized = convertNitroPixelsToRgba({ source, width, height, pixelFormat });
-  const pixels = normalized.pixels;
-  const mask = new Uint8Array(width * height);
-
-  for (let index = 0; index < width * height; index += 1) {
-    const targetIndex = index * 4;
-    const red = pixels[targetIndex];
-    const green = pixels[targetIndex + 1];
-    const blue = pixels[targetIndex + 2];
-    const x = index % width;
-    const y = Math.floor(index / width);
-    const luminance = red * 0.299 + green * 0.587 + blue * 0.114;
-    const insideSafeBounds =
-      x >= width * 0.04 &&
-      x < width * 0.96 &&
-      y >= height * 0.03 &&
-      y < height * 0.97;
-    mask[index] = insideSafeBounds && luminance > 6 ? 1 : 0;
-  }
-
-  return { pixels, mask, width, height, redBlueCorrected: normalized.redBlueCorrected };
-}
-
 // Nitro Image'in beklediği yerel dosya yolundan file URI önekini kaldırır.
 function toNativeFilePath(uri: string) {
   return decodeURIComponent(uri.replace(/^file:\/\//, ''));

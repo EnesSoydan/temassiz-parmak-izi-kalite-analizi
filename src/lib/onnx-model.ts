@@ -7,9 +7,13 @@ type OrtSession = Awaited<ReturnType<OrtModule['InferenceSession']['create']>>;
 // Mobil inference icin uygulamaya gomulen ONNX model asset'ini temsil eder.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const FINGERTIP_OBB_MODEL = require('../../assets/models/fingertip_obb.onnx');
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const FINGERTIP_SEGMENTATION_MODEL = require('../../assets/models/fingertip_segmentation.onnx');
 
 let cachedSession: OrtSession | null = null;
 let cachedSessionPromise: Promise<OrtSession> | null = null;
+let cachedSegmentationSession: OrtSession | null = null;
+let cachedSegmentationSessionPromise: Promise<OrtSession> | null = null;
 let cachedOrt: OrtModule | null = null;
 
 // ONNX modelini bir kez indirip hızlandırılmış InferenceSession olarak hazırlar; sonraki çağrılarda cache kullanır.
@@ -38,6 +42,36 @@ export async function loadFingertipObbSession() {
     return await cachedSessionPromise;
   } catch (error) {
     cachedSessionPromise = null;
+    throw error;
+  }
+}
+
+// Öğrenilmiş parmak maskesi modelini de OBB modeliyle aynı hızlandırıcı seçimiyle hazırlar.
+export async function loadFingertipSegmentationSession() {
+  if (cachedSegmentationSession) {
+    return cachedSegmentationSession;
+  }
+
+  if (cachedSegmentationSessionPromise) {
+    return cachedSegmentationSessionPromise;
+  }
+
+  cachedSegmentationSessionPromise = (async () => {
+    const ort = await loadOnnxRuntime();
+    const [modelAsset] = await Asset.loadAsync(FINGERTIP_SEGMENTATION_MODEL);
+
+    if (!modelAsset.localUri) {
+      throw new Error('Öğrenilmiş segmentasyon modeli cihaza indirilemedi.');
+    }
+
+    cachedSegmentationSession = await createAcceleratedSession(ort, modelAsset.localUri);
+    return cachedSegmentationSession;
+  })();
+
+  try {
+    return await cachedSegmentationSessionPromise;
+  } catch (error) {
+    cachedSegmentationSessionPromise = null;
     throw error;
   }
 }
@@ -85,6 +119,13 @@ async function createAcceleratedSession(ort: OrtModule, modelUri: string) {
 export async function getFingertipObbRuntime() {
   const ort = await loadOnnxRuntime();
   const session = await loadFingertipObbSession();
+
+  return { ort, session };
+}
+
+export async function getFingertipSegmentationRuntime() {
+  const ort = await loadOnnxRuntime();
+  const session = await loadFingertipSegmentationSession();
 
   return { ort, session };
 }
