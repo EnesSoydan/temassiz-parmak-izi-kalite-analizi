@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 
 import {
+  getCurrentConfirmedLiveDetections,
   getHalfTurnAngleDifference,
   getVisibleLiveDetections,
+  mergeCaptureSnapshotDetections,
+  mergeMissingLiveDetections,
   updateLiveDetectionTracks,
 } from '../src/lib/live-detection-tracker.ts';
 
@@ -131,6 +134,11 @@ tracks = updateLiveDetectionTracks(tracks, [outlierDetection]);
 const retainedTrack = tracks.get('index');
 assert.ok(retainedTrack, 'Ani aykırı ölçümde önceki track kısa süre korunmalı.');
 assert.equal(retainedTrack.missedUpdates, 1);
+assert.equal(
+  getCurrentConfirmedLiveDetections(tracks).length,
+  0,
+  'Bu turda yeniden görülmeyen kutu kalite kapısına gönderilmemeli.'
+);
 assert.deepEqual(
   retainedTrack.detection.center,
   centerBeforeOutlier,
@@ -165,6 +173,74 @@ assert.equal(
   getVisibleLiveDetections(pinkyTracks).length,
   0,
   'Düşük güvenli serçe de ikinci tutarlı ölçümden önce çizilmemeli.'
+);
+
+// Fotoğraf modelinin kaçırdığı sınıf son kararlı canlı OBB ile tamamlanmalı; bulunan sınıflar ezilmemeli.
+const photoDetections = [
+  createDetection({ className: 'index', centerX: 0.32 }),
+  createDetection({ className: 'middle', centerX: 0.46 }),
+  createDetection({ className: 'ring', centerX: 0.60 }),
+];
+const liveFallbackDetections = [
+  ...photoDetections,
+  createDetection({ className: 'pinky', centerX: 0.74, confidence: 0.46 }),
+];
+const mergedDetectionResult = mergeMissingLiveDetections(
+  photoDetections,
+  liveFallbackDetections
+);
+assert.equal(
+  mergedDetectionResult.fallbackClasses.join(','),
+  'pinky',
+  'Yalnızca fotoğraf modelinin kaçırdığı serçe canlı OBB ile tamamlanmalı.'
+);
+assert.equal(
+  mergedDetectionResult.detections.length,
+  4,
+  'Eksik canlı OBB tamamlandıktan sonra dört sınıf bulunmalı.'
+);
+assert.equal(
+  mergedDetectionResult.detections.find((detection) => detection.className === 'index')
+    .center.x,
+  photoDetections[0].center.x,
+  'Fotoğraf modelinin bulduğu index kutusu canlı yedekle ezilmemeli.'
+);
+assert.equal(
+  mergedDetectionResult.detections.find((detection) => detection.className === 'pinky')
+    .id,
+  'live-fallback-pinky',
+  'Canlı yedek kutusu kaynağı ayırt edilebilir bir ID taşımalı.'
+);
+
+// Otomatik çekim açıldığında kullanıcıya gösterilen canlı kutular fotoğraf modelinden
+// bağımsız olarak ROI kaynağı olmalı; fotoğraf modeli yalnızca snapshot'ta olmayan sınıfı tamamlamalı.
+const shiftedPhotoPinky = createDetection({
+  className: 'pinky',
+  centerX: 0.81,
+  confidence: 0.93,
+});
+const captureSnapshotResult = mergeCaptureSnapshotDetections(
+  [...photoDetections, shiftedPhotoPinky],
+  liveFallbackDetections
+);
+assert.deepEqual(
+  captureSnapshotResult.snapshotClasses,
+  ['index', 'middle', 'ring', 'pinky'],
+  'Dört canlı çekim kutusunun tamamı snapshot kaynağı olarak işaretlenmeli.'
+);
+assert.equal(
+  captureSnapshotResult.detections.find(
+    (detection) => detection.className === 'pinky'
+  ).center.x,
+  0.74,
+  'Fotoğraf modeli serçeyi farklı bulsa bile çekim anındaki serçe OBB korunmalı.'
+);
+assert.equal(
+  captureSnapshotResult.detections.find(
+    (detection) => detection.className === 'pinky'
+  ).id,
+  'live-capture-pinky',
+  'Çekim anındaki ROI kaynağı log ve kayıtta ayırt edilebilmeli.'
 );
 
 console.info(

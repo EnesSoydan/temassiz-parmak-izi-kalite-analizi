@@ -31,6 +31,25 @@ export type MinutiaeRejectionReason =
   | 'candidate-count'
   | 'candidate-overflow';
 
+// Ridge iskeletinin hangi temizlik aşamasında parçalandığını karşılaştırmak için topoloji özeti.
+export type MinutiaeTopologyStageDiagnostics = {
+  pixelCount: number;
+  componentCount: number;
+  endingPixelCount: number;
+  bifurcationPixelCount: number;
+};
+
+export type MinutiaeTopologyDiagnostics = {
+  binary: MinutiaeTopologyStageDiagnostics;
+  opened?: MinutiaeTopologyStageDiagnostics;
+  orientationCleaned?: MinutiaeTopologyStageDiagnostics;
+  thinned: MinutiaeTopologyStageDiagnostics;
+  bridged: MinutiaeTopologyStageDiagnostics;
+  componentFiltered: MinutiaeTopologyStageDiagnostics;
+  pruned: MinutiaeTopologyStageDiagnostics;
+  thresholdLoopCleaned?: MinutiaeTopologyStageDiagnostics;
+};
+
 // Her parmak ROI'si için cihaz üzerinde hesaplanan ayrıntılı kalite sonucunu taşır.
 export type FingerprintQuality = {
   globalScore: number;
@@ -74,14 +93,40 @@ export type FingerprintQuality = {
   minutiaeEndingCandidateCount?: number;
   minutiaeBifurcationCandidateCount?: number;
   minutiaeConfidenceHistogram?: number[];
+  minutiaeThresholdPrimaryCount?: number;
+  minutiaeThresholdLocationStableCount?: number;
+  minutiaeThresholdTypeStableCount?: number;
+  minutiaeThresholdLoopCandidateCount?: number;
+  minutiaeThresholdLoopStableCount?: number;
+  minutiaeThresholdLoopRemovedCount?: number;
+  minutiaeThresholdLoopRemovedPixelCount?: number;
+  minutiaeOrientationBridgeRemovedPixelCount?: number;
   minutiaeSearchableAreaRatio?: number;
   minutiaeLargestRegionRatio?: number;
+  minutiaeTopology?: MinutiaeTopologyDiagnostics;
   status: 'good' | 'medium' | 'poor';
   message: string;
 };
 
 // Kalibrasyon çekimlerini ham fotoğrafı paylaşmadan elle sınıflandırmak için kullanılan etiketler.
 export type QualityCalibrationLabel = 'good' | 'borderline' | 'bad';
+
+// Gerçek giriş çekiminin yalnızca değerlendirmede kullanılan biyometrik gerçeğini taşır.
+// Bu etiket matcher'a veya enrollment şablonlarına hiçbir zaman geri beslenmez.
+export type ProbeEvaluationTruth =
+  | {
+      version: 1;
+      relation: 'genuine';
+      expectedPersonId: string;
+      evaluationSessionId: string;
+      labeledAt: string;
+    }
+  | {
+      version: 1;
+      relation: 'impostor';
+      evaluationSessionId: string;
+      labeledAt: string;
+    };
 
 // OBB modelinin desteklediği parmak ucu sınıf adları.
 export type DetectionClassName = 'index' | 'middle' | 'pinky' | 'ring' | 'unknown';
@@ -176,6 +221,9 @@ export type FingerRoi = {
   canonicalSource?: 'ambient' | 'flash' | 'single';
   segmentedImageUri?: string;
   maskImageUri?: string;
+  binaryImageUri?: string;
+  openedBinaryImageUri?: string;
+  minutiaeOverlayImageUri?: string;
   enhancedImageUri?: string;
   orientationImageUri?: string;
   minutiaeImageUri?: string;
@@ -262,6 +310,7 @@ export type CaptureSample = {
   sessionId: string;
   qualityStatus: QualityStatus;
   calibrationLabel?: QualityCalibrationLabel;
+  probeEvaluation?: ProbeEvaluationTruth;
   accepted: boolean;
 };
 
@@ -308,6 +357,7 @@ export type FingerMatchStatus =
 
 export type FingerMatchFailureReason =
   | 'probe-missing'
+  | 'probe-quality-insufficient'
   | 'enrollment-missing'
   | 'not-enough-probe-minutiae'
   | 'not-enough-enrollment-minutiae'
@@ -321,6 +371,8 @@ export type FingerMatchResult = {
   status: FingerMatchStatus;
   score: number;
   matchedMinutiae: number;
+  matchedEndingCount?: number;
+  matchedBifurcationCount?: number;
   coverage: number;
   probeUsableMinutiae: number;
   enrollmentUsableMinutiae: number;

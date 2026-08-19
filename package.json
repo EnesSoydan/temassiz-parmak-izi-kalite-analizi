@@ -64,7 +64,10 @@
     "test:texture": "node --experimental-strip-types scripts/test-texture-descriptor.mjs",
     "test:png": "node --experimental-strip-types scripts/test-png-encoder.mjs",
     "test:matcher": "node --experimental-strip-types scripts/test-fingerprint-matcher.mjs",
+    "test:evaluation": "node --experimental-strip-types scripts/test-fingerprint-evaluation.mjs",
+    "test:live-quality": "node --experimental-strip-types scripts/test-live-capture-quality.mjs",
     "test:tracking": "node --experimental-strip-types scripts/test-live-detection-tracker.mjs",
+    "test:seg-preview": "node --experimental-strip-types scripts/test-segmentation-preview.mjs",
     "test:roi": "node --experimental-strip-types scripts/test-roi-alignment.mjs",
     "test:homography": "node --experimental-strip-types scripts/test-roi-alignment.mjs",
     "postinstall": "patch-package"

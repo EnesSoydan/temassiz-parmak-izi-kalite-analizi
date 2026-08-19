@@ -308,8 +308,8 @@ export async function saveRidgeEnhancedImage({
   width,
   height,
   outputImageUri,
-  maximumWidth = 256,
-  quality = 88,
+  maximumWidth,
+  quality = 95,
 }: {
   pixels: Uint8Array;
   width: number;
@@ -320,8 +320,10 @@ export async function saveRidgeEnhancedImage({
 }) {
   ensureJpegBufferShim();
 
-  // Teknik galeri görsellerini küçültür; kalite ve minutiae hesapları bundan önce tam analiz tamponunda yapılmıştır.
-  const preview = resizeTechnicalPreview(pixels, width, height, maximumWidth);
+  // Varsayılan olarak analiz çözünürlüğünü korur; yalnızca çağıran açıkça sınır verirse küçültür.
+  const preview = maximumWidth
+    ? resizeTechnicalPreview(pixels, width, height, maximumWidth)
+    : { pixels, width, height };
   const jpeg = encode(
     { data: preview.pixels, width: preview.width, height: preview.height },
     quality

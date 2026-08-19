@@ -5,6 +5,7 @@ import type {
   CaptureSample,
   DetectionClassName,
   FingerRoi,
+  ProbeEvaluationTruth,
   QualityCalibrationLabel,
 } from '@/types/biometrics';
 
@@ -16,6 +17,9 @@ const CANONICAL_ROI_DIR = `${ROOT_DIR}canonical-roi/`;
 const ALIGNED_CANONICAL_ROI_DIR = `${ROOT_DIR}aligned-canonical-roi/`;
 const SEGMENTED_ROI_DIR = `${ROOT_DIR}segmented-roi/`;
 const MASK_ROI_DIR = `${ROOT_DIR}mask-roi/`;
+const BINARY_ROI_DIR = `${ROOT_DIR}binary-roi/`;
+const OPENED_BINARY_ROI_DIR = `${ROOT_DIR}opened-binary-roi/`;
+const MINUTIAE_OVERLAY_ROI_DIR = `${ROOT_DIR}minutiae-overlay-roi/`;
 const ENHANCED_ROI_DIR = `${ROOT_DIR}enhanced-roi/`;
 const ORIENTATION_ROI_DIR = `${ROOT_DIR}orientation-roi/`;
 const MINUTIAE_ROI_DIR = `${ROOT_DIR}minutiae-roi/`;
@@ -32,6 +36,9 @@ export async function ensureCaptureStorage() {
   await ensureDirectory(ALIGNED_CANONICAL_ROI_DIR);
   await ensureDirectory(SEGMENTED_ROI_DIR);
   await ensureDirectory(MASK_ROI_DIR);
+  await ensureDirectory(BINARY_ROI_DIR);
+  await ensureDirectory(OPENED_BINARY_ROI_DIR);
+  await ensureDirectory(MINUTIAE_OVERLAY_ROI_DIR);
   await ensureDirectory(ENHANCED_ROI_DIR);
   await ensureDirectory(ORIENTATION_ROI_DIR);
   await ensureDirectory(MINUTIAE_ROI_DIR);
@@ -104,6 +111,33 @@ export async function createMaskFingerRoiImageUri(
 ) {
   await ensureCaptureStorage();
   return `${MASK_ROI_DIR}${sampleId}-${className}.png`;
+}
+
+// Thinning öncesi siyah ridge/beyaz zemin ikili çıktısının kalıcı yolunu hazırlar.
+export async function createBinaryFingerRoiImageUri(
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  return `${BINARY_ROI_DIR}${sampleId}-${className}.png`;
+}
+
+// Kontrollü morfolojik opening sonrasındaki Binary karşılaştırma çıktısının yolunu hazırlar.
+export async function createOpenedBinaryFingerRoiImageUri(
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  return `${OPENED_BINARY_ROI_DIR}${sampleId}-${className}.png`;
+}
+
+// Hizalı kanonik ROI üzerine bindirilecek şeffaf minutiae iskeletinin yolunu hazırlar.
+export async function createMinutiaeOverlayFingerRoiImageUri(
+  sampleId: string,
+  className: DetectionClassName
+) {
+  await ensureCaptureStorage();
+  return `${MINUTIAE_OVERLAY_ROI_DIR}${sampleId}-${className}.png`;
 }
 
 // Yön ve frekans destekli ridge iyileştirme çıktısının kalıcı yolunu hazırlar.
@@ -188,6 +222,23 @@ export async function setCaptureCalibrationLabel(
   return nextSamples;
 }
 
+// Giriş çekiminin gerçek kişi/farklı el etiketini yalnızca değerlendirme metadata'sında günceller.
+export async function setCaptureProbeEvaluation(
+  sampleId: string,
+  probeEvaluation: ProbeEvaluationTruth | null
+) {
+  const samples = await loadCaptureSamples();
+  const nextSamples = samples.map((sample) => {
+    if (sample.id !== sampleId) return sample;
+    if (probeEvaluation) return { ...sample, probeEvaluation };
+
+    const { probeEvaluation: _removedEvaluation, ...unlabeledSample } = sample;
+    return unlabeledSample;
+  });
+  await FileSystem.writeAsStringAsync(INDEX_FILE, JSON.stringify(nextSamples, null, 2));
+  return nextSamples;
+}
+
 // Etiketli örneklerin fotoğraf yollarını ve kimliklerini dışarıda bırakan kalibrasyon özeti üretir.
 export async function exportQualityCalibrationSummary() {
   const samples = await loadCaptureSamples();
@@ -265,6 +316,12 @@ export async function exportQualityCalibrationSummary() {
                 fingerRoi.quality.minutiaeBifurcationCandidateCount ?? 0,
               minutiaeConfidenceHistogram:
                 fingerRoi.quality.minutiaeConfidenceHistogram ?? [],
+              minutiaeThresholdPrimaryCount:
+                fingerRoi.quality.minutiaeThresholdPrimaryCount ?? 0,
+              minutiaeThresholdLocationStableCount:
+                fingerRoi.quality.minutiaeThresholdLocationStableCount ?? 0,
+              minutiaeThresholdTypeStableCount:
+                fingerRoi.quality.minutiaeThresholdTypeStableCount ?? 0,
               ridgeEnhancementGainPercent:
                 fingerRoi.quality.ridgeEnhancementGainPercent ?? 0,
               ridgeEnhancementSupportedAreaRatio:
@@ -344,6 +401,27 @@ export async function deleteCaptureSample(sampleId: string) {
 
         if (fingerRoi.maskImageUri) {
           await deleteFileIfExists(fingerRoi.maskImageUri);
+        }
+
+        if (fingerRoi.binaryImageUri) {
+          await deleteFileIfExists(fingerRoi.binaryImageUri);
+        }
+
+        if (fingerRoi.openedBinaryImageUri) {
+          await deleteFileIfExists(fingerRoi.openedBinaryImageUri);
+        }
+
+        if (fingerRoi.minutiaeOverlayImageUri) {
+          await deleteFileIfExists(fingerRoi.minutiaeOverlayImageUri);
+        }
+
+        // Kısa süre kullanılan Binary+Nokta debug alanı eski bir kayıtta kaldıysa
+        // kayıt silinirken görünmeyen dosyasını da geriye dönük olarak temizleriz.
+        const legacyBinaryMinutiaeImageUri = (
+          fingerRoi as FingerRoi & { binaryMinutiaeImageUri?: string }
+        ).binaryMinutiaeImageUri;
+        if (legacyBinaryMinutiaeImageUri) {
+          await deleteFileIfExists(legacyBinaryMinutiaeImageUri);
         }
 
         // Ridge iyileştirme çıktısı varsa aynı kaydın diğer ROI dosyalarıyla birlikte sileriz.

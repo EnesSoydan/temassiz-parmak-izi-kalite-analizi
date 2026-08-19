@@ -53,7 +53,17 @@ import {
   identifyPersonFromFingerRois,
 } from '@/lib/fingerprint-matcher';
 import {
+  analyzeLiveRoiPixels,
+  createInitialLiveCaptureGateState,
+  updateLiveCaptureGate,
+  type LiveCaptureFingerResult,
+  type LiveCaptureGateResult,
+  type LiveCaptureGateReason,
+} from '@/lib/live-capture-quality';
+import {
+  getCurrentConfirmedLiveDetections,
   getVisibleLiveDetections,
+  mergeCaptureSnapshotDetections,
   updateLiveDetectionTracks,
   type LiveDetectionTrack,
 } from '@/lib/live-detection-tracker';
@@ -75,6 +85,8 @@ type LiveDetectionFrame = {
 type LiveDetectionOverlayProps = {
   detections: DetectedObbBox[];
   imageSize: LiveDetectionFrame | null;
+  capturePhase: AutoCapturePhase;
+  fingerQuality: LiveCaptureFingerResult[];
 };
 
 type PreparedCapturePhoto = {
@@ -85,10 +97,19 @@ type PreparedCapturePhoto = {
 
 type CaptureMode = 'identify' | 'enroll';
 
+type AutoCapturePhase =
+  | 'idle'
+  | 'warming'
+  | 'evaluating'
+  | 'capturing'
+  | 'processing';
+
 function formatMatchFailureReason(reason: FingerMatchFailureReason) {
   switch (reason) {
     case 'probe-missing':
       return 'gelen parmak yok';
+    case 'probe-quality-insufficient':
+      return 'görüntü kalitesi yetersiz';
     case 'enrollment-missing':
       return 'kayıt şablonu yok';
     case 'not-enough-probe-minutiae':
@@ -121,7 +142,12 @@ function formatFingerMatchLine(result: FingerMatchResult) {
   const texture = result.textureScore === undefined
     ? ''
     : `, texture=${Math.round(result.textureScore * 100)}%`;
-  return `${result.fingerPosition}: ${formatMatchStatus(result)}, geometrik_skor=${result.score.toFixed(1)}/100, nokta=${result.matchedMinutiae}/${result.probeUsableMinutiae} (gereken=${result.minimumMatchedMinutiae}), kapsama=${Math.round(result.coverage * 100)}% (gereken=${Math.round(result.minimumCoverage * 100)}%)${graph}${texture}, neden=${reasons}`;
+  const matchedTypes =
+    result.matchedEndingCount === undefined &&
+    result.matchedBifurcationCount === undefined
+      ? ''
+      : `, tür=${result.matchedEndingCount ?? 0}son/${result.matchedBifurcationCount ?? 0}çat`;
+  return `${result.fingerPosition}: ${formatMatchStatus(result)}, geometrik_skor=${result.score.toFixed(1)}/100, nokta=${result.matchedMinutiae}/${result.probeUsableMinutiae} (gereken=${result.minimumMatchedMinutiae})${matchedTypes}, kapsama=${Math.round(result.coverage * 100)}% (gereken=${Math.round(result.minimumCoverage * 100)}%)${graph}${texture}, neden=${reasons}`;
 }
 
 // Mobil model için yeterli ayrıntıyı koruyan canlı kamera çözünürlüğü.
@@ -142,13 +168,30 @@ const LIVE_FOCUS_FORCE_REFRESH_MS = 1800;
 // Canlı odak zaten sürerken deklanşör kilidinin oturması için yalnızca kısa bir ek bekleme kullanılır.
 const PRE_CAPTURE_FOCUS_DELAY_MS = 350;
 
+// Manuel serbest bırakma aksasa bile çekim 3A kilidinin kalıcı olmasını önler.
+const CAPTURE_METERING_AUTO_RESET_SECONDS = 3;
+
+// Sürekli ışık açıldıktan sonra kamera pozlama ve odağının yerleşmesi için beklenir.
+const AUTO_CAPTURE_WARMUP_MS = 4000;
+
+// Torch'un sınırsız açık kalmasını önleyip kullanıcıya yeni bir deneme olanağı verir.
+const AUTO_CAPTURE_EVALUATION_TIMEOUT_MS = 10000;
+
 // Flaşlı çekimde yakın parmak ucundaki parlama riskini azaltmak için hafif negatif EV uygularız.
 const ROI_EXPOSURE_COMPENSATION_INDEX = -0.7;
 
 // Canlı sonuçları modelin ürettiği gerçek yönlendirilmiş dörtgenlerle çizer.
-function LiveDetectionOverlay({ detections, imageSize }: LiveDetectionOverlayProps) {
+function LiveDetectionOverlay({
+  detections,
+  imageSize,
+  capturePhase,
+  fingerQuality,
+}: LiveDetectionOverlayProps) {
   const [layout, setLayout] = useState({ width: 0, height: 0 });
   const imageFrame = getCoveredImageFrame(layout, imageSize);
+  const qualityByFinger = new Map(
+    fingerQuality.map((result) => [result.fingerPosition, result])
+  );
 
   // Kamera önizlemesinin gerçek boyutunu kutu koordinat hesabı için saklar.
   function handleLayout(event: LayoutChangeEvent) {
@@ -164,13 +207,22 @@ function LiveDetectionOverlay({ detections, imageSize }: LiveDetectionOverlayPro
         <Svg width={layout.width} height={layout.height}>
           {detections.map((detection) => {
             const polygon = getScreenObbPolygon(detection, imageFrame);
+            const quality =
+              detection.className === 'unknown'
+                ? undefined
+                : qualityByFinger.get(detection.className);
+            const presentation = getLiveDetectionPresentation(
+              capturePhase,
+              quality,
+              detection.confidence
+            );
 
             return (
               <G key={detection.id}>
                 <Polygon
                   points={polygon.points}
-                  fill="rgba(47, 209, 107, 0.10)"
-                  stroke="#2FD16B"
+                  fill={presentation.fill}
+                  stroke={presentation.stroke}
                   strokeWidth={2}
                   strokeLinejoin="round"
                 />
@@ -181,7 +233,7 @@ function LiveDetectionOverlay({ detections, imageSize }: LiveDetectionOverlayPro
                   fontSize={9}
                   fontWeight="700"
                   textAnchor="middle">
-                  {`${formatDetectionClass(detection.className)} ${Math.round(detection.confidence * 100)}%`}
+                  {`${formatDetectionClass(detection.className)} ${presentation.label}`}
                 </SvgText>
               </G>
             );
@@ -190,6 +242,41 @@ function LiveDetectionOverlay({ detections, imageSize }: LiveDetectionOverlayPro
       )}
     </View>
   );
+}
+
+function getLiveDetectionPresentation(
+  capturePhase: AutoCapturePhase,
+  quality: LiveCaptureFingerResult | undefined,
+  confidence: number
+) {
+  if (capturePhase === 'warming') {
+    return {
+      stroke: '#F4B942',
+      fill: 'rgba(244, 185, 66, 0.12)',
+      label: 'ısınıyor',
+    };
+  }
+
+  if (capturePhase === 'evaluating') {
+    if (quality?.ready) {
+      return {
+        stroke: '#2FD16B',
+        fill: 'rgba(47, 209, 107, 0.14)',
+        label: 'hazır',
+      };
+    }
+    return {
+      stroke: '#FF6B6B',
+      fill: 'rgba(255, 107, 107, 0.12)',
+      label: 'kontrol',
+    };
+  }
+
+  return {
+    stroke: '#2FD16B',
+    fill: 'rgba(47, 209, 107, 0.10)',
+    label: `${Math.round(confidence * 100)}%`,
+  };
 }
 
 // Normalize OBB köşelerini kamera önizlemesindeki gerçek çokgen ve etiket konumuna taşır.
@@ -291,7 +378,8 @@ async function meterCameraAtRegion({
     modes,
     responsiveness: adaptiveness === 'locked' ? 'snappy' : 'steady',
     adaptiveness,
-    autoResetAfter: null,
+    autoResetAfter:
+      adaptiveness === 'locked' ? CAPTURE_METERING_AUTO_RESET_SECONDS : null,
   });
 }
 
@@ -373,6 +461,73 @@ function createLiveCaptureGuide({
   return 'Telefonu parmak yüzeyine paralel tut ve sabit kal.';
 }
 
+function createAutoCaptureGuide(
+  phase: AutoCapturePhase,
+  result: LiveCaptureGateResult | null
+) {
+  if (phase === 'warming') {
+    return 'Flaş açık; pozlama ve odak 4 saniye dengeleniyor.';
+  }
+  if (phase === 'capturing') {
+    return 'Dört parmak hazır, fotoğraf çekiliyor...';
+  }
+  if (phase !== 'evaluating') return '';
+  if (!result) return 'Dört parmak ROI’si kontrol ediliyor...';
+
+  const firstPending = result.fingerResults.find((finger) => !finger.ready);
+  if (!firstPending) return 'Dört parmak hazır.';
+  return `${result.readyFingerCount}/4 parmak hazır · ${formatDetectionClass(firstPending.fingerPosition)}: ${formatLiveGateReason(firstPending.reason)}`;
+}
+
+function formatLiveGateReason(reason: LiveCaptureGateReason) {
+  switch (reason) {
+    case 'missing':
+      return 'kadraja al';
+    case 'low-confidence':
+      return 'biraz daha belirgin göster';
+    case 'outside-frame':
+      return 'kenardan uzaklaştır';
+    case 'too-small':
+      return 'kameraya biraz yaklaştır';
+    case 'too-large':
+      return 'kameradan biraz uzaklaştır';
+    case 'invalid-shape':
+      return 'parmak uçlarını kameraya düz göster';
+    case 'hand-angle':
+    case 'angle-inconsistent':
+      return 'telefonu ele paralel tut';
+    case 'size-inconsistent':
+      return 'eli kameraya paralel tut';
+    case 'too-dark':
+      return 'aydınlatmayı düzelt';
+    case 'too-bright':
+    case 'glare':
+      return 'parlamayı azalt';
+    case 'low-contrast':
+    case 'low-detail':
+      return 'netlik için sabit tut';
+    case 'pixel-data-missing':
+    case 'stabilizing':
+      return 'kontrol ediliyor';
+    case 'moving':
+      return 'sabit tut';
+    case 'ready':
+      return 'hazır';
+  }
+}
+
+function formatLiveGateDiagnostics(result: LiveCaptureGateResult | null) {
+  if (!result) return 'ölçüm-yok';
+  const fingers = result.fingerResults
+    .map((finger) => {
+      const metrics = finger.pixelMetrics;
+      const geometry = finger.geometryMetrics;
+      return `${finger.fingerPosition}:${finger.reason},güven=${Math.round(finger.confidence * 100)}%,kısa=${geometry ? `${(geometry.shortEdgeRatio * 100).toFixed(1)}%` : '-'},oran=${geometry ? geometry.aspectRatio.toFixed(2) : '-'},açı=${geometry ? `${geometry.verticalDeviationDegrees.toFixed(1)}°` : '-'},parlaklık=${metrics ? metrics.brightnessMean.toFixed(0) : '-'},kontrast=${metrics ? metrics.contrastDeviation.toFixed(1) : '-'},parlama=${metrics ? Math.round(metrics.highlightRatio * 100) : '-'}%,detay=${metrics ? metrics.edgeEnergy.toFixed(1) : '-'}`;
+    })
+    .join(' | ');
+  return `kalibrasyon=${result.calibrationVersion} | ${fingers}`;
+}
+
 // Kısa kamera işlemlerinde akışı bloklamadan beklemek için kullanılır.
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -423,24 +578,37 @@ async function prepareCapturedPhoto(
 // Native model bir sınıfı kaçırırsa aynı sabit JPEG'i de tarayıp sınıf başına en güvenilir kutuyu tutar.
 async function tryDetectFingertipsFromImage(
   image: NitroImage,
-  fallbackImageUri: string
+  fallbackImageUri: string,
+  captureSnapshotDetections: DetectedObbBox[] = []
 ) {
   let nativeDetections: DetectedObbBox[] = [];
+  let photoDetections: DetectedObbBox[] = [];
 
   try {
     nativeDetections = await detectFingertipObbBoxesFromImage(image);
-    if (nativeDetections.length >= 4) return nativeDetections;
+    photoDetections = nativeDetections;
   } catch (error) {
     console.warn('Parmak ucu modeli native görüntüyle çalıştırılamadı.', error);
   }
 
-  try {
-    const jpegDetections = await detectFingertipObbBoxes(fallbackImageUri);
-    return mergeBestDetections(nativeDetections, jpegDetections);
-  } catch (fallbackError) {
-    console.warn('Parmak ucu modeli JPEG yedeğiyle de çalıştırılamadı.', fallbackError);
-    return nativeDetections;
+  if (nativeDetections.length < 4) {
+    try {
+      const jpegDetections = await detectFingertipObbBoxes(fallbackImageUri);
+      photoDetections = mergeBestDetections(nativeDetections, jpegDetections);
+    } catch (fallbackError) {
+      console.warn('Parmak ucu modeli JPEG yedeğiyle de çalıştırılamadı.', fallbackError);
+      photoDetections = nativeDetections;
+    }
   }
+
+  const mergedDetections = mergeCaptureSnapshotDetections(
+    photoDetections,
+    captureSnapshotDetections
+  );
+  return {
+    ...mergedDetections,
+    photoDetectionCount: photoDetections.length,
+  };
 }
 
 // Birden fazla model sonucundan her parmak sınıfının en güvenilir kutusunu seçer.
@@ -491,6 +659,15 @@ export default function CameraScreen() {
   const liveDetectionPausedRef = useRef(true);
   const liveFocusBusyRef = useRef(false);
   const captureMeteringActiveRef = useRef(false);
+  const autoCaptureWarmupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoCaptureTimeoutTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoCapturePhaseRef = useRef<AutoCapturePhase>('idle');
+  const autoCaptureTriggeredRef = useRef(false);
+  const autoCaptureStartedAtRef = useRef(0);
+  const liveCaptureGateRef = useRef(createInitialLiveCaptureGateState());
+  const captureDetectionSnapshotRef = useRef<DetectedObbBox[]>([]);
+  const liveCaptureQualityRef = useRef<LiveCaptureGateResult | null>(null);
+  const executePhotoCaptureRef = useRef<() => Promise<void>>(async () => {});
   const lastLiveFocusAtRef = useRef(0);
   const lastLiveFocusPointRef = useRef<{ x: number; y: number } | null>(null);
   const liveDetectionTracksRef = useRef(
@@ -502,6 +679,8 @@ export default function CameraScreen() {
   const [isScreenFocused, setIsScreenFocused] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isTakingPhoto, setIsTakingPhoto] = useState(false);
+  const [autoCapturePhase, setAutoCapturePhase] = useState<AutoCapturePhase>('idle');
+  const [liveCaptureQuality, setLiveCaptureQuality] = useState<LiveCaptureGateResult | null>(null);
   // Çift çekim deneyi varsayılan olarak açıktır; kullanıcı üst anahtardan tek çekime dönebilir.
   const [liveDetections, setLiveDetections] = useState<DetectedObbBox[]>([]);
   const [liveDetectionFrame, setLiveDetectionFrame] = useState<LiveDetectionFrame | null>(null);
@@ -510,7 +689,7 @@ export default function CameraScreen() {
   const [captureMode, setCaptureMode] = useState<CaptureMode>('identify');
   const [enrollmentName, setEnrollmentName] = useState('');
   const [enrollmentSamples, setEnrollmentSamples] = useState<EnrollmentCaptureSample[]>([]);
-  const [registeredPersonCount, setRegisteredPersonCount] = useState(0);
+  const [registeredPersonCount, setRegisteredPersonCount] = useState<number | null>(null);
   const { hasPermission, requestPermission } = useCameraPermission();
   const closeUpCameraDevice = useCameraDevice('back', {
     physicalDevices: ['ultra-wide-angle'],
@@ -529,11 +708,21 @@ export default function CameraScreen() {
       ? closeUpCameraDevice.minZoom
       : 1;
   const activeCameraHasFlash = closeUpCameraDevice?.hasFlash === true;
+  const activeCameraHasTorch = closeUpCameraDevice?.hasTorch === true;
   const liveCaptureGuide = createLiveCaptureGuide({
     detections: liveDetections,
     modelStatus,
     isCameraReady,
   });
+  const autoCaptureGuide = createAutoCaptureGuide(
+    autoCapturePhase,
+    liveCaptureQuality
+  );
+  const isAutoCaptureWaiting =
+    autoCapturePhase === 'warming' || autoCapturePhase === 'evaluating';
+  const shouldEnableTorch =
+    activeCameraHasTorch &&
+    (isAutoCaptureWaiting || autoCapturePhase === 'capturing');
 
   // Kısa durum mesajını gösterip başarılı işlemlerde otomatik olarak temizler.
   const showFeedback = useCallback((message: string, autoClear = true) => {
@@ -545,6 +734,38 @@ export default function CameraScreen() {
     if (autoClear) {
       feedbackTimerRef.current = setTimeout(() => setFeedback(''), 1800);
     }
+  }, []);
+
+  const clearAutoCaptureTimers = useCallback(() => {
+    if (autoCaptureWarmupTimerRef.current) {
+      clearTimeout(autoCaptureWarmupTimerRef.current);
+      autoCaptureWarmupTimerRef.current = null;
+    }
+    if (autoCaptureTimeoutTimerRef.current) {
+      clearTimeout(autoCaptureTimeoutTimerRef.current);
+      autoCaptureTimeoutTimerRef.current = null;
+    }
+  }, []);
+
+  const cancelAutoCapture = useCallback(
+    (message?: string) => {
+      clearAutoCaptureTimers();
+      autoCapturePhaseRef.current = 'idle';
+      autoCaptureTriggeredRef.current = false;
+      liveCaptureGateRef.current = createInitialLiveCaptureGateState();
+      captureDetectionSnapshotRef.current = [];
+      liveCaptureQualityRef.current = null;
+      setAutoCapturePhase('idle');
+      setLiveCaptureQuality(null);
+      if (message) showFeedback(message);
+    },
+    [clearAutoCaptureTimers, showFeedback]
+  );
+
+  // UI sayısını tahminden değil şifreli veritabanındaki gerçek kişi listesinden yeniler.
+  const readRegisteredPersonCount = useCallback(async () => {
+    const database = await loadBiometricDatabase();
+    return database.people.length;
   }, []);
 
   // Worklet'ten gelen mobil boyutlu görüntüyü ONNX modelinde tek sefer çalıştırır.
@@ -574,9 +795,53 @@ export default function CameraScreen() {
 
         const nextTracks = updateLiveDetectionTracks(liveDetectionTracksRef.current, detections);
         const trackedDetections = getVisibleLiveDetections(nextTracks);
+        const currentQualityDetections =
+          getCurrentConfirmedLiveDetections(nextTracks);
         liveDetectionTracksRef.current = nextTracks;
         setLiveDetections(trackedDetections);
         setLiveDetectionFrame({ width: sourceWidth, height: sourceHeight });
+
+        if (autoCapturePhaseRef.current === 'evaluating') {
+          const pixelMetrics = analyzeLiveRoiPixels({
+            buffer: rawBuffer,
+            width,
+            height,
+            detections: currentQualityDetections,
+          });
+          const gateUpdate = updateLiveCaptureGate({
+            previousState: liveCaptureGateRef.current,
+            detections: currentQualityDetections,
+            pixelMetrics,
+            frameSize: { width, height },
+          });
+          liveCaptureGateRef.current = gateUpdate.state;
+          liveCaptureQualityRef.current = gateUpdate.result;
+          setLiveCaptureQuality(gateUpdate.result);
+
+          if (gateUpdate.result.ready && !autoCaptureTriggeredRef.current) {
+            autoCaptureTriggeredRef.current = true;
+            // Kullanıcının hazır olarak gördüğü OBB'leri çekim anının ROI kaynağı olarak
+            // bağımsız kopyalarız; fotoğraf modeli sonradan farklı sonuç üretse de bu alanlar korunur.
+            captureDetectionSnapshotRef.current = currentQualityDetections.map(
+              (detection) => ({
+                ...detection,
+                center: { ...detection.center },
+                size: { ...detection.size },
+                points: detection.points.map((point) => ({ ...point })),
+              })
+            );
+            clearAutoCaptureTimers();
+            autoCapturePhaseRef.current = 'capturing';
+            setAutoCapturePhase('capturing');
+            console.info(
+              `[Otomatik çekim] durum=hazır, parmak=4/4, bekleme=${Date.now() - autoCaptureStartedAtRef.current}ms`
+            );
+            console.info(
+              `[Otomatik çekim kalite] ${formatLiveGateDiagnostics(gateUpdate.result)}`
+            );
+            void executePhotoCaptureRef.current();
+          }
+        }
       } catch (error) {
         liveDetectionPausedRef.current = true;
         console.warn('Canlı parmak ucu modeli çalıştırılamadı.', error);
@@ -585,7 +850,7 @@ export default function CameraScreen() {
         liveInferenceBusy.setBlocking(false);
       }
     },
-    [liveInferenceBusy]
+    [clearAutoCaptureTimers, liveInferenceBusy]
   );
 
   // Frame dönüşüm hatasında canlı modeli durdurup tekrar eden uyarıları engeller.
@@ -717,9 +982,9 @@ export default function CameraScreen() {
   // Kamera ekranı açıldığında yalnızca kişi sayısını okur; şablonların kendisi belleğe taşınmaz.
   useEffect(() => {
     let isMounted = true;
-    loadBiometricDatabase()
-      .then((database) => {
-        if (isMounted) setRegisteredPersonCount(database.people.length);
+    readRegisteredPersonCount()
+      .then((personCount) => {
+        if (isMounted) setRegisteredPersonCount(personCount);
       })
       .catch((error) => {
         if (isMounted && error instanceof BiometricDatabaseError) {
@@ -730,7 +995,7 @@ export default function CameraScreen() {
     return () => {
       isMounted = false;
     };
-  }, [showFeedback]);
+  }, [readRegisteredPersonCount, showFeedback]);
 
   // Kamera sekmesi açık ve model hazır olduğunda canlı kutu tespitini otomatik çalıştırır.
   useEffect(() => {
@@ -740,6 +1005,33 @@ export default function CameraScreen() {
       liveInferenceBusy.setBlocking(false);
     }
   }, [isScreenFocused, liveFrameFailed, liveInferenceBusy, modelStatus]);
+
+  // Torch komutunu yalnızca aktif kamera oturumuna gönderip CameraX iptallerini yakalarız.
+  useEffect(() => {
+    const controller = cameraRef.current?.controller;
+    if (!controller || !isCameraReady || !isScreenFocused || !activeCameraHasTorch) {
+      return;
+    }
+
+    const torchMode = shouldEnableTorch ? 'on' : 'off';
+    controller
+      .setTorchMode(torchMode)
+      .then(() => {
+        if (torchMode === 'on') {
+          console.info('[Otomatik çekim] torch=açık');
+        }
+      })
+      .catch((error) => {
+        if (!isMeteringCancellation(error)) {
+          console.warn('Kamera torch durumu değiştirilemedi.', error);
+        }
+      });
+  }, [
+    activeCameraHasTorch,
+    isCameraReady,
+    isScreenFocused,
+    shouldEnableTorch,
+  ]);
 
   // Canlı kutular kararlı biçimde görüldükçe kutu grubunun merkezinde yakın odağı sürekli tutar.
   useEffect(() => {
@@ -817,6 +1109,7 @@ export default function CameraScreen() {
     useCallback(() => {
       setIsScreenFocused(true);
       return () => {
+        cancelAutoCapture();
         setIsScreenFocused(false);
         setIsCameraReady(false);
         liveFocusBusyRef.current = false;
@@ -826,22 +1119,110 @@ export default function CameraScreen() {
         setLiveDetections([]);
         setLiveDetectionFrame(null);
       };
-    }, [])
+    }, [cancelAutoCapture])
   );
 
   // Ekran kapanırken bekleyen geri bildirim zamanlayıcısını temizler.
   useEffect(() => {
     return () => {
+      clearAutoCaptureTimers();
       if (feedbackTimerRef.current) {
         clearTimeout(feedbackTimerRef.current);
       }
     };
-  }, []);
+  }, [clearAutoCaptureTimers]);
 
-  // Kameradan tam el karesi alır, modeli çalıştırır ve kutu verileriyle yerel kayda ekler.
-  async function handleTakePhoto() {
-    if (!canUseCamera || !isCameraReady || isTakingPhoto) return;
+  // Deklanşör öncesinde canlı kutuların merkezine odak/pozlama ölçümü yaparak ROI netliğini artırır.
+  async function focusCameraBeforeCapture() {
+    const camera = cameraRef.current;
+    if (!camera || cameraLayout.width <= 0 || cameraLayout.height <= 0) return;
 
+    try {
+      // Devam eden canlı 3A isteğini bitirip deklanşör ölçümünü tek etkin istek olarak başlatırız.
+      await camera.resetFocus().catch((error) => {
+        if (!isMeteringCancellation(error)) {
+          console.warn('Canlı kamera ölçümü sıfırlanamadı.', error);
+        }
+      });
+      const region = getLiveMeteringRegion({
+        detections: liveDetections,
+        imageSize: liveDetectionFrame,
+        layout: cameraLayout,
+      });
+      const activeDevice = camera.controller?.device;
+      if (!activeDevice) return;
+
+      await meterCameraAtRegion({
+        camera,
+        device: activeDevice,
+        region,
+        adaptiveness: 'locked',
+      });
+      const controller = camera.controller;
+      if (controller) {
+        console.info(
+          `[Çekim 3A] modlar=${getSupportedMeteringModes(activeDevice).join('+') || 'yok'}, bölge=${Math.round(region.size)}px, poz_kademesi=${controller.exposureBias.toFixed(1)}`
+        );
+      }
+      await sleep(PRE_CAPTURE_FOCUS_DELAY_MS);
+    } catch (error) {
+      console.warn('Çekim öncesi kamera odağı uygulanamadı.', error);
+    }
+  }
+
+  // Torch ışığına göre kilitlenen AE/AF'yi fotoğraf alınır alınmaz normal önizleme moduna döndürür.
+  async function releaseCameraControlsAfterCapture() {
+    const camera = cameraRef.current;
+    const controller = camera?.controller;
+    if (!camera || !controller) return;
+    const activeDevice = controller.device;
+
+    if (activeDevice.hasTorch) {
+      await controller.setTorchMode('off').catch((error) => {
+        if (!isMeteringCancellation(error)) {
+          console.warn('Çekim sonrası torch kapatılamadı.', error);
+        }
+      });
+    }
+
+    await camera.resetFocus().catch((error) => {
+      if (!isMeteringCancellation(error)) {
+        console.warn('Çekim sonrası kamera ölçümü serbest bırakılamadı.', error);
+      }
+    });
+
+    const exposureCompensationIndex = activeDevice.supportsExposureBias
+      ? clamp(
+          ROI_EXPOSURE_COMPENSATION_INDEX,
+          activeDevice.minExposureBias,
+          activeDevice.maxExposureBias
+        )
+      : 0;
+    if (activeDevice.supportsExposureBias) {
+      await controller.setExposureBias(exposureCompensationIndex).catch((error) => {
+        console.warn('Çekim sonrası pozlama telafisi yenilenemedi.', error);
+      });
+    }
+    console.info(
+      `[Çekim 3A] durum=serbest, poz_kademesi=${exposureCompensationIndex.toFixed(1)}`
+    );
+  }
+
+  // Deklanşör ilk basışta sürekli ışığı ve canlı kalite kapısını başlatır; ikinci basış beklemeyi iptal eder.
+  function handleTakePhoto() {
+    if (isAutoCaptureWaiting) {
+      console.info('[Otomatik çekim] durum=kullanıcı-iptali');
+      cancelAutoCapture('Otomatik çekim iptal edildi.');
+      return;
+    }
+    if (
+      autoCapturePhaseRef.current !== 'idle' ||
+      !canUseCamera ||
+      !isCameraReady ||
+      isTakingPhoto
+    ) {
+      return;
+    }
     if (captureMode === 'enroll' && !enrollmentName.trim()) {
       showFeedback('Önce kayıt için bir kullanıcı adı gir.', false);
       return;
@@ -856,6 +1237,56 @@ export default function CameraScreen() {
       return;
     }
 
+    if (!activeCameraHasTorch) {
+      showFeedback('Bu kamera sürekli flaş kullanımını desteklemiyor.', false);
+      return;
+    }
+
+    clearAutoCaptureTimers();
+    autoCaptureStartedAtRef.current = Date.now();
+    autoCaptureTriggeredRef.current = false;
+    autoCapturePhaseRef.current = 'warming';
+    liveCaptureGateRef.current = createInitialLiveCaptureGateState();
+    captureDetectionSnapshotRef.current = [];
+    liveCaptureQualityRef.current = null;
+    setLiveCaptureQuality(null);
+    setAutoCapturePhase('warming');
+    showFeedback('', false);
+    console.info(
+      `[Otomatik çekim] durum=başladı, ısınma=${AUTO_CAPTURE_WARMUP_MS}ms, kontrol=${AUTO_CAPTURE_EVALUATION_TIMEOUT_MS}ms`
+    );
+
+    autoCaptureWarmupTimerRef.current = setTimeout(() => {
+      if (autoCapturePhaseRef.current !== 'warming') return;
+      liveCaptureGateRef.current = createInitialLiveCaptureGateState();
+      liveCaptureQualityRef.current = null;
+      setLiveCaptureQuality(null);
+      autoCapturePhaseRef.current = 'evaluating';
+      setAutoCapturePhase('evaluating');
+      console.info('[Otomatik çekim] durum=roi-kontrolü');
+    }, AUTO_CAPTURE_WARMUP_MS);
+
+    autoCaptureTimeoutTimerRef.current = setTimeout(() => {
+      if (
+        autoCapturePhaseRef.current !== 'warming' &&
+        autoCapturePhaseRef.current !== 'evaluating'
+      ) {
+        return;
+      }
+      console.info(
+        `[Otomatik çekim] durum=zaman-aşımı, kalite=${formatLiveGateDiagnostics(liveCaptureQualityRef.current)}`
+      );
+      cancelAutoCapture('Kalite koşulları oluşmadı. Elini düzeltip tekrar dene.');
+    }, AUTO_CAPTURE_WARMUP_MS + AUTO_CAPTURE_EVALUATION_TIMEOUT_MS);
+  }
+
+  // Kalite kapısı açıldıktan sonra tam çözünürlüklü kareyi alıp mevcut biyometrik hatta gönderir.
+  async function executePhotoCapture() {
+    if (!canUseCamera || !isCameraReady || isTakingPhoto) {
+      cancelAutoCapture('Kamera çekime hazır değil. Tekrar dene.');
+      return;
+    }
+
     setIsTakingPhoto(true);
     captureMeteringActiveRef.current = true;
     liveDetectionPausedRef.current = true;
@@ -864,6 +1295,7 @@ export default function CameraScreen() {
     showFeedback('Elini sabit tut, fotoğraf çekiliyor...', false);
     const processingStartedAt = getCurrentTimeMs();
     let sourceImage: NitroImage | undefined;
+    let cameraControlsReleased = false;
 
     try {
       const focusStartedAt = getCurrentTimeMs();
@@ -880,6 +1312,11 @@ export default function CameraScreen() {
         },
         {}
       );
+      // Fotoğraf sensörden alındıktan sonra ağır ROI işlemleri sürerken torch'u kapatırız.
+      autoCapturePhaseRef.current = 'processing';
+      await releaseCameraControlsAfterCapture();
+      cameraControlsReleased = true;
+      setAutoCapturePhase('processing');
       const flashCaptureDuration = getCurrentTimeMs() - flashCaptureStartedAt;
       const prepared = await prepareCapturedPhoto(flashPhoto, 'flaşlı');
       sourceImage = prepared.image;
@@ -894,12 +1331,16 @@ export default function CameraScreen() {
       const rawSaveDuration = getCurrentTimeMs() - rawSaveStartedAt;
 
       const detectionStartedAt = getCurrentTimeMs();
-      const detections = await tryDetectFingertipsFromImage(
+      const detectionResult = await tryDetectFingertipsFromImage(
         sourceImage,
-        rawImageUri
+        rawImageUri,
+        captureDetectionSnapshotRef.current
       );
+      const detections = detectionResult.detections;
       const detectionDuration = getCurrentTimeMs() - detectionStartedAt;
-      console.info(`[Fotoğraf model] tespit=${detections.length}`);
+      console.info(
+        `[Fotoğraf model] tespit=${detectionResult.photoDetectionCount}, nihai=${detections.length}, çekim_kutusu=${detectionResult.snapshotClasses.join(',') || 'yok'}, fotoğrafta_eksik=${detectionResult.fallbackClasses.join(',') || 'yok'}`
+      );
 
       const roiStartedAt = getCurrentTimeMs();
       const fingerRois = await tryExtractFingerRois({
@@ -918,6 +1359,7 @@ export default function CameraScreen() {
       let biometricMessage = '';
 
       if (captureMode === 'enroll') {
+        let completedEnrollmentName: string | null = null;
         try {
           validateEnrollmentFingerRois(fingerRois);
           const nextSamples = [
@@ -941,14 +1383,10 @@ export default function CameraScreen() {
               samples: completedSamples,
             });
             biometricAccepted = true;
-            const databaseAfterEnrollment = await loadBiometricDatabase();
-            setRegisteredPersonCount(databaseAfterEnrollment.people.length);
             setEnrollmentSamples([]);
             setEnrollmentName('');
             biometricMessage = `Kayıt tamamlandı: ${person.displayName}`;
-            console.info(
-              `[Biyometrik kayıt] kişi=${person.displayName}, örnek=3/3, toplam=${databaseAfterEnrollment.people.length}`
-            );
+            completedEnrollmentName = person.displayName;
           }
         } catch (error) {
           if (error instanceof EnrollmentValidationError) {
@@ -959,6 +1397,19 @@ export default function CameraScreen() {
             console.warn('[Biyometrik kayıt] veritabanı işlemi başarısız.', error);
           } else {
             throw error;
+          }
+        } finally {
+          try {
+            const personCount = await readRegisteredPersonCount();
+            setRegisteredPersonCount(personCount);
+            console.info(
+              completedEnrollmentName
+                ? `[Biyometrik kayıt] kişi=${completedEnrollmentName}, örnek=3/3, toplam=${personCount}`
+                : `[Biyometrik kayıt] kayıtlı_kişi=${personCount}, durum=korundu`
+            );
+          } catch (error) {
+            // Okuma başarısızsa ekrandaki son doğru sayı korunur; geçici olarak sıfıra çekilmez.
+            console.warn('Kayıtlı kişi sayısı yenilenemedi.', error);
           }
         }
       } else {
@@ -1037,51 +1488,21 @@ export default function CameraScreen() {
       console.warn('Fotoğraf kaydedilemedi.', error);
       showFeedback('Fotoğraf kaydedilemedi. Tekrar dene.', false);
     } finally {
+      if (!cameraControlsReleased) {
+        await releaseCameraControlsAfterCapture();
+      }
       sourceImage?.dispose();
       captureMeteringActiveRef.current = false;
       photoProcessingActive.setBlocking(false);
       liveDetectionPausedRef.current = modelStatus !== 'ready' || !isScreenFocused;
       setIsTakingPhoto(false);
+      cancelAutoCapture();
     }
   }
 
-  // Deklanşör öncesinde canlı kutuların merkezine odak/pozlama ölçümü yaparak ROI netliğini artırır.
-  async function focusCameraBeforeCapture() {
-    const camera = cameraRef.current;
-    if (!camera || cameraLayout.width <= 0 || cameraLayout.height <= 0) return;
-
-    try {
-      // Devam eden canlı 3A isteğini bitirip deklanşör ölçümünü tek etkin istek olarak başlatırız.
-      await camera.resetFocus().catch((error) => {
-        if (!isMeteringCancellation(error)) {
-          console.warn('Canlı kamera ölçümü sıfırlanamadı.', error);
-        }
-      });
-      const region = getLiveMeteringRegion({
-        detections: liveDetections,
-        imageSize: liveDetectionFrame,
-        layout: cameraLayout,
-      });
-      const activeDevice = camera.controller?.device;
-      if (!activeDevice) return;
-
-      await meterCameraAtRegion({
-        camera,
-        device: activeDevice,
-        region,
-        adaptiveness: 'locked',
-      });
-      const controller = camera.controller;
-      if (controller) {
-        console.info(
-          `[Çekim 3A] modlar=${getSupportedMeteringModes(activeDevice).join('+') || 'yok'}, bölge=${Math.round(region.size)}px, poz_kademesi=${controller.exposureBias.toFixed(1)}`
-        );
-      }
-      await sleep(PRE_CAPTURE_FOCUS_DELAY_MS);
-    } catch (error) {
-      console.warn('Çekim öncesi kamera odağı uygulanamadı.', error);
-    }
-  }
+  useEffect(() => {
+    executePhotoCaptureRef.current = executePhotoCapture;
+  });
 
   // Kamera izni reddedildiyse kullanıcıya yeniden isteme olanağı verir.
   async function handlePermissionRetry() {
@@ -1152,9 +1573,13 @@ export default function CameraScreen() {
               }
             })();
           }}
-          onPreviewStopped={() => setIsCameraReady(false)}
+          onPreviewStopped={() => {
+            cancelAutoCapture();
+            setIsCameraReady(false);
+          }}
           onError={(error) => {
             console.warn('Kamera oturumu hata verdi.', error);
+            cancelAutoCapture();
             setIsCameraReady(false);
             showFeedback(`Kamera hatası: ${error.message}`, false);
           }}
@@ -1170,7 +1595,12 @@ export default function CameraScreen() {
         </View>
       )}
 
-      <LiveDetectionOverlay detections={liveDetections} imageSize={liveDetectionFrame} />
+      <LiveDetectionOverlay
+        detections={liveDetections}
+        imageSize={liveDetectionFrame}
+        capturePhase={autoCapturePhase}
+        fingerQuality={liveCaptureQuality?.fingerResults ?? []}
+      />
 
       <SafeAreaView pointerEvents="box-none" style={styles.controls}>
         <View style={styles.topControl}>
@@ -1179,7 +1609,7 @@ export default function CameraScreen() {
               Canlı takip
             </ThemedText>
             <ThemedText type="small" style={styles.modeText}>
-              Kayıtlı kişi: {registeredPersonCount}
+              Kayıtlı kişi: {registeredPersonCount ?? '...'}
             </ThemedText>
           </View>
 
@@ -1188,7 +1618,9 @@ export default function CameraScreen() {
               style={[
                 styles.captureModeButton,
                 captureMode === 'identify' && styles.captureModeButtonActive,
+                (isTakingPhoto || autoCapturePhase !== 'idle') && styles.disabledButton,
               ]}
+              disabled={isTakingPhoto || autoCapturePhase !== 'idle'}
               onPress={() => {
                 setCaptureMode('identify');
                 setEnrollmentSamples([]);
@@ -1201,7 +1633,9 @@ export default function CameraScreen() {
               style={[
                 styles.captureModeButton,
                 captureMode === 'enroll' && styles.captureModeButtonActive,
+                (isTakingPhoto || autoCapturePhase !== 'idle') && styles.disabledButton,
               ]}
+              disabled={isTakingPhoto || autoCapturePhase !== 'idle'}
               onPress={() => setCaptureMode('enroll')}>
               <ThemedText type="smallBold" style={styles.modeText}>
                 Yeni kişi kaydet
@@ -1217,6 +1651,7 @@ export default function CameraScreen() {
               placeholderTextColor="rgba(255, 255, 255, 0.68)"
               autoCapitalize="words"
               returnKeyType="done"
+              editable={!isTakingPhoto && autoCapturePhase === 'idle'}
               style={styles.enrollmentInput}
             />
           ) : null}
@@ -1228,16 +1663,19 @@ export default function CameraScreen() {
         </View>
 
         <View style={styles.bottomControl}>
-          {feedback || liveCaptureGuide ? (
+          {feedback || autoCaptureGuide || liveCaptureGuide ? (
             <ThemedText type="small" style={styles.feedbackText}>
-              {feedback || liveCaptureGuide}
+              {feedback || autoCaptureGuide || liveCaptureGuide}
             </ThemedText>
           ) : null}
 
           <Pressable
-            accessibilityLabel="Fotoğraf çek"
+            accessibilityLabel={
+              isAutoCaptureWaiting ? 'Otomatik çekimi iptal et' : 'Otomatik fotoğraf çek'
+            }
             style={[
               styles.shutterButton,
+              isAutoCaptureWaiting && styles.armedShutterButton,
               (!isCameraReady || isTakingPhoto) && styles.disabledButton,
             ]}
             disabled={!isCameraReady || isTakingPhoto}
@@ -1346,6 +1784,10 @@ const styles = StyleSheet.create({
     borderWidth: 4,
     borderColor: '#ffffff',
     backgroundColor: 'rgba(0, 0, 0, 0.22)',
+  },
+  armedShutterButton: {
+    borderColor: '#F4B942',
+    backgroundColor: 'rgba(244, 185, 66, 0.18)',
   },
   shutterInner: {
     width: 54,

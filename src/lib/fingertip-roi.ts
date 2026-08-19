@@ -5,9 +5,12 @@ import {
 
 import {
   createAlignedCanonicalFingerRoiImageUri,
+  createBinaryFingerRoiImageUri,
   createEnhancedFingerRoiImageUri,
   createMaskFingerRoiImageUri,
   createMinutiaeFingerRoiImageUri,
+  createMinutiaeOverlayFingerRoiImageUri,
+  createOpenedBinaryFingerRoiImageUri,
   createOrientationFingerRoiImageUri,
   createSegmentedFingerRoiImageUri,
   saveCanonicalFingerRoiImage,
@@ -18,6 +21,7 @@ import {
   rotateRgbaAndMask,
   saveMaskPng,
   saveRgbaImage,
+  saveRgbaPng,
   segmentFingerRoiImage,
 } from '@/lib/finger-segmentation';
 import {
@@ -35,6 +39,7 @@ import {
 } from '@/lib/roi-geometry';
 import {
   extractFingerprintMinutiae,
+  createDistalMinutiaeMask,
   type MinutiaeExtractionResult,
 } from '@/lib/minutiae-extraction';
 import { saveRidgeEnhancedImage } from '@/lib/ridge-enhancement';
@@ -158,6 +163,9 @@ export async function extractFingerRoisFromImage({
         canonicalImageUri,
         segmentedImageUri: processedRoi.segmentedImageUri,
         maskImageUri: processedRoi.maskImageUri,
+        binaryImageUri: processedRoi.binaryImageUri,
+        openedBinaryImageUri: processedRoi.openedBinaryImageUri,
+        minutiaeOverlayImageUri: processedRoi.minutiaeOverlayImageUri,
         enhancedImageUri: processedRoi.enhancedImageUri,
         orientationImageUri: processedRoi.orientationImageUri,
         minutiaeImageUri: processedRoi.minutiaeImageUri,
@@ -232,6 +240,11 @@ async function tryProcessFingerRoi({
       await createAlignedCanonicalFingerRoiImageUri(sampleId, className);
     const outputImageUri = await createSegmentedFingerRoiImageUri(sampleId, className);
     const outputMaskImageUri = await createMaskFingerRoiImageUri(sampleId, className);
+    const binaryImageUri = await createBinaryFingerRoiImageUri(sampleId, className);
+    const openedBinaryImageUri =
+      await createOpenedBinaryFingerRoiImageUri(sampleId, className);
+    const minutiaeOverlayImageUri =
+      await createMinutiaeOverlayFingerRoiImageUri(sampleId, className);
     const enhancedImageUri = await createEnhancedFingerRoiImageUri(sampleId, className);
     const orientationImageUri = await createOrientationFingerRoiImageUri(
       sampleId,
@@ -396,8 +409,14 @@ async function tryProcessFingerRoi({
     let savedEnhancedImageUri: string | undefined;
     let savedOrientationImageUri: string | undefined;
     let savedMinutiaeImageUri: string | undefined;
+    let savedBinaryImageUri: string | undefined;
+    let savedOpenedBinaryImageUri: string | undefined;
+    let savedMinutiaeOverlayImageUri: string | undefined;
     let minutiaeTemplate: FingerRoi['minutiaeTemplate'];
     let minutiaeVisualization: Uint8Array | undefined;
+    let binaryVisualization: Uint8Array | undefined;
+    let openedBinaryVisualization: Uint8Array | undefined;
+    let minutiaeOverlayVisualization: Uint8Array | undefined;
 
     // Teknik Nokta görüntüsü kalite yetersiz olsa bile üretilir; yalnızca template kabulü aşağıdaki ayrı kapıda yapılır.
     if (
@@ -407,17 +426,39 @@ async function tryProcessFingerRoi({
       quality.ridgeMedianPeriodPixels > 0
     ) {
       const minutiaeStartedAt = Date.now();
+      const distalMask = createDistalMinutiaeMask(
+        result.mask,
+        result.width,
+        result.height
+      );
+      const distalSupportMask = intersectMasks(
+        analysis.minutiaeSupportMask,
+        distalMask
+      );
+      const distalOrientationMask = intersectMasks(
+        analysis.minutiaeOrientationMask,
+        distalMask
+      );
+      const distalOrientationFieldMask = analysis.minutiaeOrientationFieldMask
+        ? intersectMasks(analysis.minutiaeOrientationFieldMask, distalMask)
+        : undefined;
       const minutiae = extractFingerprintMinutiae({
         pixels: analysis.enhancedPixels,
-        mask: result.mask,
-        candidateMask: analysis.minutiaeSupportMask,
-        orientationMask: analysis.minutiaeOrientationMask,
+        mask: distalMask,
+        candidateMask: distalSupportMask,
+        orientationMask: distalOrientationMask,
+        orientationAngles: analysis.minutiaeOrientationAngles,
+        orientationFieldMask: distalOrientationFieldMask,
         width: result.width,
         height: result.height,
         ridgePeriodPixels: quality.ridgeMedianPeriodPixels,
         minimumSupportConfidence: MINUTIAE_SUPPORT_CONFIDENCE_FLOOR,
       });
       minutiaeVisualization = minutiae.visualizationPixels;
+      binaryVisualization = minutiae.binaryVisualizationPixels;
+      openedBinaryVisualization = minutiae.openedBinaryVisualizationPixels;
+      minutiaeOverlayVisualization =
+        minutiae.skeletonOverlayVisualizationPixels;
       const minutiaeAssessment = assessMinutiaeTemplate(quality, minutiae);
       quality.minutiaeStatus = minutiaeAssessment.status;
       quality.minutiaeRejectionReason = minutiaeAssessment.reason;
@@ -432,12 +473,29 @@ async function tryProcessFingerRoi({
       quality.minutiaeBifurcationCandidateCount =
         minutiae.bifurcationCandidateCount;
       quality.minutiaeConfidenceHistogram = minutiae.confidenceHistogram;
+      quality.minutiaeThresholdPrimaryCount =
+        minutiae.thresholdConsensusPrimaryCount;
+      quality.minutiaeThresholdLocationStableCount =
+        minutiae.thresholdConsensusLocationCount;
+      quality.minutiaeThresholdTypeStableCount =
+        minutiae.thresholdConsensusTypeCount;
+      quality.minutiaeThresholdLoopCandidateCount =
+        minutiae.thresholdLoopCandidateCount;
+      quality.minutiaeThresholdLoopStableCount =
+        minutiae.thresholdLoopStableCount;
+      quality.minutiaeThresholdLoopRemovedCount =
+        minutiae.thresholdLoopRemovedCount;
+      quality.minutiaeThresholdLoopRemovedPixelCount =
+        minutiae.thresholdLoopRemovedPixelCount;
+      quality.minutiaeOrientationBridgeRemovedPixelCount =
+        minutiae.orientationBridgeRemovedPixelCount;
       quality.minutiaeSearchableAreaRatio = Math.round(
         minutiae.searchableAreaRatio * 100
       );
       quality.minutiaeLargestRegionRatio = Math.round(
         minutiae.largestSearchableRegionRatio * 100
       );
+      quality.minutiaeTopology = minutiae.topologyDiagnostics;
       if (minutiaeAssessment.status === 'sufficient') {
         minutiaeTemplate = {
           ...minutiae.template,
@@ -459,7 +517,11 @@ async function tryProcessFingerRoi({
       const bifurcationCount =
         minutiae.template.minutiae.length - endingCount;
       console.info(
-        `[Minutiae] parmak=${className}, durum=${minutiaeAssessment.status}, ret=${minutiaeAssessment.reason ?? 'yok'}, toplam=${minutiae.template.minutiae.length}, son=${endingCount}, çatallanma=${bifurcationCount}, crossing=${minutiae.crossingNumberCandidateCount}, branch=${minutiae.branchValidatedCandidateCount}, suppression=${minutiae.suppressionCandidateCount}, ham_aday=${minutiae.rawCandidateCount}, iskelet=${minutiae.skeletonPixelCount}, mikro_delik=${minutiae.filledHolePixelCount}, küçük_bileşen=${minutiae.removedComponentPixelCount}, budanan=${minutiae.prunedPixelCount}, bağlanan=${minutiae.bridgedPixelCount}, destek=${Math.round(minutiae.supportCoverage * 100)}%, aranabilir=${Math.round(minutiae.searchableAreaRatio * 100)}%, büyük_bölge=${Math.round(minutiae.largestSearchableRegionRatio * 100)}%, ridge_oranı=${Math.round(minutiae.binaryRidgeRatio * 100)}%, inceltme=${minutiae.thinningIterations}, conf=${minutiae.confidenceHistogram.join('/')}, süre=${Date.now() - minutiaeStartedAt}ms`
+        `[Minutiae] parmak=${className}, durum=${minutiaeAssessment.status}, ret=${minutiaeAssessment.reason ?? 'yok'}, toplam=${minutiae.template.minutiae.length}, son=${endingCount}, çatallanma=${bifurcationCount}, crossing=${minutiae.crossingNumberCandidateCount}, çatallanma_akış=${minutiae.bifurcationCrossingNumberCandidateCount}/${minutiae.bifurcationBranchValidatedCount}/${minutiae.bifurcationRingValidatedCount}/${minutiae.bifurcationCandidateCount}/${minutiae.bifurcationMicroCycleValidatedCount}/${minutiae.bifurcationStabilityValidatedCount}/${minutiae.bifurcationSuppressionCount}, eşik_kararlılığı=${minutiae.thresholdConsensusPrimaryCount}/${minutiae.thresholdConsensusLocationCount}/${minutiae.thresholdConsensusTypeCount}, eşik_halkası=${minutiae.thresholdLoopCandidateCount}/${minutiae.thresholdLoopStableCount}/${minutiae.thresholdLoopRemovedCount}/${minutiae.thresholdLoopRemovedPixelCount}px, branch=${minutiae.branchValidatedCandidateCount}, suppression=${minutiae.suppressionCandidateCount}, ham_aday=${minutiae.rawCandidateCount}, iskelet=${minutiae.skeletonPixelCount}, mikro_delik=${minutiae.filledHolePixelCount}, ikili_gürültü=${minutiae.binaryNoisePixelCount}, opening=${minutiae.morphologicalOpeningStatus}, opening_px=${minutiae.morphologicalOpeningBeforePixelCount}->${minutiae.morphologicalOpeningAfterPixelCount}, opening_bileşen=${minutiae.morphologicalOpeningBeforeComponentCount}->${minutiae.morphologicalOpeningAfterComponentCount}, yön_köprüsü=${minutiae.orientationBridgeRemovedPixelCount}, küçük_bileşen=${minutiae.removedComponentPixelCount}, budanan=${minutiae.prunedPixelCount}, bağlanan=${minutiae.bridgedPixelCount}, destek=${Math.round(minutiae.supportCoverage * 100)}%, aranabilir=${Math.round(minutiae.searchableAreaRatio * 100)}%, büyük_bölge=${Math.round(minutiae.largestSearchableRegionRatio * 100)}%, ridge_oranı=${Math.round(minutiae.binaryRidgeRatio * 100)}%, inceltme=${minutiae.thinningIterations}, conf=${minutiae.confidenceHistogram.join('/')}, süre=${Date.now() - minutiaeStartedAt}ms`
+      );
+      const topology = minutiae.topologyDiagnostics;
+      console.info(
+        `[Minutiae topoloji] parmak=${className}, ikili=${formatTopologyStage(topology.binary)}, opening=${formatTopologyStage(topology.opened ?? topology.binary)}, yön_temiz=${formatTopologyStage(topology.orientationCleaned ?? topology.opened ?? topology.binary)}, inceltilmiş=${formatTopologyStage(topology.thinned)}, köprü=${formatTopologyStage(topology.bridged)}, bileşen=${formatTopologyStage(topology.componentFiltered)}, budama=${formatTopologyStage(topology.pruned)}, eşik_halkası=${formatTopologyStage(topology.thresholdLoopCleaned ?? topology.pruned)}`
       );
     } else {
       quality.minutiaeStatus = 'insufficient';
@@ -513,6 +575,42 @@ async function tryProcessFingerRoi({
         })
       );
     }
+    if (binaryVisualization) {
+      technicalImageWrites.push(
+        saveMaskPng({
+          mask: binaryVisualization,
+          width: result.width,
+          height: result.height,
+          outputImageUri: binaryImageUri,
+        }).then((savedUri) => {
+          savedBinaryImageUri = savedUri;
+        })
+      );
+    }
+    if (openedBinaryVisualization) {
+      technicalImageWrites.push(
+        saveMaskPng({
+          mask: openedBinaryVisualization,
+          width: result.width,
+          height: result.height,
+          outputImageUri: openedBinaryImageUri,
+        }).then((savedUri) => {
+          savedOpenedBinaryImageUri = savedUri;
+        })
+      );
+    }
+    if (minutiaeOverlayVisualization) {
+      technicalImageWrites.push(
+        saveRgbaPng({
+          pixels: minutiaeOverlayVisualization,
+          width: result.width,
+          height: result.height,
+          outputImageUri: minutiaeOverlayImageUri,
+        }).then((savedUri) => {
+          savedMinutiaeOverlayImageUri = savedUri;
+        })
+      );
+    }
     // Native dosya yazımları birbirini beklemeden ilerler; Promise.all iki JPEG çıktısının tamamlandığını garanti eder.
     await Promise.all(technicalImageWrites);
     const technicalWriteMs = Date.now() - technicalWriteStartedAt;
@@ -530,6 +628,9 @@ async function tryProcessFingerRoi({
     return {
       segmentedImageUri: result.imageUri,
       maskImageUri: outputMaskImageUri,
+      binaryImageUri: savedBinaryImageUri,
+      openedBinaryImageUri: savedOpenedBinaryImageUri,
+      minutiaeOverlayImageUri: savedMinutiaeOverlayImageUri,
       alignedCanonicalImageUri,
       enhancedImageUri: savedEnhancedImageUri,
       orientationImageUri: savedOrientationImageUri,
@@ -560,6 +661,20 @@ async function tryProcessFingerRoi({
       perspectiveCorrected: false,
     };
   }
+}
+
+function intersectMasks(left: Uint8Array, right: Uint8Array) {
+  const result = new Uint8Array(left.length);
+  for (let index = 0; index < result.length; index += 1) {
+    if (left[index] && right[index]) result[index] = 1;
+  }
+  return result;
+}
+
+function formatTopologyStage(
+  stage: MinutiaeExtractionResult['topologyDiagnostics']['binary']
+) {
+  return `${stage.componentCount}b/${stage.pixelCount}p/${stage.endingPixelCount}s/${stage.bifurcationPixelCount}ç`;
 }
 
 // Teknik aday listesini çekim kalitesi, kesintisiz arama alanı ve aday sayısıyla template kabulünden ayırır.

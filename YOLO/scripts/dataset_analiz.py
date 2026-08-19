@@ -6,7 +6,8 @@ from pathlib import Path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-DEFAULT_DATASET_ROOT = Path(r"C:\Users\eness\Downloads\final_hands")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATASET_ROOT = PROJECT_ROOT / "YOLO" / "datasets" / "merged_hands_fingertip_obb"
 DEFAULT_SPLITS = ("train", "valid", "test")
 
 

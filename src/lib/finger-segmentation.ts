@@ -7,8 +7,9 @@ import {
   type HomographyMatrix,
   warpRgbaImageByHomography,
 } from '@/lib/roi-geometry';
-import { encodeGrayscalePng } from '@/lib/png-encoder';
+import { encodeGrayscalePng, encodeRgbaPng } from '@/lib/png-encoder';
 import { inferLearnedFingerMask } from '@/lib/onnx-segmentation';
+import { createSegmentedPreviewPixels } from '@/lib/segmentation-preview';
 
 export type SegmentationResult = {
   imageUri: string;
@@ -173,6 +174,27 @@ export async function saveMaskPng({
   await FileSystem.writeAsStringAsync(
     outputImageUri,
     bytesToBase64(encodeGrayscalePng(mask, width, height)),
+    { encoding: FileSystem.EncodingType.Base64 }
+  );
+  return outputImageUri;
+}
+
+// Renkli debug tamponunu JPEG sıkıştırması olmadan PNG olarak saklar.
+export async function saveRgbaPng({
+  pixels,
+  width,
+  height,
+  outputImageUri,
+}: {
+  pixels: Uint8Array;
+  width: number;
+  height: number;
+  outputImageUri: string;
+}) {
+  ensureJpegBufferShim();
+  await FileSystem.writeAsStringAsync(
+    outputImageUri,
+    bytesToBase64(encodeRgbaPng(pixels, width, height)),
     { encoding: FileSystem.EncodingType.Base64 }
   );
   return outputImageUri;
@@ -439,168 +461,18 @@ function estimateMaskPrincipalAxis(
   return Math.round(axisDegrees * 10) / 10;
 }
 
-// Segmentasyon çıktısını yalnızca silüet değil, ridge dokusunu daha görünür yapan gri görüntü olarak üretir.
+// Eski çağrı adını korurken yalnızca galeri için doygunluğu sınırlı segmentasyon önizlemesi üretir.
 export function createEnhancedSegmentedPixels(
   sourcePixels: Uint8Array,
   mask: Uint8Array,
   width: number,
   height: number
 ) {
-  const grayscale = createGrayscaleImage(sourcePixels, width, height);
-  const normalized = normalizeLocalBrightness(grayscale, mask, width, height);
-  const stretched = stretchMaskedContrast(normalized, mask);
-  const sharpened = sharpenMaskedGrayscale(stretched, mask, width, height);
-  const outputPixels = new Uint8Array(sourcePixels.length);
-
-  for (let pixelIndex = 0; pixelIndex < mask.length; pixelIndex += 1) {
-    const dataIndex = pixelIndex * 4;
-    const value = mask[pixelIndex] ? sharpened[pixelIndex] : 0;
-
-    outputPixels[dataIndex] = value;
-    outputPixels[dataIndex + 1] = value;
-    outputPixels[dataIndex + 2] = value;
-    outputPixels[dataIndex + 3] = 255;
-  }
-
-  return outputPixels;
-}
-
-// RGB piksel dizisini luminance tabanlı gri tona çevirir.
-function createGrayscaleImage(pixels: Uint8Array, width: number, height: number) {
-  const grayscale = new Uint8Array(width * height);
-
-  for (let index = 0; index < grayscale.length; index += 1) {
-    const pixelIndex = index * 4;
-    grayscale[index] = Math.round(
-      (pixels[pixelIndex] ?? 0) * 0.299 +
-        (pixels[pixelIndex + 1] ?? 0) * 0.587 +
-        (pixels[pixelIndex + 2] ?? 0) * 0.114
-    );
-  }
-
-  return grayscale;
-}
-
-// Parmak üzerindeki yavaş ışık değişimini bastırıp lokal çizgi farklarını öne çıkarır.
-function normalizeLocalBrightness(
-  grayscale: Uint8Array,
-  mask: Uint8Array,
-  width: number,
-  height: number
-) {
-  const radius = Math.max(5, Math.min(12, Math.round(Math.min(width, height) / 12)));
-  const integral = createIntegralImage(grayscale, width, height);
-  const normalized = new Uint8Array(grayscale.length);
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      if (!mask[index]) continue;
-
-      const left = Math.max(0, x - radius);
-      const top = Math.max(0, y - radius);
-      const right = Math.min(width - 1, x + radius);
-      const bottom = Math.min(height - 1, y + radius);
-      const area = (right - left + 1) * (bottom - top + 1);
-      const localMean = readIntegralSum(integral, width, left, top, right, bottom) / area;
-
-      normalized[index] = clampByte(128 + (grayscale[index] - localMean) * 1.65);
-    }
-  }
-
-  return normalized;
-}
-
-// Maskeli alanın yüzde değerlerine göre kontrastı güvenli şekilde genişletir.
-function stretchMaskedContrast(grayscale: Uint8Array, mask: Uint8Array) {
-  const stretched = new Uint8Array(grayscale.length);
-  const { low, high } = getMaskedContrastBounds(grayscale, mask);
-  const range = Math.max(high - low, 12);
-
-  for (let index = 0; index < grayscale.length; index += 1) {
-    if (!mask[index]) continue;
-    stretched[index] = clampByte(((grayscale[index] - low) / range) * 255);
-  }
-
-  return stretched;
-}
-
-// Hafif unsharp mask ile ridge benzeri ince geçişleri abartmadan belirginleştirir.
-function sharpenMaskedGrayscale(
-  grayscale: Uint8Array,
-  mask: Uint8Array,
-  width: number,
-  height: number
-) {
-  const blurred = blurGrayscale(grayscale, width, height);
-  const sharpened = new Uint8Array(grayscale.length);
-
-  for (let index = 0; index < grayscale.length; index += 1) {
-    if (!mask[index]) continue;
-
-    sharpened[index] = clampByte(grayscale[index] + (grayscale[index] - blurred[index]) * 0.85);
-  }
-
-  return sharpened;
-}
-
-// Küçük 3x3 bulanıklaştırma, keskinleştirme için düşük frekans referansı üretir.
-function blurGrayscale(grayscale: Uint8Array, width: number, height: number) {
-  const blurred = new Uint8Array(grayscale.length);
-  const integral = createIntegralImage(grayscale, width, height);
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const left = Math.max(0, x - 1);
-      const top = Math.max(0, y - 1);
-      const right = Math.min(width - 1, x + 1);
-      const bottom = Math.min(height - 1, y + 1);
-      const area = (right - left + 1) * (bottom - top + 1);
-      const total = readIntegralSum(integral, width, left, top, right, bottom);
-
-      blurred[y * width + x] = Math.round(total / area);
-    }
-  }
-
-  return blurred;
-}
-
-// Lokal ortalama hesabını hızlandırmak için klasik integral görüntü üretir.
-function createIntegralImage(grayscale: Uint8Array, width: number, height: number) {
-  const integral = new Float64Array((width + 1) * (height + 1));
-
-  for (let y = 1; y <= height; y += 1) {
-    let rowTotal = 0;
-
-    for (let x = 1; x <= width; x += 1) {
-      rowTotal += grayscale[(y - 1) * width + (x - 1)];
-      integral[y * (width + 1) + x] = integral[(y - 1) * (width + 1) + x] + rowTotal;
-    }
-  }
-
-  return integral;
-}
-
-// Integral görüntüden verilen dikdörtgenin toplam parlaklık değerini okur.
-function readIntegralSum(
-  integral: Float64Array,
-  width: number,
-  left: number,
-  top: number,
-  right: number,
-  bottom: number
-) {
-  const stride = width + 1;
-  const x1 = left;
-  const y1 = top;
-  const x2 = right + 1;
-  const y2 = bottom + 1;
-
-  return (
-    integral[y2 * stride + x2] -
-    integral[y1 * stride + x2] -
-    integral[y2 * stride + x1] +
-    integral[y1 * stride + x1]
+  return createSegmentedPreviewPixels(
+    sourcePixels,
+    mask,
+    width,
+    height
   );
 }
 
@@ -964,40 +836,4 @@ function base64ToBytes(base64: string) {
 // JPEG encoder çıktısını native Buffer polyfill ile tek çağrıda base64 metnine dönüştürür.
 function bytesToBase64(bytes: Uint8Array) {
   return Buffer.from(bytes).toString('base64');
-}
-
-// 8-bit histogram üzerinden sıralama yapmadan maskeli alanın %4-%96 kontrast sınırlarını bulur.
-function getMaskedContrastBounds(grayscale: Uint8Array, mask: Uint8Array) {
-  const histogram = new Uint32Array(256);
-  let count = 0;
-
-  for (let index = 0; index < grayscale.length; index += 1) {
-    if (!mask[index]) continue;
-    histogram[grayscale[index]] += 1;
-    count += 1;
-  }
-
-  return {
-    low: getHistogramPercentile(histogram, count, 0.04),
-    high: getHistogramPercentile(histogram, count, 0.96),
-  };
-}
-
-// Histogramda hedef yüzdelik sırasına ulaşan ilk 8-bit değeri döndürür.
-function getHistogramPercentile(histogram: Uint32Array, count: number, percentile: number) {
-  if (count === 0) return 0;
-  const target = Math.floor((count - 1) * percentile);
-  let cumulative = 0;
-
-  for (let value = 0; value < histogram.length; value += 1) {
-    cumulative += histogram[value];
-    if (cumulative > target) return value;
-  }
-
-  return 255;
-}
-
-// Görüntü işlemlerinde değerleri güvenli 8-bit piksel aralığında tutar.
-function clampByte(value: number) {
-  return Math.round(Math.min(Math.max(value, 0), 255));
 }

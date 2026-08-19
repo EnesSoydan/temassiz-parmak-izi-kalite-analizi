@@ -1,6 +1,8 @@
 import type {
   FingerprintMinutia,
   FingerprintTemplate,
+  MinutiaeTopologyDiagnostics,
+  MinutiaeTopologyStageDiagnostics,
   MinutiaType,
 } from '@/types/biometrics';
 
@@ -9,6 +11,8 @@ type MinutiaeExtractionInput = {
   mask: Uint8Array;
   candidateMask?: Uint8Array;
   orientationMask?: Uint8Array;
+  orientationAngles?: Float32Array;
+  orientationFieldMask?: Uint8Array;
   width: number;
   height: number;
   ridgePeriodPixels: number;
@@ -20,7 +24,7 @@ type PixelPoint = {
   y: number;
 };
 
-type MinutiaCandidate = PixelPoint & {
+export type MinutiaCandidate = PixelPoint & {
   type: MinutiaType;
   angleDegrees: number;
   confidence: number;
@@ -29,6 +33,9 @@ type MinutiaCandidate = PixelPoint & {
 export type MinutiaeExtractionResult = {
   template: FingerprintTemplate;
   visualizationPixels: Uint8Array;
+  binaryVisualizationPixels: Uint8Array;
+  openedBinaryVisualizationPixels: Uint8Array;
+  skeletonOverlayVisualizationPixels: Uint8Array;
   binaryRidgeRatio: number;
   skeletonPixelCount: number;
   rawCandidateCount: number;
@@ -40,16 +47,43 @@ export type MinutiaeExtractionResult = {
   supportCoverage: number;
   searchableAreaRatio: number;
   largestSearchableRegionRatio: number;
+  binaryNoisePixelCount: number;
+  morphologicalOpeningStatus: MorphologicalOpeningStatus;
+  morphologicalOpeningBeforePixelCount: number;
+  morphologicalOpeningAfterPixelCount: number;
+  morphologicalOpeningBeforeComponentCount: number;
+  morphologicalOpeningAfterComponentCount: number;
+  orientationBridgeRemovedPixelCount: number;
   crossingNumberCandidateCount: number;
+  bifurcationCrossingNumberCandidateCount: number;
+  bifurcationBranchValidatedCount: number;
+  bifurcationRingValidatedCount: number;
+  bifurcationMicroCycleValidatedCount: number;
+  bifurcationStabilityValidatedCount: number;
+  bifurcationSuppressionCount: number;
   branchValidatedCandidateCount: number;
   suppressionCandidateCount: number;
   endingCandidateCount: number;
   bifurcationCandidateCount: number;
   confidenceHistogram: number[];
+  thresholdConsensusPrimaryCount: number;
+  thresholdConsensusLocationCount: number;
+  thresholdConsensusTypeCount: number;
+  thresholdLoopCandidateCount: number;
+  thresholdLoopStableCount: number;
+  thresholdLoopRemovedCount: number;
+  thresholdLoopRemovedPixelCount: number;
+  topologyDiagnostics: MinutiaeTopologyDiagnostics;
 };
 
 export type MinutiaeDetectionDiagnostics = {
   crossingNumberCandidateCount: number;
+  bifurcationCrossingNumberCandidateCount: number;
+  bifurcationBranchValidatedCount: number;
+  bifurcationRingValidatedCount: number;
+  bifurcationMicroCycleValidatedCount: number;
+  bifurcationStabilityValidatedCount: number;
+  bifurcationSuppressionCount: number;
   branchValidatedCandidateCount: number;
   suppressionCandidateCount: number;
   endingCandidateCount: number;
@@ -72,12 +106,82 @@ const BIFURCATION_SUPPRESSION_PERIOD_FACTOR = 2;
 // Gerçek çatallanmanın geniş çevrede tam üç ayrı ridge çıkışı vermesini sınayan halka yarıçapı.
 const BIFURCATION_RING_RADIUS_PERIOD_FACTOR = 2.4;
 
+// Tek eşikte oluşan kopma ve birleşmeleri ayırt etmek için ana eşik çevresinde iki küçük perturbasyon kullanılır.
+const RIDGE_THRESHOLD_MULTIPLIERS = [0.5, 1, 1.5] as const;
+
+// Doğrulanmış 8 px yön bloğunun 28° kabul payına örnekleme toleransı eklenir;
+// bu sınırı aşan kopukluk ridge boyunca değil, ridge'lere enine ilerliyor sayılır.
+const MAX_ORIENTATION_GAP_AXIS_DIFFERENCE_DEGREES = 32;
+
+// Beklenen ridge genişliği 3x3 çapraz çekirdeği taşıyamayacak kadar küçükse opening uygulanmaz.
+const MIN_MORPHOLOGICAL_OPENING_RIDGE_PERIOD = 6;
+const MIN_MORPHOLOGICAL_OPENING_PIXEL_RETENTION = 0.82;
+
+export type MorphologicalOpeningStatus =
+  | 'applied'
+  | 'skipped-small-period'
+  | 'rejected-pixel-loss'
+  | 'rejected-fragmentation'
+  | 'no-change';
+
+export type MorphologicalOpeningResult = {
+  status: MorphologicalOpeningStatus;
+  beforePixelCount: number;
+  afterPixelCount: number;
+  beforeComponentCount: number;
+  afterComponentCount: number;
+};
+
+type ThresholdPipelineResult = {
+  binary: Uint8Array;
+  referenceBinary?: Uint8Array;
+  skeleton: Uint8Array;
+  detection: ReturnType<typeof detectMinutiaeFromSkeletonDetailed>;
+  binaryNoisePixelCount: number;
+  morphologicalOpening: MorphologicalOpeningResult;
+  orientationBridgeRemovedPixelCount: number;
+  filledHolePixelCount: number;
+  thinningIterations: number;
+  bridgedPixelCount: number;
+  removedComponentPixelCount: number;
+  prunedPixelCount: number;
+  topologyDiagnostics?: MinutiaeTopologyDiagnostics;
+};
+
+export type ThresholdConsensusResult = {
+  candidates: MinutiaCandidate[];
+  primaryCount: number;
+  locationStableCount: number;
+  typeStableCount: number;
+};
+
+export type ThresholdLoopValidationResult = {
+  candidateCount: number;
+  stableCount: number;
+  unstableCount: number;
+  removedLoopCount: number;
+  removedPixelCount: number;
+};
+
+type SkeletonLoop = {
+  centerX: number;
+  centerY: number;
+  area: number;
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  boundaryIndexes: number[];
+};
+
 // Gri ROI'den adaptif ikili ridge haritası, iskelet ve filtrelenmiş minutiae şablonu üretir.
 export function extractFingerprintMinutiae({
   pixels,
   mask,
   candidateMask = mask,
   orientationMask = mask,
+  orientationAngles,
+  orientationFieldMask,
   width,
   height,
   ridgePeriodPixels,
@@ -86,9 +190,12 @@ export function extractFingerprintMinutiae({
   const grayscale = rgbaToGrayscale(pixels, width, height);
   const foregroundDistance = createMaskDistanceMap(mask, width, height);
   const period = clamp(ridgePeriodPixels || 8, 5, 14);
+  // Yön görselindeki yeşil hücreleri oluşturan doğrulanmış ince alan varsa,
+  // daha gevşek kaba yön maskesi yerine doğrudan bu alanı zorunlu sınır yaparız.
+  const verifiedOrientationMask = orientationFieldMask ?? orientationMask;
   const stableSearchArea = createStableMinutiaeSearchArea({
     supportMask: candidateMask,
-    orientationMask,
+    orientationMask: verifiedOrientationMask,
     foregroundMask: mask,
     width,
     height,
@@ -109,53 +216,93 @@ export function extractFingerprintMinutiae({
     candidateBoundaryMargin,
     getForegroundBoundaryMargin(period)
   );
-  const binary = createAdaptiveRidgeBinary(
+  const commonPipelineInput = {
     grayscale,
     mask,
     foregroundDistance,
-    width,
-    height,
-    period
-  );
-  cleanBinaryRidges(binary, foregroundDistance, width, height);
-  const filledHolePixelCount = fillSmallBinaryRidgeHoles(
-    binary,
-    foregroundDistance,
-    width,
-    height,
-    period
-  );
-  const thinning = thinRidgesZhangSuen(binary, width, height);
-  const bridgedPixelCount = bridgeShortSkeletonGaps(
-    thinning.skeleton,
-    stableSearchArea.mask,
-    width,
-    height,
-    period
-  );
-  const removedComponentPixelCount = removeSmallSkeletonComponents(
-    thinning.skeleton,
-    width,
-    height,
-    Math.max(18, Math.round(period * 3.5))
-  );
-  const prunedPixelCount = pruneShortSkeletonBranches(
-    thinning.skeleton,
-    width,
-    height,
-    Math.max(8, Math.round(period * 1.8))
-  );
-  const detection = detectMinutiaeFromSkeletonDetailed({
-    skeleton: thinning.skeleton,
-    maskDistance: candidateDistance,
-    foregroundDistance,
+    stableSearchMask: stableSearchArea.mask,
+    candidateDistance,
+    supportConfidence: stableSearchArea.supportConfidence,
     width,
     height,
     ridgePeriodPixels: period,
-    supportConfidence: stableSearchArea.supportConfidence,
     minimumSupportConfidence,
+    orientationAngles,
+    orientationFieldMask,
+  };
+  const primaryPipeline = runMinutiaeThresholdPipeline({
+    ...commonPipelineInput,
+    thresholdMultiplier: RIDGE_THRESHOLD_MULTIPLIERS[1],
+    collectTopologyDiagnostics: true,
   });
-  const rawCandidates = detection.candidates;
+  const relaxedPipeline = runMinutiaeThresholdPipeline({
+    ...commonPipelineInput,
+    thresholdMultiplier: RIDGE_THRESHOLD_MULTIPLIERS[0],
+    collectTopologyDiagnostics: false,
+  });
+  const strictPipeline = runMinutiaeThresholdPipeline({
+    ...commonPipelineInput,
+    thresholdMultiplier: RIDGE_THRESHOLD_MULTIPLIERS[2],
+    collectTopologyDiagnostics: false,
+  });
+  const thresholdLoopValidation = removeThresholdUnstableSkeletonLoops({
+    skeleton: primaryPipeline.skeleton,
+    variantSkeletons: [relaxedPipeline.skeleton, strictPipeline.skeleton],
+    width,
+    height,
+    ridgePeriodPixels: period,
+    orientationAngles,
+    orientationMask: orientationFieldMask,
+  });
+  if (thresholdLoopValidation.removedPixelCount > 0) {
+    primaryPipeline.removedComponentPixelCount += removeSmallSkeletonComponents(
+      primaryPipeline.skeleton,
+      width,
+      height,
+      Math.max(18, Math.round(period * 3.5))
+    );
+    primaryPipeline.prunedPixelCount += pruneShortSkeletonBranches(
+      primaryPipeline.skeleton,
+      width,
+      height,
+      Math.max(8, Math.round(period * 1.8))
+    );
+    primaryPipeline.detection = detectMinutiaeFromSkeletonDetailed({
+      skeleton: primaryPipeline.skeleton,
+      maskDistance: candidateDistance,
+      foregroundDistance,
+      width,
+      height,
+      ridgePeriodPixels: period,
+      supportConfidence: stableSearchArea.supportConfidence,
+      minimumSupportConfidence,
+    });
+  }
+  if (primaryPipeline.topologyDiagnostics) {
+    primaryPipeline.topologyDiagnostics.thresholdLoopCleaned =
+      summarizeRidgeTopology(primaryPipeline.skeleton, width, height);
+  }
+  const thresholdConsensus = selectThresholdStableMinutiaeCandidates({
+    primaryCandidates: primaryPipeline.detection.candidates,
+    variantCandidates: [
+      relaxedPipeline.detection.candidates,
+      strictPipeline.detection.candidates,
+    ],
+    ridgePeriodPixels: period,
+  });
+  const rawCandidates = thresholdConsensus.candidates;
+  const binaryVisualizationPixels = createBinaryRidgeVisualization(
+    primaryPipeline.referenceBinary ?? primaryPipeline.binary,
+    stableSearchArea.mask,
+    width,
+    height
+  );
+  const openedBinaryVisualizationPixels = createBinaryRidgeVisualization(
+    primaryPipeline.binary,
+    stableSearchArea.mask,
+    width,
+    height
+  );
   const minutiae = rawCandidates.slice(0, MAX_MINUTIAE_COUNT).map(
     (candidate): FingerprintMinutia => ({
       x: round(candidate.x / Math.max(width - 1, 1), 5),
@@ -177,25 +324,1015 @@ export function extractFingerprintMinutiae({
   return {
     template,
     visualizationPixels: createMinutiaeVisualization(
-      thinning.skeleton,
+      primaryPipeline.skeleton,
       rawCandidates.slice(0, MAX_MINUTIAE_COUNT),
-      mask,
+      stableSearchArea.mask,
       width,
       height
     ),
-    binaryRidgeRatio: calculateBinaryRidgeRatio(binary, mask),
-    skeletonPixelCount: countEnabledPixels(thinning.skeleton),
+    binaryVisualizationPixels,
+    openedBinaryVisualizationPixels,
+    skeletonOverlayVisualizationPixels: createMinutiaeSkeletonOverlay(
+      primaryPipeline.skeleton,
+      stableSearchArea.mask,
+      width,
+      height
+    ),
+    binaryRidgeRatio: calculateBinaryRidgeRatio(
+      primaryPipeline.binary,
+      stableSearchArea.mask
+    ),
+    skeletonPixelCount: countEnabledPixels(primaryPipeline.skeleton),
     rawCandidateCount: rawCandidates.length,
-    thinningIterations: thinning.iterations,
-    prunedPixelCount,
-    bridgedPixelCount,
-    removedComponentPixelCount,
-    filledHolePixelCount,
+    thinningIterations: primaryPipeline.thinningIterations,
+    prunedPixelCount: primaryPipeline.prunedPixelCount,
+    bridgedPixelCount: primaryPipeline.bridgedPixelCount,
+    removedComponentPixelCount: primaryPipeline.removedComponentPixelCount,
+    filledHolePixelCount: primaryPipeline.filledHolePixelCount,
     supportCoverage: calculateMaskCoverage(candidateMask, mask),
     searchableAreaRatio: searchableRegion.totalRatio,
     largestSearchableRegionRatio: searchableRegion.largestRegionRatio,
-    ...detection.diagnostics,
+    binaryNoisePixelCount: primaryPipeline.binaryNoisePixelCount,
+    morphologicalOpeningStatus: primaryPipeline.morphologicalOpening.status,
+    morphologicalOpeningBeforePixelCount:
+      primaryPipeline.morphologicalOpening.beforePixelCount,
+    morphologicalOpeningAfterPixelCount:
+      primaryPipeline.morphologicalOpening.afterPixelCount,
+    morphologicalOpeningBeforeComponentCount:
+      primaryPipeline.morphologicalOpening.beforeComponentCount,
+    morphologicalOpeningAfterComponentCount:
+      primaryPipeline.morphologicalOpening.afterComponentCount,
+    orientationBridgeRemovedPixelCount:
+      primaryPipeline.orientationBridgeRemovedPixelCount,
+    topologyDiagnostics: primaryPipeline.topologyDiagnostics!,
+    ...primaryPipeline.detection.diagnostics,
+    confidenceHistogram: createConfidenceHistogram(rawCandidates),
+    thresholdConsensusPrimaryCount: thresholdConsensus.primaryCount,
+    thresholdConsensusLocationCount: thresholdConsensus.locationStableCount,
+    thresholdConsensusTypeCount: thresholdConsensus.typeStableCount,
+    thresholdLoopCandidateCount: thresholdLoopValidation.candidateCount,
+    thresholdLoopStableCount: thresholdLoopValidation.stableCount,
+    thresholdLoopRemovedCount: thresholdLoopValidation.removedLoopCount,
+    thresholdLoopRemovedPixelCount: thresholdLoopValidation.removedPixelCount,
   };
+}
+
+// Aynı ROI'yi belirli bir adaptif eşik perturbasyonuyla baştan sona işleyerek karşılaştırılabilir adaylar üretir.
+function runMinutiaeThresholdPipeline({
+  grayscale,
+  mask,
+  foregroundDistance,
+  stableSearchMask,
+  candidateDistance,
+  supportConfidence,
+  width,
+  height,
+  ridgePeriodPixels,
+  minimumSupportConfidence,
+  orientationAngles,
+  orientationFieldMask,
+  thresholdMultiplier,
+  collectTopologyDiagnostics,
+}: {
+  grayscale: Uint8Array;
+  mask: Uint8Array;
+  foregroundDistance: Uint16Array;
+  stableSearchMask: Uint8Array;
+  candidateDistance: Uint16Array;
+  supportConfidence: Uint8Array;
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+  minimumSupportConfidence: number;
+  orientationAngles?: Float32Array;
+  orientationFieldMask?: Uint8Array;
+  thresholdMultiplier: number;
+  collectTopologyDiagnostics: boolean;
+}): ThresholdPipelineResult {
+  const binary = createAdaptiveRidgeBinary(
+    grayscale,
+    mask,
+    foregroundDistance,
+    width,
+    height,
+    ridgePeriodPixels,
+    thresholdMultiplier
+  );
+  // Güvensiz yön bölgelerindeki koyu lekeleri topolojiye hiç sokmayız. Yalnızca
+  // görseli kırpmak yeterli değildir; aksi halde inceltme bu lekeleri bağlayabilir.
+  restrictBinaryToMask(binary, stableSearchMask);
+  const binaryNoisePixelCount = removeSmallBinaryComponents(
+    binary,
+    width,
+    height,
+    Math.max(12, Math.round(ridgePeriodPixels * 2))
+  );
+  cleanBinaryRidges(binary, candidateDistance, width, height);
+  restrictBinaryToMask(binary, stableSearchMask);
+  const filledHolePixelCount = fillSmallBinaryRidgeHoles(
+    binary,
+    candidateDistance,
+    width,
+    height,
+    ridgePeriodPixels
+  );
+  restrictBinaryToMask(binary, stableSearchMask);
+  const binaryTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(binary, width, height)
+    : undefined;
+  const referenceBinary = collectTopologyDiagnostics
+    ? new Uint8Array(binary)
+    : undefined;
+  const morphologicalOpening = applyControlledBinaryOpening({
+    binary,
+    width,
+    height,
+    ridgePeriodPixels,
+    allowedMask: stableSearchMask,
+  });
+  const openedTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(binary, width, height)
+    : undefined;
+  const orientationBridgeRemovedPixelCount =
+    orientationAngles && orientationFieldMask
+      ? removeOrientationInconsistentBinaryBridges({
+          binary,
+          orientationAngles,
+          orientationMask: orientationFieldMask,
+          maskDistance: foregroundDistance,
+          width,
+          height,
+          ridgePeriodPixels,
+        })
+      : 0;
+  if (referenceBinary && orientationAngles && orientationFieldMask) {
+    removeOrientationInconsistentBinaryBridges({
+      binary: referenceBinary,
+      orientationAngles,
+      orientationMask: orientationFieldMask,
+      maskDistance: foregroundDistance,
+      width,
+      height,
+      ridgePeriodPixels,
+    });
+  }
+  const orientationCleanedTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(binary, width, height)
+    : undefined;
+  const thinning = thinRidgesZhangSuen(binary, width, height);
+  const thinnedTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(thinning.skeleton, width, height)
+    : undefined;
+  const bridgedPixelCount = bridgeShortSkeletonGaps(
+    thinning.skeleton,
+    stableSearchMask,
+    width,
+    height,
+    ridgePeriodPixels,
+    orientationAngles,
+    orientationFieldMask
+  );
+  const bridgedTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(thinning.skeleton, width, height)
+    : undefined;
+  const removedComponentPixelCount = removeSmallSkeletonComponents(
+    thinning.skeleton,
+    width,
+    height,
+    Math.max(18, Math.round(ridgePeriodPixels * 3.5))
+  );
+  const componentFilteredTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(thinning.skeleton, width, height)
+    : undefined;
+  const prunedPixelCount = pruneShortSkeletonBranches(
+    thinning.skeleton,
+    width,
+    height,
+    Math.max(8, Math.round(ridgePeriodPixels * 1.8))
+  );
+  const prunedTopology = collectTopologyDiagnostics
+    ? summarizeRidgeTopology(thinning.skeleton, width, height)
+    : undefined;
+  const detection = detectMinutiaeFromSkeletonDetailed({
+    skeleton: thinning.skeleton,
+    maskDistance: candidateDistance,
+    foregroundDistance,
+    width,
+    height,
+    ridgePeriodPixels,
+    supportConfidence,
+    minimumSupportConfidence,
+  });
+
+  return {
+    binary,
+    referenceBinary,
+    skeleton: thinning.skeleton,
+    detection,
+    binaryNoisePixelCount,
+    morphologicalOpening,
+    orientationBridgeRemovedPixelCount,
+    filledHolePixelCount,
+    thinningIterations: thinning.iterations,
+    bridgedPixelCount,
+    removedComponentPixelCount,
+    prunedPixelCount,
+    topologyDiagnostics:
+      binaryTopology &&
+      openedTopology &&
+      orientationCleanedTopology &&
+      thinnedTopology &&
+      bridgedTopology &&
+      componentFilteredTopology &&
+      prunedTopology
+          ? {
+            binary: binaryTopology,
+            opened: openedTopology,
+            orientationCleaned: orientationCleanedTopology,
+            thinned: thinnedTopology,
+            bridged: bridgedTopology,
+            componentFiltered: componentFilteredTopology,
+            pruned: prunedTopology,
+          }
+        : undefined,
+  };
+}
+
+// Tek geçiş 3x3 çapraz erosion+dilation uygular; gerçek ridge alanını aşırı
+// azaltan veya görüntüyü çok fazla parçaya bölen sonucu otomatik olarak geri alır.
+export function applyControlledBinaryOpening({
+  binary,
+  width,
+  height,
+  ridgePeriodPixels,
+  allowedMask,
+}: {
+  binary: Uint8Array;
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+  allowedMask?: Uint8Array;
+}): MorphologicalOpeningResult {
+  const beforePixelCount = countEnabledPixels(binary);
+  const beforeComponentCount = countEnabledComponents(binary, width, height);
+  const unchangedResult = (
+    status: MorphologicalOpeningStatus
+  ): MorphologicalOpeningResult => ({
+    status,
+    beforePixelCount,
+    afterPixelCount: beforePixelCount,
+    beforeComponentCount,
+    afterComponentCount: beforeComponentCount,
+  });
+
+  if (ridgePeriodPixels < MIN_MORPHOLOGICAL_OPENING_RIDGE_PERIOD) {
+    return unchangedResult('skipped-small-period');
+  }
+
+  const eroded = erodeBinaryWithCrossKernel(binary, width, height);
+  const opened = dilateBinaryWithCrossKernel(eroded, width, height);
+  if (allowedMask) restrictBinaryToMask(opened, allowedMask);
+  const afterPixelCount = countEnabledPixels(opened);
+  const afterComponentCount = countEnabledComponents(opened, width, height);
+  if (afterPixelCount === beforePixelCount) {
+    return unchangedResult('no-change');
+  }
+
+  const retainedRatio = afterPixelCount / Math.max(beforePixelCount, 1);
+  if (retainedRatio < MIN_MORPHOLOGICAL_OPENING_PIXEL_RETENTION) {
+    return unchangedResult('rejected-pixel-loss');
+  }
+  const maximumComponentCount = Math.max(
+    beforeComponentCount * 3,
+    beforeComponentCount + 32
+  );
+  if (afterComponentCount > maximumComponentCount) {
+    return unchangedResult('rejected-fragmentation');
+  }
+
+  binary.set(opened);
+  return {
+    status: 'applied',
+    beforePixelCount,
+    afterPixelCount,
+    beforeComponentCount,
+    afterComponentCount,
+  };
+}
+
+// Binary ridge tamponunu doğrulanmış yön alanıyla kesiştirir; maske sınırı
+// dışında kalan pikseller daha sonraki morfoloji ve inceltme adımlarına ulaşmaz.
+function restrictBinaryToMask(binary: Uint8Array, allowedMask: Uint8Array) {
+  if (binary.length !== allowedMask.length) {
+    throw new RangeError('Binary ridge ve yön güven maskesi boyutları uyuşmuyor.');
+  }
+
+  for (let index = 0; index < binary.length; index += 1) {
+    if (!allowedMask[index]) binary[index] = 0;
+  }
+}
+
+function erodeBinaryWithCrossKernel(
+  binary: Uint8Array,
+  width: number,
+  height: number
+) {
+  const eroded = new Uint8Array(binary.length);
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = y * width + x;
+      if (
+        binary[index] &&
+        binary[index - 1] &&
+        binary[index + 1] &&
+        binary[index - width] &&
+        binary[index + width]
+      ) {
+        eroded[index] = 1;
+      }
+    }
+  }
+  return eroded;
+}
+
+function dilateBinaryWithCrossKernel(
+  binary: Uint8Array,
+  width: number,
+  height: number
+) {
+  const dilated = new Uint8Array(binary.length);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (!binary[index]) continue;
+      dilated[index] = 1;
+      if (x > 0) dilated[index - 1] = 1;
+      if (x + 1 < width) dilated[index + 1] = 1;
+      if (y > 0) dilated[index - width] = 1;
+      if (y + 1 < height) dilated[index + width] = 1;
+    }
+  }
+  return dilated;
+}
+
+// Tek bir eşikte görünen topoloji yerine, yakın eşiklerde aynı konum ve tipte tekrar eden adayları template'e alır.
+export function selectThresholdStableMinutiaeCandidates({
+  primaryCandidates,
+  variantCandidates,
+  ridgePeriodPixels,
+}: {
+  primaryCandidates: MinutiaCandidate[];
+  variantCandidates: MinutiaCandidate[][];
+  ridgePeriodPixels: number;
+}): ThresholdConsensusResult {
+  const locationHits = new Uint8Array(primaryCandidates.length);
+  const typeHits = new Uint8Array(primaryCandidates.length);
+  locationHits.fill(1);
+  typeHits.fill(1);
+  const maximumDistance = Math.max(3, ridgePeriodPixels * 0.7);
+
+  for (const candidates of variantCandidates) {
+    for (const index of matchConsensusCandidates(
+      primaryCandidates,
+      candidates,
+      maximumDistance,
+      false
+    )) {
+      locationHits[index] += 1;
+    }
+    for (const index of matchConsensusCandidates(
+      primaryCandidates,
+      candidates,
+      maximumDistance,
+      true
+    )) {
+      typeHits[index] += 1;
+    }
+  }
+
+  let locationStableCount = 0;
+  let typeStableCount = 0;
+  const requiredFullConsensus = variantCandidates.length + 1;
+  const candidates = primaryCandidates.flatMap((candidate, index) => {
+    const locationStable = locationHits[index] >= 2;
+    if (locationStable) locationStableCount += 1;
+    const requiredTypeHits =
+      candidate.type === 'bifurcation' ? requiredFullConsensus : 2;
+    const typeStable = locationStable && typeHits[index] >= requiredTypeHits;
+    if (!typeStable) return [];
+    typeStableCount += 1;
+    return [{
+      ...candidate,
+      confidence: Math.round(
+        clamp(
+          candidate.confidence +
+            (typeHits[index] === requiredFullConsensus ? 4 : -2),
+          0,
+          100
+        )
+      ),
+    }];
+  });
+
+  return {
+    candidates,
+    primaryCount: primaryCandidates.length,
+    locationStableCount,
+    typeStableCount,
+  };
+}
+
+// Ana eşikte oluşan küçük kapalı çevrimleri komşu eşiklerde arar. En az iki
+// eşikte tekrarlanan çevrim korunur; yalnızca sıkı eşikte desteklenmeyen ve
+// güvenilir ridge yönüne belirgin biçimde aykırı bağlantılar yerel olarak açılır.
+export function removeThresholdUnstableSkeletonLoops({
+  skeleton,
+  variantSkeletons,
+  width,
+  height,
+  ridgePeriodPixels,
+  orientationAngles,
+  orientationMask,
+}: {
+  skeleton: Uint8Array;
+  variantSkeletons: Uint8Array[];
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+  orientationAngles?: Float32Array;
+  orientationMask?: Uint8Array;
+}): ThresholdLoopValidationResult {
+  const emptyResult: ThresholdLoopValidationResult = {
+    candidateCount: 0,
+    stableCount: 0,
+    unstableCount: 0,
+    removedLoopCount: 0,
+    removedPixelCount: 0,
+  };
+  const pixelCount = width * height;
+  if (
+    width < 3 ||
+    height < 3 ||
+    skeleton.length !== pixelCount ||
+    variantSkeletons.some((variant) => variant.length !== pixelCount)
+  ) {
+    return emptyResult;
+  }
+
+  const period = clamp(ridgePeriodPixels, 5, 14);
+  const primaryLoops = findSmallSkeletonLoops(
+    skeleton,
+    width,
+    height,
+    period
+  );
+  const variantLoops = variantSkeletons.map((variant) =>
+    findSmallSkeletonLoops(variant, width, height, period)
+  );
+  const stableLoops = primaryLoops.filter((loop) =>
+    variantLoops.some((loops) =>
+      loops.some((candidate) => skeletonLoopsMatch(loop, candidate, period))
+    )
+  );
+  const unstableLoops = primaryLoops.filter(
+    (loop) => !stableLoops.includes(loop)
+  );
+
+  if (
+    unstableLoops.length === 0 ||
+    !orientationAngles ||
+    !orientationMask ||
+    orientationAngles.length !== pixelCount ||
+    orientationMask.length !== pixelCount ||
+    variantSkeletons.length === 0
+  ) {
+    return {
+      candidateCount: primaryLoops.length,
+      stableCount: stableLoops.length,
+      unstableCount: unstableLoops.length,
+      removedLoopCount: 0,
+      removedPixelCount: 0,
+    };
+  }
+
+  const strictSkeleton = variantSkeletons[variantSkeletons.length - 1];
+  const relaxedSkeleton = variantSkeletons[0];
+  const maximumCutsPerLoop = Math.max(1, Math.round(period * 0.35));
+  let removedLoopCount = 0;
+  let removedPixelCount = 0;
+
+  for (const originalLoop of unstableLoops) {
+    let currentLoop = findMatchingSkeletonLoop(
+      skeleton,
+      width,
+      height,
+      period,
+      originalLoop
+    );
+    if (!currentLoop) continue;
+
+    const tentativeRemovals: number[] = [];
+    for (let attempt = 0; attempt < maximumCutsPerLoop; attempt += 1) {
+      const cutIndex = selectUnstableLoopCutPixel({
+        loop: currentLoop,
+        skeleton,
+        relaxedSkeleton,
+        strictSkeleton,
+        orientationAngles,
+        orientationMask,
+        width,
+        height,
+        ridgePeriodPixels: period,
+      });
+      if (cutIndex === undefined) break;
+
+      skeleton[cutIndex] = 0;
+      tentativeRemovals.push(cutIndex);
+      currentLoop = findMatchingSkeletonLoop(
+        skeleton,
+        width,
+        height,
+        period,
+        originalLoop
+      );
+      if (!currentLoop) break;
+    }
+
+    if (currentLoop) {
+      // Tek bir pikseli kesip topolojiyi değiştiremediysek yarım müdahaleyi geri alırız.
+      for (const index of tentativeRemovals) skeleton[index] = 1;
+      continue;
+    }
+
+    removedLoopCount += 1;
+    removedPixelCount += tentativeRemovals.length;
+  }
+
+  return {
+    candidateCount: primaryLoops.length,
+    stableCount: stableLoops.length,
+    unstableCount: unstableLoops.length,
+    removedLoopCount,
+    removedPixelCount,
+  };
+}
+
+// İskeletin dört-komşulukla dışarı ulaşamayan arka plan bileşenlerini küçük
+// çevrim içleri olarak bulur. Büyük gerçek enclosure'lar bu yerel filtreden çıkarılır.
+function findSmallSkeletonLoops(
+  skeleton: Uint8Array,
+  width: number,
+  height: number,
+  ridgePeriodPixels: number
+) {
+  const visited = new Uint8Array(skeleton.length);
+  const queue = new Int32Array(skeleton.length);
+  const loops: SkeletonLoop[] = [];
+  const minimumArea = Math.max(
+    2,
+    Math.round(ridgePeriodPixels * ridgePeriodPixels * 0.04)
+  );
+  const maximumArea = Math.max(
+    20,
+    Math.round(ridgePeriodPixels * ridgePeriodPixels * 2.5)
+  );
+  const maximumSpan = Math.max(8, Math.round(ridgePeriodPixels * 2.75));
+  const minimumBoundaryPixels = Math.max(6, Math.round(ridgePeriodPixels * 0.75));
+  const cardinalOffsets = [
+    [0, -1],
+    [1, 0],
+    [0, 1],
+    [-1, 0],
+  ] as const;
+
+  for (let startIndex = 0; startIndex < skeleton.length; startIndex += 1) {
+    if (skeleton[startIndex] || visited[startIndex]) continue;
+    let queueStart = 0;
+    let queueEnd = 1;
+    queue[0] = startIndex;
+    visited[startIndex] = 1;
+    let enclosed = true;
+    let minimumX = width;
+    let maximumX = -1;
+    let minimumY = height;
+    let maximumY = -1;
+    let coordinateTotalX = 0;
+    let coordinateTotalY = 0;
+
+    while (queueStart < queueEnd) {
+      const index = queue[queueStart];
+      queueStart += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+      minimumX = Math.min(minimumX, x);
+      maximumX = Math.max(maximumX, x);
+      minimumY = Math.min(minimumY, y);
+      maximumY = Math.max(maximumY, y);
+      coordinateTotalX += x;
+      coordinateTotalY += y;
+      if (x === 0 || x === width - 1 || y === 0 || y === height - 1) {
+        enclosed = false;
+      }
+
+      for (const [deltaX, deltaY] of cardinalOffsets) {
+        const nextX = x + deltaX;
+        const nextY = y + deltaY;
+        if (
+          nextX < 0 ||
+          nextX >= width ||
+          nextY < 0 ||
+          nextY >= height
+        ) {
+          continue;
+        }
+        const nextIndex = nextY * width + nextX;
+        if (skeleton[nextIndex] || visited[nextIndex]) continue;
+        visited[nextIndex] = 1;
+        queue[queueEnd] = nextIndex;
+        queueEnd += 1;
+      }
+    }
+
+    const componentWidth = maximumX - minimumX + 1;
+    const componentHeight = maximumY - minimumY + 1;
+    if (
+      !enclosed ||
+      queueEnd < minimumArea ||
+      queueEnd > maximumArea ||
+      componentWidth > maximumSpan ||
+      componentHeight > maximumSpan
+    ) {
+      continue;
+    }
+
+    const boundary = new Set<number>();
+    for (let componentIndex = 0; componentIndex < queueEnd; componentIndex += 1) {
+      const index = queue[componentIndex];
+      const x = index % width;
+      const y = Math.floor(index / width);
+      for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
+        for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
+          if (deltaX === 0 && deltaY === 0) continue;
+          const nextX = x + deltaX;
+          const nextY = y + deltaY;
+          if (
+            nextX < 0 ||
+            nextX >= width ||
+            nextY < 0 ||
+            nextY >= height
+          ) {
+            continue;
+          }
+          const nextIndex = nextY * width + nextX;
+          if (skeleton[nextIndex]) boundary.add(nextIndex);
+        }
+      }
+    }
+    if (boundary.size < minimumBoundaryPixels) continue;
+
+    loops.push({
+      centerX: coordinateTotalX / queueEnd,
+      centerY: coordinateTotalY / queueEnd,
+      area: queueEnd,
+      left: minimumX,
+      top: minimumY,
+      right: maximumX,
+      bottom: maximumY,
+      boundaryIndexes: [...boundary],
+    });
+  }
+
+  return loops;
+}
+
+function skeletonLoopsMatch(
+  first: SkeletonLoop,
+  second: SkeletonLoop,
+  ridgePeriodPixels: number
+) {
+  const centerDistance = Math.hypot(
+    first.centerX - second.centerX,
+    first.centerY - second.centerY
+  );
+  const areaRatio =
+    Math.max(first.area, second.area) / Math.max(1, Math.min(first.area, second.area));
+  const firstWidth = first.right - first.left + 1;
+  const firstHeight = first.bottom - first.top + 1;
+  const secondWidth = second.right - second.left + 1;
+  const secondHeight = second.bottom - second.top + 1;
+  const maximumSpanDifference = Math.max(4, ridgePeriodPixels * 1.25);
+  return (
+    centerDistance <= Math.max(3, ridgePeriodPixels * 0.85) &&
+    areaRatio <= 4 &&
+    Math.abs(firstWidth - secondWidth) <= maximumSpanDifference &&
+    Math.abs(firstHeight - secondHeight) <= maximumSpanDifference
+  );
+}
+
+function findMatchingSkeletonLoop(
+  skeleton: Uint8Array,
+  width: number,
+  height: number,
+  ridgePeriodPixels: number,
+  target: SkeletonLoop
+) {
+  return findSmallSkeletonLoops(
+    skeleton,
+    width,
+    height,
+    ridgePeriodPixels
+  ).find((loop) => skeletonLoopsMatch(loop, target, ridgePeriodPixels));
+}
+
+function selectUnstableLoopCutPixel({
+  loop,
+  skeleton,
+  relaxedSkeleton,
+  strictSkeleton,
+  orientationAngles,
+  orientationMask,
+  width,
+  height,
+  ridgePeriodPixels,
+}: {
+  loop: SkeletonLoop;
+  skeleton: Uint8Array;
+  relaxedSkeleton: Uint8Array;
+  strictSkeleton: Uint8Array;
+  orientationAngles: Float32Array;
+  orientationMask: Uint8Array;
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+}) {
+  const candidates: { index: number; score: number }[] = [];
+  const localRadius = Math.max(2, Math.round(ridgePeriodPixels * 0.35));
+
+  for (const index of loop.boundaryIndexes) {
+    if (!skeleton[index] || !orientationMask[index]) continue;
+    const expectedRadians = orientationAngles[index];
+    if (!Number.isFinite(expectedRadians)) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    if (hasSkeletonPixelNear(strictSkeleton, width, height, x, y, 1)) {
+      continue;
+    }
+
+    const neighborCount = countNeighbors(skeleton, width, x, y);
+    if (neighborCount < 2 || neighborCount > 4) continue;
+    const localAxis = estimateSkeletonAxis(
+      skeleton,
+      width,
+      height,
+      x,
+      y,
+      localRadius
+    );
+    const expectedAxis = normalizeAxisDegrees(
+      (expectedRadians * 180) / Math.PI
+    );
+    const orientationMismatch = axisDifferenceDegrees(localAxis, expectedAxis);
+    if (orientationMismatch < 40) continue;
+
+    const relaxedUnsupported = !hasSkeletonPixelNear(
+      relaxedSkeleton,
+      width,
+      height,
+      x,
+      y,
+      1
+    );
+    candidates.push({
+      index,
+      score:
+        orientationMismatch +
+        (relaxedUnsupported ? 20 : 0) -
+        Math.abs(neighborCount - 2) * 8,
+    });
+  }
+
+  candidates.sort((first, second) => second.score - first.score);
+  return candidates[0]?.index;
+}
+
+function hasSkeletonPixelNear(
+  skeleton: Uint8Array,
+  width: number,
+  height: number,
+  centerX: number,
+  centerY: number,
+  radius: number
+) {
+  for (
+    let y = Math.max(0, centerY - radius);
+    y <= Math.min(height - 1, centerY + radius);
+    y += 1
+  ) {
+    for (
+      let x = Math.max(0, centerX - radius);
+      x <= Math.min(width - 1, centerX + radius);
+      x += 1
+    ) {
+      if (skeleton[y * width + x]) return true;
+    }
+  }
+  return false;
+}
+
+// Bir perturbasyon adayının birden fazla ana adayı desteklememesi için en yakın çiftleri açgözlü biçimde tekilleştirir.
+function matchConsensusCandidates(
+  primaryCandidates: MinutiaCandidate[],
+  candidates: MinutiaCandidate[],
+  maximumDistance: number,
+  requireSameType: boolean
+) {
+  const pairs: { primaryIndex: number; candidateIndex: number; distance: number }[] = [];
+  for (let primaryIndex = 0; primaryIndex < primaryCandidates.length; primaryIndex += 1) {
+    const primary = primaryCandidates[primaryIndex];
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+      const candidate = candidates[candidateIndex];
+      if (requireSameType && primary.type !== candidate.type) continue;
+      const candidateDistance = Math.hypot(
+        primary.x - candidate.x,
+        primary.y - candidate.y
+      );
+      if (candidateDistance <= maximumDistance) {
+        pairs.push({ primaryIndex, candidateIndex, distance: candidateDistance });
+      }
+    }
+  }
+  pairs.sort((first, second) => first.distance - second.distance);
+
+  const matchedPrimary = new Set<number>();
+  const matchedCandidates = new Set<number>();
+  for (const pair of pairs) {
+    if (
+      matchedPrimary.has(pair.primaryIndex) ||
+      matchedCandidates.has(pair.candidateIndex)
+    ) {
+      continue;
+    }
+    matchedPrimary.add(pair.primaryIndex);
+    matchedCandidates.add(pair.candidateIndex);
+  }
+  return matchedPrimary;
+}
+
+// Template'e gerçekten giren kararlı adayların güven dağılımını raporlar.
+function createConfidenceHistogram(candidates: MinutiaCandidate[]) {
+  const histogram = new Array<number>(10).fill(0);
+  for (const candidate of candidates) {
+    histogram[Math.min(9, Math.floor(candidate.confidence / 10))] += 1;
+  }
+  return histogram;
+}
+
+// Thinning öncesi ridge bantlarını referans görüntüyle aynı siyah ridge/beyaz zemin biçiminde gösterir.
+function createBinaryRidgeVisualization(
+  binary: Uint8Array,
+  mask: Uint8Array,
+  width: number,
+  height: number
+) {
+  const pixels = new Uint8Array(width * height);
+  pixels.fill(255);
+  for (let index = 0; index < pixels.length; index += 1) {
+    if (mask[index] && binary[index]) pixels[index] = 0;
+  }
+  return pixels;
+}
+
+// Nokta görüntüsündeki inceltilmiş ridge iskeletini kanonik ROI üzerine bindirmek için
+// arka planı tamamen şeffaf, koordinatları değişmemiş beyaz bir RGBA katman üretir.
+function createMinutiaeSkeletonOverlay(
+  skeleton: Uint8Array,
+  mask: Uint8Array,
+  width: number,
+  height: number
+) {
+  const pixels = new Uint8Array(width * height * 4);
+  for (let index = 0; index < skeleton.length; index += 1) {
+    if (!mask[index] || !skeleton[index]) continue;
+    const offset = index * 4;
+    pixels[offset] = 255;
+    pixels[offset + 1] = 255;
+    pixels[offset + 2] = 255;
+    pixels[offset + 3] = 255;
+  }
+  return pixels;
+}
+
+// Parmak tabanındaki eklem/kıvrım bölgesini minutiae aramasından ayıran geçici distal maske.
+export function createDistalMinutiaeMask(
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  retainedHeightRatio = 0.84
+) {
+  const distalMask = new Uint8Array(mask);
+  let minimumY = height;
+  let maximumY = -1;
+
+  for (let index = 0; index < mask.length; index += 1) {
+    if (!mask[index]) continue;
+    const y = Math.floor(index / width);
+    minimumY = Math.min(minimumY, y);
+    maximumY = Math.max(maximumY, y);
+  }
+
+  if (maximumY < minimumY) return distalMask;
+  const retainedMaximumY = Math.floor(
+    minimumY + (maximumY - minimumY) * retainedHeightRatio
+  );
+
+  for (let y = retainedMaximumY + 1; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      distalMask[y * width + x] = 0;
+    }
+  }
+
+  return distalMask;
+}
+
+// Ridge bantları ve iskelet için bileşen, uç ve çatallanma piksel sayılarını aynı ölçekte raporlar.
+function summarizeRidgeTopology(
+  image: Uint8Array,
+  width: number,
+  height: number
+): MinutiaeTopologyStageDiagnostics {
+  let pixelCount = 0;
+  let endingPixelCount = 0;
+  let bifurcationPixelCount = 0;
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = y * width + x;
+      if (!image[index]) continue;
+      pixelCount += 1;
+      const crossingNumber = calculateCrossingNumber(
+        getClockwiseNeighbors(image, width, x, y)
+      );
+      if (crossingNumber === 1) endingPixelCount += 1;
+      if (crossingNumber === 3) bifurcationPixelCount += 1;
+    }
+  }
+
+  return {
+    pixelCount,
+    componentCount: countEnabledComponents(image, width, height),
+    endingPixelCount,
+    bifurcationPixelCount,
+  };
+}
+
+// Sekizli komşuluk bileşen sayısı, ridge kopukluğunu yalnızca piksel oranından bağımsız gösterir.
+function countEnabledComponents(
+  image: Uint8Array,
+  width: number,
+  height: number
+) {
+  const visited = new Uint8Array(image.length);
+  const queue = new Int32Array(image.length);
+  let componentCount = 0;
+
+  for (let startIndex = 0; startIndex < image.length; startIndex += 1) {
+    if (!image[startIndex] || visited[startIndex]) continue;
+    componentCount += 1;
+    let queueStart = 0;
+    let queueEnd = 1;
+    queue[0] = startIndex;
+    visited[startIndex] = 1;
+
+    while (queueStart < queueEnd) {
+      const index = queue[queueStart];
+      queueStart += 1;
+      const x = index % width;
+      const y = Math.floor(index / width);
+
+      for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
+        for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
+          if (deltaX === 0 && deltaY === 0) continue;
+          const nextX = x + deltaX;
+          const nextY = y + deltaY;
+          if (
+            nextX < 0 ||
+            nextX >= width ||
+            nextY < 0 ||
+            nextY >= height
+          ) {
+            continue;
+          }
+          const nextIndex = nextY * width + nextX;
+          if (!image[nextIndex] || visited[nextIndex]) continue;
+          visited[nextIndex] = 1;
+          queue[queueEnd] = nextIndex;
+          queueEnd += 1;
+        }
+      }
+    }
+  }
+
+  return componentCount;
 }
 
 // Testlerde ve ileride template doğrulamasında kullanılmak üzere hazır iskeletten aday çıkarır.
@@ -251,6 +1388,9 @@ export function detectMinutiaeFromSkeletonDetailed({
 }) {
   const candidates: MinutiaCandidate[] = [];
   let crossingNumberCandidateCount = 0;
+  let bifurcationCrossingNumberCandidateCount = 0;
+  let bifurcationBranchValidatedCount = 0;
+  let bifurcationRingValidatedCount = 0;
   let branchValidatedCandidateCount = 0;
   let endingCandidateCount = 0;
   let bifurcationCandidateCount = 0;
@@ -279,6 +1419,9 @@ export function detectMinutiaeFromSkeletonDetailed({
             : null;
       if (!type) continue;
       crossingNumberCandidateCount += 1;
+      if (type === 'bifurcation') {
+        bifurcationCrossingNumberCandidateCount += 1;
+      }
 
       const minimumBranchLength =
         type === 'bifurcation'
@@ -304,6 +1447,7 @@ export function detectMinutiaeFromSkeletonDetailed({
       ) {
         continue;
       }
+      if (type === 'bifurcation') bifurcationBranchValidatedCount += 1;
       if (
         type === 'bifurcation' &&
         !hasStableBifurcationRingTopology(
@@ -336,6 +1480,7 @@ export function detectMinutiaeFromSkeletonDetailed({
       ) {
         continue;
       }
+      if (type === 'bifurcation') bifurcationRingValidatedCount += 1;
       branchValidatedCandidateCount += 1;
       if (type === 'ending') endingCandidateCount += 1;
       if (type === 'bifurcation') bifurcationCandidateCount += 1;
@@ -357,14 +1502,32 @@ export function detectMinutiaeFromSkeletonDetailed({
     }
   }
 
-  const stabilityValidatedCandidates = rejectUnstableCandidatePairs(
+  const microCycleValidatedCandidates = rejectShortBifurcationCycles({
     candidates,
+    skeleton,
+    width,
+    height,
+    ridgePeriodPixels,
+  });
+  const bifurcationMicroCycleValidatedCount =
+    microCycleValidatedCandidates.filter(
+      (candidate) => candidate.type === 'bifurcation'
+    ).length;
+  const stabilityValidatedCandidates = rejectUnstableCandidatePairs(
+    microCycleValidatedCandidates,
     ridgePeriodPixels
   );
+  const bifurcationStabilityValidatedCount =
+    stabilityValidatedCandidates.filter(
+      (candidate) => candidate.type === 'bifurcation'
+    ).length;
   const suppressedCandidates = suppressNearbyCandidates(
     stabilityValidatedCandidates,
     ridgePeriodPixels
   );
+  const bifurcationSuppressionCount = suppressedCandidates.filter(
+    (candidate) => candidate.type === 'bifurcation'
+  ).length;
   const confidenceHistogram = new Array<number>(10).fill(0);
   for (const candidate of suppressedCandidates) {
     confidenceHistogram[Math.min(9, Math.floor(candidate.confidence / 10))] += 1;
@@ -374,6 +1537,12 @@ export function detectMinutiaeFromSkeletonDetailed({
     candidates: suppressedCandidates,
     diagnostics: {
       crossingNumberCandidateCount,
+      bifurcationCrossingNumberCandidateCount,
+      bifurcationBranchValidatedCount,
+      bifurcationRingValidatedCount,
+      bifurcationMicroCycleValidatedCount,
+      bifurcationStabilityValidatedCount,
+      bifurcationSuppressionCount,
       branchValidatedCandidateCount,
       suppressionCandidateCount: suppressedCandidates.length,
       endingCandidateCount,
@@ -601,7 +1770,8 @@ function createAdaptiveRidgeBinary(
   maskDistance: Uint16Array,
   width: number,
   height: number,
-  ridgePeriodPixels: number
+  ridgePeriodPixels: number,
+  thresholdMultiplier = 1
 ) {
   const binary = new Uint8Array(mask.length);
   const integral = createIntegralImage(grayscale, width, height);
@@ -628,12 +1798,69 @@ function createAdaptiveRidgeBinary(
       const localMean =
         readIntegralSum(integral, width, left, top, right, bottom) /
         foregroundCount;
-      const thresholdOffset = Math.max(2, ridgePeriodPixels * 0.22);
+      const thresholdOffset =
+        Math.max(2, ridgePeriodPixels * 0.22) * thresholdMultiplier;
       if (grayscale[index] < localMean - thresholdOffset) binary[index] = 1;
     }
   }
 
   return binary;
+}
+
+// Adaptif eşikten kalan çok küçük, gerçek ridge oluşturamayacak ikili bileşenleri kaldırır.
+// Eşik ridge periyoduna bağlıdır; ana ridge bantlarını koparmamak için bilinçli olarak düşüktür.
+export function removeSmallBinaryComponents(
+  binary: Uint8Array,
+  width: number,
+  height: number,
+  minimumComponentPixels: number
+) {
+  const visited = new Uint8Array(binary.length);
+  let removedPixelCount = 0;
+
+  for (let startIndex = 0; startIndex < binary.length; startIndex += 1) {
+    if (!binary[startIndex] || visited[startIndex]) continue;
+
+    const component = [startIndex];
+    visited[startIndex] = 1;
+
+    for (
+      let componentIndex = 0;
+      componentIndex < component.length;
+      componentIndex += 1
+    ) {
+      const index = component[componentIndex];
+      const x = index % width;
+      const y = Math.floor(index / width);
+
+      for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
+        for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
+          if (deltaX === 0 && deltaY === 0) continue;
+          const nextX = x + deltaX;
+          const nextY = y + deltaY;
+          if (
+            nextX < 0 ||
+            nextY < 0 ||
+            nextX >= width ||
+            nextY >= height
+          ) {
+            continue;
+          }
+          const nextIndex = nextY * width + nextX;
+          if (binary[nextIndex] && !visited[nextIndex]) {
+            visited[nextIndex] = 1;
+            component.push(nextIndex);
+          }
+        }
+      }
+    }
+
+    if (component.length >= minimumComponentPixels) continue;
+    for (const index of component) binary[index] = 0;
+    removedPixelCount += component.length;
+  }
+
+  return removedPixelCount;
 }
 
 // Tek piksellik gürültüyü kaldırıp küçük ridge boşluklarını kapatmadan önce yalnızca güçlü komşulukları korur.
@@ -751,6 +1978,217 @@ export function fillSmallBinaryRidgeHoles(
   return filledPixelCount;
 }
 
+// Güvenilir yerel ridge eksenine yaklaşık dik ilerleyen kısa ikili bağlantıları,
+// inceltme bu bağlantıları kalıcı iskelet çatallarına çevirmeden önce keser.
+export function removeOrientationInconsistentBinaryBridges({
+  binary,
+  orientationAngles,
+  orientationMask,
+  maskDistance,
+  width,
+  height,
+  ridgePeriodPixels,
+}: {
+  binary: Uint8Array;
+  orientationAngles: Float32Array;
+  orientationMask: Uint8Array;
+  maskDistance: Uint16Array;
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+}) {
+  if (
+    binary.length !== width * height ||
+    orientationAngles.length !== binary.length ||
+    orientationMask.length !== binary.length ||
+    maskDistance.length !== binary.length
+  ) {
+    return 0;
+  }
+
+  const period = clamp(ridgePeriodPixels, 5, 14);
+  const probeLength = Math.max(5, Math.round(period * 0.95));
+  const maximumTangentRun = Math.max(2, Math.round(period * 0.35));
+  const minimumNormalRun = Math.max(2, Math.round(period * 0.35));
+  const minimumNormalTotal = Math.max(5, Math.round(period * 0.75));
+  const minimumAxisAdvantage = Math.max(2, Math.round(period * 0.35));
+  const boundaryMargin = Math.max(3, Math.round(period * 0.55));
+  const candidateMask = new Uint8Array(binary.length);
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = y * width + x;
+      const angle = orientationAngles[index];
+      if (
+        !binary[index] ||
+        !orientationMask[index] ||
+        maskDistance[index] < boundaryMargin ||
+        !Number.isFinite(angle)
+      ) {
+        continue;
+      }
+
+      const tangentX = Math.cos(angle);
+      const tangentY = Math.sin(angle);
+      const normalX = -tangentY;
+      const normalY = tangentX;
+      const tangentForward = countDirectionalBinaryRun(
+        binary,
+        width,
+        height,
+        x,
+        y,
+        tangentX,
+        tangentY,
+        probeLength
+      );
+      const tangentBackward = countDirectionalBinaryRun(
+        binary,
+        width,
+        height,
+        x,
+        y,
+        -tangentX,
+        -tangentY,
+        probeLength
+      );
+      if (
+        tangentForward > maximumTangentRun ||
+        tangentBackward > maximumTangentRun
+      ) {
+        continue;
+      }
+
+      const normalForward = countDirectionalBinaryRun(
+        binary,
+        width,
+        height,
+        x,
+        y,
+        normalX,
+        normalY,
+        probeLength
+      );
+      const normalBackward = countDirectionalBinaryRun(
+        binary,
+        width,
+        height,
+        x,
+        y,
+        -normalX,
+        -normalY,
+        probeLength
+      );
+      const tangentTotal = tangentForward + tangentBackward;
+      const normalTotal = normalForward + normalBackward;
+      if (
+        normalForward < minimumNormalRun ||
+        normalBackward < minimumNormalRun ||
+        normalTotal < minimumNormalTotal ||
+        normalTotal < tangentTotal + minimumAxisAdvantage
+      ) {
+        continue;
+      }
+
+      candidateMask[index] = 1;
+    }
+  }
+
+  const visited = new Uint8Array(binary.length);
+  const maximumCandidateSpan = Math.max(4, Math.round(period * 0.9));
+  const maximumCandidatePixels = Math.max(
+    10,
+    Math.round(period * period * 0.55)
+  );
+  let removedPixelCount = 0;
+
+  for (let startIndex = 0; startIndex < candidateMask.length; startIndex += 1) {
+    if (!candidateMask[startIndex] || visited[startIndex]) continue;
+    const component = [startIndex];
+    visited[startIndex] = 1;
+    let minimumX = startIndex % width;
+    let maximumX = minimumX;
+    let minimumY = Math.floor(startIndex / width);
+    let maximumY = minimumY;
+
+    for (
+      let componentIndex = 0;
+      componentIndex < component.length;
+      componentIndex += 1
+    ) {
+      const index = component[componentIndex];
+      const x = index % width;
+      const y = Math.floor(index / width);
+      minimumX = Math.min(minimumX, x);
+      maximumX = Math.max(maximumX, x);
+      minimumY = Math.min(minimumY, y);
+      maximumY = Math.max(maximumY, y);
+
+      for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
+        for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
+          if (deltaX === 0 && deltaY === 0) continue;
+          const nextX = x + deltaX;
+          const nextY = y + deltaY;
+          if (
+            nextX < 0 ||
+            nextX >= width ||
+            nextY < 0 ||
+            nextY >= height
+          ) {
+            continue;
+          }
+          const nextIndex = nextY * width + nextX;
+          if (!candidateMask[nextIndex] || visited[nextIndex]) continue;
+          visited[nextIndex] = 1;
+          component.push(nextIndex);
+        }
+      }
+    }
+
+    const componentSpan = Math.max(
+      maximumX - minimumX + 1,
+      maximumY - minimumY + 1
+    );
+    if (
+      componentSpan > maximumCandidateSpan ||
+      component.length > maximumCandidatePixels
+    ) {
+      continue;
+    }
+    for (const index of component) binary[index] = 0;
+    removedPixelCount += component.length;
+  }
+
+  return removedPixelCount;
+}
+
+// Bir eksende merkezden itibaren kesintisiz ikili ridge uzunluğunu, çapraz açılarda
+// aynı pikseli iki kez saymadan ölçer.
+function countDirectionalBinaryRun(
+  binary: Uint8Array,
+  width: number,
+  height: number,
+  startX: number,
+  startY: number,
+  directionX: number,
+  directionY: number,
+  maximumLength: number
+) {
+  let count = 0;
+  let previousIndex = startY * width + startX;
+  for (let distance = 1; distance <= maximumLength; distance += 1) {
+    const x = Math.round(startX + directionX * distance);
+    const y = Math.round(startY + directionY * distance);
+    if (x < 0 || x >= width || y < 0 || y >= height) break;
+    const index = y * width + x;
+    if (index === previousIndex) continue;
+    previousIndex = index;
+    if (!binary[index]) break;
+    count += 1;
+  }
+  return count;
+}
+
 // İkili ridge bantlarını topolojiyi koruyarak tek piksel kalınlığında iskelete indirir.
 function thinRidgesZhangSuen(
   binary: Uint8Array,
@@ -804,7 +2242,9 @@ export function bridgeShortSkeletonGaps(
   searchMask: Uint8Array,
   width: number,
   height: number,
-  ridgePeriodPixels: number
+  ridgePeriodPixels: number,
+  orientationAngles?: Float32Array,
+  orientationMask?: Uint8Array
 ) {
   const endpoints: (PixelPoint & { angleDegrees: number })[] = [];
   const maximumGap = Math.max(4, Math.round(ridgePeriodPixels * 0.7));
@@ -860,6 +2300,19 @@ export function bridgeShortSkeletonGaps(
       ) {
         continue;
       }
+      if (
+        !isGapBridgeConsistentWithOrientation({
+          first,
+          second,
+          connectionAxis,
+          orientationAngles,
+          orientationMask,
+          width,
+          height,
+        })
+      ) {
+        continue;
+      }
 
       const points = createLinePoints(first.x, first.y, second.x, second.y);
       if (
@@ -904,6 +2357,59 @@ export function bridgeShortSkeletonGaps(
   }
 
   return bridgedPixelCount;
+}
+
+// İnceltme öncesinde kesilen enine bağların, uçlar birbirine bakıyor diye yeniden
+// kurulmasını engeller; yön alanı yoksa eski güvenli davranışı korur.
+function isGapBridgeConsistentWithOrientation({
+  first,
+  second,
+  connectionAxis,
+  orientationAngles,
+  orientationMask,
+  width,
+  height,
+}: {
+  first: PixelPoint;
+  second: PixelPoint;
+  connectionAxis: number;
+  orientationAngles?: Float32Array;
+  orientationMask?: Uint8Array;
+  width: number;
+  height: number;
+}) {
+  if (
+    !orientationAngles ||
+    !orientationMask ||
+    orientationAngles.length !== width * height ||
+    orientationMask.length !== width * height
+  ) {
+    return true;
+  }
+
+  const samples = [
+    first,
+    {
+      x: Math.round((first.x + second.x) / 2),
+      y: Math.round((first.y + second.y) / 2),
+    },
+    second,
+  ];
+  for (const sample of samples) {
+    const index = sample.y * width + sample.x;
+    const angleRadians = orientationAngles[index];
+    if (!orientationMask[index] || !Number.isFinite(angleRadians)) continue;
+    const expectedAxis = normalizeAxisDegrees(
+      (angleRadians * 180) / Math.PI
+    );
+    if (
+      axisDifferenceDegrees(expectedAxis, connectionAxis) >
+      MAX_ORIENTATION_GAP_AXIS_DIFFERENCE_DEGREES
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Köprünün başka bir ridge'e değmesini veya onu kesmesini engelleyerek sahte çatallanma oluşmasını önler.
@@ -1064,7 +2570,8 @@ function countSustainedBranches(
   return sustained;
 }
 
-// Merkezden uzaktaki halkada tam üç iskelet çıkışı arayarak kısa köprü ve ağ birleşmelerini eler.
+// Merkezden çıkan üç dalı ayrı izleyerek paralel ridge'lerin halkadaki piksellerinin
+// gerçek çatallanma dalı sanılmasını önler.
 function hasStableBifurcationRingTopology(
   skeleton: Uint8Array,
   width: number,
@@ -1073,78 +2580,132 @@ function hasStableBifurcationRingTopology(
   centerY: number,
   ridgePeriodPixels: number
 ) {
-  const radius = Math.max(
-    8,
-    Math.round(
-      ridgePeriodPixels * BIFURCATION_RING_RADIUS_PERIOD_FACTOR
+  const starts = getDistinctBranchStarts(
+    skeleton,
+    width,
+    centerX,
+    centerY
+  );
+  if (starts.length !== 3) return false;
+
+  const requiredLength = Math.max(
+    12,
+    Math.round(ridgePeriodPixels * 1.8)
+  );
+  const traceLength = Math.max(
+    requiredLength,
+    Math.round(ridgePeriodPixels * BIFURCATION_RING_RADIUS_PERIOD_FACTOR)
+  );
+  const traces = starts.map((start) =>
+    traceBifurcationBranch(
+      skeleton,
+      width,
+      height,
+      centerX,
+      centerY,
+      start,
+      traceLength
     )
   );
-  const thickness = Math.max(2, Math.round(ridgePeriodPixels * 0.3));
-  const innerRadiusSquared = (radius - thickness) ** 2;
-  const outerRadiusSquared = (radius + thickness) ** 2;
-  const ringPixels = new Set<number>();
+  if (traces.some((trace) => !trace || trace.length < requiredLength)) {
+    return false;
+  }
 
-  for (
-    let y = Math.max(1, centerY - radius - thickness);
-    y <= Math.min(height - 2, centerY + radius + thickness);
-    y += 1
-  ) {
+  const branchAngles = traces.map((trace) => {
+    const endpoint = trace![trace!.length - 1];
+    return normalizeDirectedDegrees(
+      (Math.atan2(endpoint.y - centerY, endpoint.x - centerX) * 180) /
+        Math.PI
+    );
+  });
+  const minimumAngleSeparation = 26;
+  for (let firstIndex = 0; firstIndex < branchAngles.length; firstIndex += 1) {
     for (
-      let x = Math.max(1, centerX - radius - thickness);
-      x <= Math.min(width - 2, centerX + radius + thickness);
-      x += 1
+      let secondIndex = firstIndex + 1;
+      secondIndex < branchAngles.length;
+      secondIndex += 1
     ) {
-      const distanceSquared =
-        (x - centerX) ** 2 + (y - centerY) ** 2;
-      const index = y * width + x;
       if (
-        skeleton[index] &&
-        distanceSquared >= innerRadiusSquared &&
-        distanceSquared <= outerRadiusSquared
+        directedAngleDifference(
+          branchAngles[firstIndex],
+          branchAngles[secondIndex]
+        ) < minimumAngleSeparation
       ) {
-        ringPixels.add(index);
+        return false;
       }
     }
   }
 
-  const visited = new Set<number>();
-  let stableExitCount = 0;
-  const minimumExitPixels = Math.max(2, thickness);
-
-  for (const startIndex of ringPixels) {
-    if (visited.has(startIndex)) continue;
-    const queue = [startIndex];
-    visited.add(startIndex);
-    let componentPixelCount = 0;
-
-    for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
-      const index = queue[queueIndex];
-      componentPixelCount += 1;
-      const x = index % width;
-      const y = Math.floor(index / width);
-
-      for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
-        for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
-          if (deltaX === 0 && deltaY === 0) continue;
-          const nextIndex = (y + deltaY) * width + x + deltaX;
-          if (
-            ringPixels.has(nextIndex) &&
-            !visited.has(nextIndex)
-          ) {
-            visited.add(nextIndex);
-            queue.push(nextIndex);
-          }
-        }
-      }
-    }
-
-    if (componentPixelCount >= minimumExitPixels) {
-      stableExitCount += 1;
-      if (stableExitCount > 3) return false;
+  const occupiedPixels = new Set<number>();
+  for (const trace of traces) {
+    for (const point of trace!) {
+      const index = point.y * width + point.x;
+      if (occupiedPixels.has(index)) return false;
+      occupiedPixels.add(index);
     }
   }
 
-  return stableExitCount === 3;
+  return true;
+}
+
+// Çatallanma dalını merkezden dışarı doğru, yönünü koruyarak izler.
+function traceBifurcationBranch(
+  skeleton: Uint8Array,
+  width: number,
+  height: number,
+  centerX: number,
+  centerY: number,
+  start: PixelPoint,
+  maximumLength: number
+) {
+  const trace: PixelPoint[] = [];
+  const visited = new Set<number>([centerY * width + centerX]);
+  let previous = { x: centerX, y: centerY };
+  let current = start;
+
+  while (trace.length < maximumLength) {
+    if (
+      current.x < 0 ||
+      current.x >= width ||
+      current.y < 0 ||
+      current.y >= height
+    ) {
+      return null;
+    }
+    const currentIndex = current.y * width + current.x;
+    if (visited.has(currentIndex)) return null;
+    visited.add(currentIndex);
+    trace.push(current);
+
+    const nextPoints = getNeighborPoints(
+      skeleton,
+      width,
+      height,
+      current.x,
+      current.y
+    ).filter((point) => {
+      const index = point.y * width + point.x;
+      return index !== previous.y * width + previous.x && !visited.has(index);
+    });
+    if (nextPoints.length === 0) break;
+
+    const incomingX = current.x - previous.x;
+    const incomingY = current.y - previous.y;
+    nextPoints.sort((left, right) => {
+      const leftX = left.x - current.x;
+      const leftY = left.y - current.y;
+      const rightX = right.x - current.x;
+      const rightY = right.y - current.y;
+      return (
+        rightX * incomingX + rightY * incomingY -
+        (leftX * incomingX + leftY * incomingY)
+      );
+    });
+    previous = current;
+    current = nextPoints[0];
+  }
+
+  return trace;
 }
 
 // Crossing Number çevresindeki her 0->1 geçişinden tek başlangıç alarak aynı dalın çapraz komşularını iki kez saymayı önler.
@@ -1381,6 +2942,117 @@ function suppressNearbyCandidates(
   return selected;
 }
 
+// Kısa ridge köprüleri ve küçük enclosure'lar iki yakın çatallanma üretir.
+// Aynı iskelet yolu üzerinde birkaç ridge periyodu içinde bağlanan çiftler,
+// temasız görüntüde güvenilir minutiae kabul edilmeyecek kadar kararsızdır.
+function rejectShortBifurcationCycles({
+  candidates,
+  skeleton,
+  width,
+  height,
+  ridgePeriodPixels,
+}: {
+  candidates: MinutiaCandidate[];
+  skeleton: Uint8Array;
+  width: number;
+  height: number;
+  ridgePeriodPixels: number;
+}) {
+  const rejected = new Set<number>();
+  const maximumPairDistance = ridgePeriodPixels * 3.1;
+  const maximumPathLength = Math.max(
+    18,
+    Math.round(ridgePeriodPixels * 4.5)
+  );
+
+  for (let firstIndex = 0; firstIndex < candidates.length; firstIndex += 1) {
+    const first = candidates[firstIndex];
+    if (first.type !== 'bifurcation' || rejected.has(firstIndex)) continue;
+
+    for (
+      let secondIndex = firstIndex + 1;
+      secondIndex < candidates.length;
+      secondIndex += 1
+    ) {
+      const second = candidates[secondIndex];
+      if (
+        second.type !== 'bifurcation' ||
+        rejected.has(secondIndex) ||
+        Math.hypot(second.x - first.x, second.y - first.y) >
+          maximumPairDistance
+      ) {
+        continue;
+      }
+      if (
+        !hasSkeletonConnectionWithinSteps(
+          skeleton,
+          width,
+          height,
+          first,
+          second,
+          maximumPathLength
+        )
+      ) {
+        continue;
+      }
+      rejected.add(firstIndex);
+      rejected.add(secondIndex);
+      break;
+    }
+  }
+
+  return candidates.filter((_, index) => !rejected.has(index));
+}
+
+// İki aday arasındaki iskelet bağlantısını sınırlı BFS ile doğrular.
+function hasSkeletonConnectionWithinSteps(
+  skeleton: Uint8Array,
+  width: number,
+  height: number,
+  start: PixelPoint,
+  target: PixelPoint,
+  maximumSteps: number
+) {
+  const startIndex = start.y * width + start.x;
+  const targetIndex = target.y * width + target.x;
+  const queue = [startIndex];
+  const depths = [0];
+  const visited = new Set<number>([startIndex]);
+
+  for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
+    const index = queue[queueIndex];
+    const depth = depths[queueIndex];
+    if (index === targetIndex) return true;
+    if (depth >= maximumSteps) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+
+    for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
+      for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
+        if (deltaX === 0 && deltaY === 0) continue;
+        const nextX = x + deltaX;
+        const nextY = y + deltaY;
+        if (
+          nextX < 0 ||
+          nextX >= width ||
+          nextY < 0 ||
+          nextY >= height
+        ) {
+          continue;
+        }
+        const nextIndex = nextY * width + nextX;
+        if (!skeleton[nextIndex] || visited.has(nextIndex)) continue;
+        if (nextIndex === targetIndex) return true;
+        visited.add(nextIndex);
+        queue.push(nextIndex);
+        depths.push(depth + 1);
+      }
+    }
+  }
+
+  return false;
+}
+
 // Yakın zıt tipleri ve aynı eksende birbirine bakan kopuk-ridge sonlarını kararsız topoloji olarak eler.
 export function rejectUnstableCandidatePairs(
   candidates: MinutiaCandidate[],
@@ -1468,6 +3140,20 @@ export function rejectUnstableCandidatePairs(
 function normalizeAxisDegrees(value: number) {
   const normalized = value % 180;
   return normalized < 0 ? normalized + 180 : normalized;
+}
+
+// Dal yönünü merkezden dışarı doğru yönlü 0-360 derece aralığına normalize eder.
+function normalizeDirectedDegrees(value: number) {
+  const normalized = value % 360;
+  return normalized < 0 ? normalized + 360 : normalized;
+}
+
+// İki yönlü dal arasındaki en kısa açısal farkı hesaplar.
+function directedAngleDifference(first: number, second: number) {
+  const difference = Math.abs(
+    normalizeDirectedDegrees(first) - normalizeDirectedDegrees(second)
+  );
+  return Math.min(difference, 360 - difference);
 }
 
 // Yönsüz iki ridge ekseni arasındaki en küçük açısal farkı hesaplar.

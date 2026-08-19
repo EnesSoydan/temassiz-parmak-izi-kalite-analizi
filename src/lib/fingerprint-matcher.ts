@@ -30,6 +30,7 @@ export type FingerprintMatcherConfig = {
   maximumRansacIterations: number;
   minimumTransformScale: number;
   maximumTransformScale: number;
+  maximumTransformRotationDegrees: number;
 };
 
 export const DEFAULT_FINGERPRINT_MATCHER_CONFIG: FingerprintMatcherConfig = {
@@ -47,6 +48,8 @@ export const DEFAULT_FINGERPRINT_MATCHER_CONFIG: FingerprintMatcherConfig = {
   maximumRansacIterations: 128,
   minimumTransformScale: 0.7,
   maximumTransformScale: 1.4,
+  // Canlı kapı en fazla 15° el sapmasına izin verir; kanonik hizalama sonrası 20° üzeri hipotez fiziksel kabul edilmez.
+  maximumTransformRotationDegrees: 20,
 };
 
 type Transform = {
@@ -59,6 +62,8 @@ type Transform = {
 type TemplateMatch = {
   score: number;
   matchedMinutiae: number;
+  matchedEndingCount: number;
+  matchedBifurcationCount: number;
   coverage: number;
   transform: Transform;
   graphRelationScore: number;
@@ -382,6 +387,11 @@ function tryTransform(
   }
 
   const matchedMinutiae = matchedProbePoints.length;
+  const matchedEndingCount = matchedProbePoints.filter(
+    (point) => point.type === 'ending'
+  ).length;
+  const matchedBifurcationCount =
+    matchedMinutiae - matchedEndingCount;
   const coverage = calculateCoverage(
     matchedProbePoints,
     matchedEnrollmentPoints,
@@ -425,6 +435,8 @@ function tryTransform(
   return {
     score,
     matchedMinutiae,
+    matchedEndingCount,
+    matchedBifurcationCount,
     coverage,
     transform,
     graphRelationScore,
@@ -462,6 +474,11 @@ function createPairTransform(
       180) /
       Math.PI
   );
+  if (
+    Math.abs(rotationDegrees) > config.maximumTransformRotationDegrees
+  ) {
+    return null;
+  }
   const radians = (rotationDegrees * Math.PI) / 180;
   const rotatedX =
     (probeFirst.x * Math.cos(radians) - probeFirst.y * Math.sin(radians)) * scale;
@@ -532,6 +549,12 @@ function getRansacTransforms(
   const seen = new Set<string>();
   const addTransform = (transform: Transform | null) => {
     if (!transform) return;
+    if (
+      Math.abs(normalizeAngle(transform.rotationDegrees)) >
+      config.maximumTransformRotationDegrees
+    ) {
+      return;
+    }
     const key = [
       transform.rotationDegrees.toFixed(3),
       transform.scale.toFixed(4),
@@ -675,6 +698,8 @@ export function matchFingerprintTemplates(
   const match = bestMatch ?? {
     score: 0,
     matchedMinutiae: 0,
+    matchedEndingCount: 0,
+    matchedBifurcationCount: 0,
     coverage: 0,
     transform: {
       rotationDegrees: 0,
@@ -698,6 +723,8 @@ export function matchFingerprintTemplates(
     status,
     score: Math.round(match.score * 10) / 10,
     matchedMinutiae: match.matchedMinutiae,
+    matchedEndingCount: match.matchedEndingCount,
+    matchedBifurcationCount: match.matchedBifurcationCount,
     coverage: Math.round(match.coverage * 1000) / 1000,
     probeUsableMinutiae: probePoints.length,
     enrollmentUsableMinutiae: enrollmentPoints.length,
@@ -750,6 +777,36 @@ function createMissingFingerResult(
   };
 }
 
+function createInsufficientProbeResult(
+  fingerPosition: FingerprintPosition,
+  probe: FingerRoi,
+  config: FingerprintMatcherConfig
+): FingerMatchResult {
+  const probeUsableMinutiae = probe.minutiaeTemplate
+    ? filterPoints(probe.minutiaeTemplate, config).length
+    : 0;
+  const failureReasons: FingerMatchFailureReason[] = [
+    'probe-quality-insufficient',
+  ];
+  if (probeUsableMinutiae < config.minimumUsableMinutiae) {
+    failureReasons.push('not-enough-probe-minutiae');
+  }
+
+  return {
+    fingerPosition,
+    status: 'insufficient',
+    score: 0,
+    matchedMinutiae: 0,
+    coverage: 0,
+    probeUsableMinutiae,
+    enrollmentUsableMinutiae: 0,
+    minimumUsableMinutiae: config.minimumUsableMinutiae,
+    minimumMatchedMinutiae: config.minimumMatchedMinutiae,
+    minimumCoverage: config.minimumCoverage,
+    failureReasons,
+  };
+}
+
 function aggregateEnrollmentMatches(
   matches: FingerMatchResult[],
   fingerPosition: FingerprintPosition,
@@ -768,6 +825,16 @@ function aggregateEnrollmentMatches(
   const matchedMinutiae = Math.round(
     selected.reduce((sum, result) => sum + result.matchedMinutiae, 0) / selected.length
   );
+  const matchedEndingCount = Math.round(
+    selected.reduce((sum, result) => sum + (result.matchedEndingCount ?? 0), 0) /
+      selected.length
+  );
+  const matchedBifurcationCount = Math.round(
+    selected.reduce(
+      (sum, result) => sum + (result.matchedBifurcationCount ?? 0),
+      0
+    ) / selected.length
+  );
   const coverage =
     selected.reduce((sum, result) => sum + result.coverage, 0) / selected.length;
   const best = selected[0];
@@ -785,6 +852,8 @@ function aggregateEnrollmentMatches(
     status,
     score: Math.round(score * 10) / 10,
     matchedMinutiae,
+    matchedEndingCount,
+    matchedBifurcationCount,
     coverage: Math.round(coverage * 1000) / 1000,
     enrollmentUsableMinutiae: Math.round(
       selected.reduce((sum, result) => sum + result.enrollmentUsableMinutiae, 0) /
@@ -848,8 +917,13 @@ export function identifyPersonFromFingerRois({
   enrollments: Enrollment[];
   config?: FingerprintMatcherConfig;
 }): PersonMatchResult {
+  const capturedProbes = new Map<FingerprintPosition, FingerRoi>();
   const validProbes = new Map<FingerprintPosition, FingerRoi>();
   for (const fingerRoi of fingerRois) {
+    if (FINGERPRINT_POSITIONS.includes(fingerRoi.className as FingerprintPosition)) {
+      const fingerPosition = fingerRoi.className as FingerprintPosition;
+      capturedProbes.set(fingerPosition, fingerRoi);
+    }
     if (
       FINGERPRINT_POSITIONS.includes(fingerRoi.className as FingerprintPosition) &&
       fingerRoi.minutiaeTemplate &&
@@ -893,6 +967,7 @@ export function identifyPersonFromFingerRois({
 
   const candidates = people.map((person) => {
     const fingerResults = FINGERPRINT_POSITIONS.map((fingerPosition) => {
+      const capturedProbe = capturedProbes.get(fingerPosition);
       const probe = validProbes.get(fingerPosition);
       const enrollmentTemplates = enrollments
         .filter(
@@ -901,12 +976,19 @@ export function identifyPersonFromFingerRois({
             item.fingerPosition === fingerPosition
         )
         .sort((first, second) => (first.sampleIndex ?? 0) - (second.sampleIndex ?? 0));
-      if (!probe) {
+      if (!capturedProbe) {
         return createMissingFingerResult(
           fingerPosition,
           'missing',
           config,
           'probe-missing'
+        );
+      }
+      if (!probe) {
+        return createInsufficientProbeResult(
+          fingerPosition,
+          capturedProbe,
+          config
         );
       }
       if (enrollmentTemplates.length === 0 || !probe.minutiaeTemplate) {

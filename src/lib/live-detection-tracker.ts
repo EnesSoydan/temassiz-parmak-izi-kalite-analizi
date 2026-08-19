@@ -25,6 +25,100 @@ const MIN_SHAPE_CURRENT_WEIGHT = 0.18;
 const MAX_SHAPE_CURRENT_WEIGHT = 0.42;
 const MIN_ANGLE_CURRENT_WEIGHT = 0.2;
 const MAX_ANGLE_CURRENT_WEIGHT = 0.48;
+const FINGER_DETECTION_CLASSES: DetectionClassName[] = [
+  'index',
+  'middle',
+  'ring',
+  'pinky',
+];
+
+export type LiveDetectionFallbackMergeResult = {
+  detections: DetectedObbBox[];
+  fallbackClasses: DetectionClassName[];
+};
+
+export type LiveDetectionCaptureMergeResult = LiveDetectionFallbackMergeResult & {
+  snapshotClasses: DetectionClassName[];
+};
+
+// Fotoğraf modeli bir sınıfı kaçırırsa, yalnızca o sınıfı son kararlı canlı OBB ile tamamlar.
+// Noktalar normalize edilmiş ve yönü düzeltilmiş görüntü koordinatında tutulduğu için
+// fotoğraf ROI hattı aynı kutuyu doğrudan kullanabilir; fotoğraf tarafından bulunan kutular ezilmez.
+export function mergeMissingLiveDetections(
+  photoDetections: DetectedObbBox[],
+  liveFallbackDetections: DetectedObbBox[]
+): LiveDetectionFallbackMergeResult {
+  const photoClasses = new Set(
+    photoDetections
+      .map((detection) => detection.className)
+      .filter((className): className is DetectionClassName =>
+        FINGER_DETECTION_CLASSES.includes(className)
+      )
+  );
+  const bestFallbackByClass = new Map<DetectionClassName, DetectedObbBox>();
+
+  for (const detection of liveFallbackDetections) {
+    if (!FINGER_DETECTION_CLASSES.includes(detection.className)) continue;
+    const current = bestFallbackByClass.get(detection.className);
+    if (!current || detection.confidence > current.confidence) {
+      bestFallbackByClass.set(detection.className, detection);
+    }
+  }
+
+  const detections = photoDetections.map((detection) => cloneDetection(detection));
+  const fallbackClasses: DetectionClassName[] = [];
+
+  for (const fingerClass of FINGER_DETECTION_CLASSES) {
+    if (photoClasses.has(fingerClass)) continue;
+
+    const fallback = bestFallbackByClass.get(fingerClass);
+    if (!fallback) continue;
+
+    detections.push({
+      ...cloneDetection(fallback),
+      id: `live-fallback-${fingerClass}`,
+    });
+    fallbackClasses.push(fingerClass);
+  }
+
+  return { detections, fallbackClasses };
+}
+
+// Kalite kapısının çekimi tetiklediği karedeki OBB'leri ROI kaynağı olarak dondurur.
+// Fotoğraf modeli yine tanı amacıyla çalışır; ancak aynı sınıfı farklı veya dar bir kutuyla
+// bulsa bile çekim anında kullanıcıya gösterilen alan değiştirilmez. Snapshot'ta bulunmayan
+// bir sınıf olursa fotoğraf modeli güvenli yedek olarak kullanılır.
+export function mergeCaptureSnapshotDetections(
+  photoDetections: DetectedObbBox[],
+  captureSnapshotDetections: DetectedObbBox[]
+): LiveDetectionCaptureMergeResult {
+  const bestPhotoByClass = getBestFingerDetectionsByClass(photoDetections);
+  const bestSnapshotByClass = getBestFingerDetectionsByClass(
+    captureSnapshotDetections
+  );
+  const photoClasses = new Set(bestPhotoByClass.keys());
+  const detections: DetectedObbBox[] = [];
+  const snapshotClasses: DetectionClassName[] = [];
+  const fallbackClasses: DetectionClassName[] = [];
+
+  for (const fingerClass of FINGER_DETECTION_CLASSES) {
+    const snapshot = bestSnapshotByClass.get(fingerClass);
+    if (snapshot) {
+      detections.push({
+        ...cloneDetection(snapshot),
+        id: `live-capture-${fingerClass}`,
+      });
+      snapshotClasses.push(fingerClass);
+      if (!photoClasses.has(fingerClass)) fallbackClasses.push(fingerClass);
+      continue;
+    }
+
+    const photoDetection = bestPhotoByClass.get(fingerClass);
+    if (photoDetection) detections.push(cloneDetection(photoDetection));
+  }
+
+  return { detections, fallbackClasses, snapshotClasses };
+}
 
 // Aynı parmak sınıfındaki kutuları önceki geometrisine göre ilişkilendirip kararlı canlı takip üretir.
 export function updateLiveDetectionTracks(
@@ -99,6 +193,16 @@ export function getVisibleLiveDetections(
     .sort((first, second) => second.confidence - first.confidence);
 }
 
+// Kalite kapısına yalnızca bu inference turunda model tarafından yeniden görülen doğrulanmış kutuları verir.
+export function getCurrentConfirmedLiveDetections(
+  tracks: Map<DetectionClassName, LiveDetectionTrack>
+) {
+  return [...tracks.values()]
+    .filter((track) => track.confirmed && track.missedUpdates === 0)
+    .map((track) => track.detection)
+    .sort((first, second) => second.confidence - first.confidence);
+}
+
 // OBB yönü 180 derece periyodiktir; iki eşdeğer yön arasındaki en kısa açısal farkı döndürür.
 export function getHalfTurnAngleDifference(from: number, to: number) {
   const halfTurn = Math.PI;
@@ -158,6 +262,20 @@ function groupDetectionsByClass(detections: DetectedObbBox[]) {
   }
 
   return groups;
+}
+
+function getBestFingerDetectionsByClass(detections: DetectedObbBox[]) {
+  const bestByClass = new Map<DetectionClassName, DetectedObbBox>();
+
+  for (const detection of detections) {
+    if (!FINGER_DETECTION_CLASSES.includes(detection.className)) continue;
+    const current = bestByClass.get(detection.className);
+    if (!current || detection.confidence > current.confidence) {
+      bestByClass.set(detection.className, detection);
+    }
+  }
+
+  return bestByClass;
 }
 
 function getTrackAcquireConfidence(className: DetectionClassName) {
@@ -417,6 +535,15 @@ function getSymmetricAreaRatio(first: Point[], second: Point[]) {
 
 function getPointDistance(first: Point, second: Point) {
   return Math.hypot(first.x - second.x, first.y - second.y);
+}
+
+function cloneDetection(detection: DetectedObbBox): DetectedObbBox {
+  return {
+    ...detection,
+    center: { ...detection.center },
+    size: { ...detection.size },
+    points: detection.points.map((point) => ({ ...point })),
+  };
 }
 
 function interpolate(from: number, to: number, weight: number) {

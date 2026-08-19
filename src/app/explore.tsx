@@ -10,6 +10,17 @@ import {
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
 import {
+  Gesture,
+  GestureDetector,
+  GestureHandlerRootView,
+} from 'react-native-gesture-handler';
+import Animated, {
+  runOnJS,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from 'react-native-reanimated';
+import {
   FlatList,
   Alert,
   Modal,
@@ -40,7 +51,12 @@ import {
   loadCaptureSamples,
   saveRawImage,
   setCaptureCalibrationLabel,
+  setCaptureProbeEvaluation,
 } from '@/lib/capture-storage';
+import {
+  createFingerprintEnrollmentBaselineReport,
+  createFingerprintProbeBaselineReport,
+} from '@/lib/fingerprint-baseline-report';
 import { detectFingertipObbBoxes } from '@/lib/fingertip-detection';
 import { sortFingerRois } from '@/lib/finger-order';
 import { extractFingerRoisFromImage } from '@/lib/fingertip-roi';
@@ -61,6 +77,10 @@ import type {
 // Galeriden eklenen kayıtlar için kısa ve çakışma ihtimali düşük kimlik üretir.
 function createId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function formatRateForUi(rate: number | null) {
+  return rate === null ? 'hesaplanamadı' : `${Math.round(rate * 100)}%`;
 }
 
 function getExifOrientation(asset: ImagePicker.ImagePickerAsset) {
@@ -113,6 +133,8 @@ type RoiInspectionVariant =
   | 'canonical'
   | 'alignedCanonical'
   | 'segmented'
+  | 'binary'
+  | 'openedBinary'
   | 'orientation'
   | 'enhanced'
   | 'minutiae';
@@ -126,6 +148,8 @@ const ROI_INSPECTION_OPTIONS: {
   { value: 'canonical', label: 'Flaşlı' },
   { value: 'alignedCanonical', label: 'Hizalı' },
   { value: 'segmented', label: 'Seg' },
+  { value: 'binary', label: 'Binary' },
+  { value: 'openedBinary', label: 'Opening' },
   { value: 'orientation', label: 'Yön' },
   { value: 'enhanced', label: 'Ridge' },
   { value: 'minutiae', label: 'Minutiae' },
@@ -146,20 +170,179 @@ function getRoiInspectionUri(
   if (variant === 'canonical') return fingerRoi.canonicalImageUri;
   if (variant === 'alignedCanonical') return fingerRoi.alignedCanonicalImageUri;
   if (variant === 'segmented') return fingerRoi.segmentedImageUri;
+  if (variant === 'binary') return fingerRoi.binaryImageUri;
+  if (variant === 'openedBinary') return fingerRoi.openedBinaryImageUri;
   if (variant === 'orientation') return fingerRoi.orientationImageUri;
   if (variant === 'enhanced') return fingerRoi.enhancedImageUri;
   return fingerRoi.minutiaeImageUri;
 }
 
+const MIN_INSPECTION_SCALE = 1;
+const MAX_INSPECTION_SCALE = 4;
+
+// Tam ekran ROI sayfasına pinch zoom, zoom sırasında taşıma ve isteğe bağlı iskelet katmanı ekler.
+function ZoomableInspectionImage({
+  imageUri,
+  overlayImageUri,
+  onZoomStateChange,
+}: {
+  imageUri: string;
+  overlayImageUri?: string;
+  onZoomStateChange: (zoomed: boolean) => void;
+}) {
+  const [isZoomed, setIsZoomed] = useState(false);
+  const scale = useSharedValue(MIN_INSPECTION_SCALE);
+  const savedScale = useSharedValue(MIN_INSPECTION_SCALE);
+  const translationX = useSharedValue(0);
+  const translationY = useSharedValue(0);
+  const savedTranslationX = useSharedValue(0);
+  const savedTranslationY = useSharedValue(0);
+  const containerWidth = useSharedValue(1);
+  const containerHeight = useSharedValue(1);
+  const overlayOpacity = useSharedValue(0);
+
+  const reportZoomState = (zoomed: boolean) => {
+    setIsZoomed(zoomed);
+    onZoomStateChange(zoomed);
+  };
+
+  const pinchGesture = Gesture.Pinch()
+    .onBegin(() => {
+      runOnJS(reportZoomState)(true);
+    })
+    .onUpdate((event) => {
+      scale.value = Math.min(
+        MAX_INSPECTION_SCALE,
+        Math.max(MIN_INSPECTION_SCALE, savedScale.value * event.scale)
+      );
+    })
+    .onFinalize(() => {
+      const nextScale = Math.min(
+        MAX_INSPECTION_SCALE,
+        Math.max(MIN_INSPECTION_SCALE, scale.value)
+      );
+      if (nextScale <= MIN_INSPECTION_SCALE + 0.01) {
+        scale.value = withTiming(MIN_INSPECTION_SCALE);
+        translationX.value = withTiming(0);
+        translationY.value = withTiming(0);
+        savedScale.value = MIN_INSPECTION_SCALE;
+        savedTranslationX.value = 0;
+        savedTranslationY.value = 0;
+        runOnJS(reportZoomState)(false);
+        return;
+      }
+
+      const maximumX = (containerWidth.value * (nextScale - 1)) / 2;
+      const maximumY = (containerHeight.value * (nextScale - 1)) / 2;
+      scale.value = nextScale;
+      savedScale.value = nextScale;
+      translationX.value = Math.min(
+        maximumX,
+        Math.max(-maximumX, translationX.value)
+      );
+      translationY.value = Math.min(
+        maximumY,
+        Math.max(-maximumY, translationY.value)
+      );
+      savedTranslationX.value = translationX.value;
+      savedTranslationY.value = translationY.value;
+      runOnJS(reportZoomState)(true);
+    });
+
+  const panGesture = Gesture.Pan()
+    .enabled(isZoomed)
+    .minDistance(2)
+    .onUpdate((event) => {
+      const maximumX = (containerWidth.value * (scale.value - 1)) / 2;
+      const maximumY = (containerHeight.value * (scale.value - 1)) / 2;
+      translationX.value = Math.min(
+        maximumX,
+        Math.max(-maximumX, savedTranslationX.value + event.translationX)
+      );
+      translationY.value = Math.min(
+        maximumY,
+        Math.max(-maximumY, savedTranslationY.value + event.translationY)
+      );
+    })
+    .onFinalize(() => {
+      savedTranslationX.value = translationX.value;
+      savedTranslationY.value = translationY.value;
+    });
+
+  const tapGesture = Gesture.Tap()
+    .enabled(Boolean(overlayImageUri))
+    .maxDistance(8)
+    .onEnd((_event, successful) => {
+      if (!successful) return;
+      overlayOpacity.value = withTiming(
+        overlayOpacity.value > 0.5 ? 0 : 1,
+        { duration: 140 }
+      );
+    });
+
+  const imageGesture = Gesture.Simultaneous(
+    pinchGesture,
+    panGesture,
+    tapGesture
+  );
+  const imageTransformStyle = useAnimatedStyle(() => ({
+    transform: [
+      { translateX: translationX.value },
+      { translateY: translationY.value },
+      { scale: scale.value },
+    ],
+  }));
+  const overlayStyle = useAnimatedStyle(() => ({
+    opacity: overlayOpacity.value,
+  }));
+
+  return (
+    <GestureDetector gesture={imageGesture}>
+      <Animated.View
+        style={[styles.inspectionImageFrame, imageTransformStyle]}
+        onLayout={(event) => {
+          containerWidth.value = Math.max(event.nativeEvent.layout.width, 1);
+          containerHeight.value = Math.max(event.nativeEvent.layout.height, 1);
+        }}>
+        <Image
+          source={{ uri: imageUri }}
+          style={styles.inspectionImage}
+          contentFit="contain"
+        />
+        {overlayImageUri ? (
+          <Animated.View
+            pointerEvents="none"
+            style={[styles.inspectionOverlay, overlayStyle]}>
+            <Image
+              source={{ uri: overlayImageUri }}
+              style={styles.inspectionImage}
+              contentFit="contain"
+            />
+          </Animated.View>
+        ) : null}
+      </Animated.View>
+    </GestureDetector>
+  );
+}
+
 // Tek bir kaydın flaşlı ham fotoğrafını, ROI çıktısını ve kalite durumlarını gösterir.
 function CaptureCard({
   sample,
+  people,
+  isEnrollmentSource,
   onDelete,
   onCalibrationLabel,
+  onProbeEvaluation,
 }: {
   sample: CaptureSample;
+  people: Person[];
+  isEnrollmentSource: boolean;
   onDelete: (sampleId: string) => void;
   onCalibrationLabel: (sampleId: string, label: QualityCalibrationLabel) => void;
+  onProbeEvaluation: (
+    sampleId: string,
+    target: { relation: 'genuine'; personId: string } | { relation: 'impostor' } | null
+  ) => void;
 }) {
   const inspectionScrollRef = useRef<ScrollView>(null);
   const { width: windowWidth } = useWindowDimensions();
@@ -167,6 +350,8 @@ function CaptureCard({
     fingerRoi: FingerRoi;
     variant: RoiInspectionVariant;
   } | null>(null);
+  const [inspectionImageZoomed, setInspectionImageZoomed] = useState(false);
+  const [inspectionZoomRevision, setInspectionZoomRevision] = useState(0);
   const inspectionPageWidth = Math.max(
     windowWidth - Spacing.three * 2,
     1
@@ -182,7 +367,14 @@ function CaptureCard({
     fingerRoi: FingerRoi,
     variant: RoiInspectionVariant
   ) {
+    setInspectionImageZoomed(false);
+    setInspectionZoomRevision((revision) => revision + 1);
     setInspection({ fingerRoi, variant });
+  }
+
+  function closeInspection() {
+    setInspectionImageZoomed(false);
+    setInspection(null);
   }
 
   // Alt sekmeden seçilen ROI sürümünü işaretleyip yatay galeriyi aynı sayfaya taşır.
@@ -196,6 +388,8 @@ function CaptureCard({
     );
     if (index < 0) return;
 
+    setInspectionImageZoomed(false);
+    setInspectionZoomRevision((revision) => revision + 1);
     setInspection({ fingerRoi: inspection.fingerRoi, variant });
     inspectionScrollRef.current?.scrollTo({
       x: index * inspectionPageWidth,
@@ -212,6 +406,8 @@ function CaptureCard({
     );
     const option = availableInspectionOptions[index];
     if (!option || option.value === inspection.variant) return;
+    setInspectionImageZoomed(false);
+    setInspectionZoomRevision((revision) => revision + 1);
     setInspection({
       fingerRoi: inspection.fingerRoi,
       variant: option.value,
@@ -248,6 +444,50 @@ function CaptureCard({
             .map((fingerRoi) => (
               <View key={fingerRoi.id} style={styles.roiPreview}>
                 <View style={styles.roiImagePair}>
+                  <View style={styles.roiImageColumn}>
+                    {fingerRoi.binaryImageUri ? (
+                      <Pressable
+                        onPress={() => openInspection(fingerRoi, 'binary')}>
+                        <Image
+                          source={{ uri: fingerRoi.binaryImageUri }}
+                          style={[styles.roiImage, styles.binaryRoiImage]}
+                          contentFit="cover"
+                        />
+                      </Pressable>
+                    ) : (
+                      <View style={[styles.roiImage, styles.emptySegmentImage]}>
+                        <ThemedText type="small" style={styles.emptySegmentText}>
+                          Yok
+                        </ThemedText>
+                      </View>
+                    )}
+                    <ThemedText type="small" style={styles.roiVariantLabel}>
+                      Binary
+                    </ThemedText>
+                  </View>
+
+                  <View style={styles.roiImageColumn}>
+                    {fingerRoi.openedBinaryImageUri ? (
+                      <Pressable
+                        onPress={() => openInspection(fingerRoi, 'openedBinary')}>
+                        <Image
+                          source={{ uri: fingerRoi.openedBinaryImageUri }}
+                          style={[styles.roiImage, styles.binaryRoiImage]}
+                          contentFit="cover"
+                        />
+                      </Pressable>
+                    ) : (
+                      <View style={[styles.roiImage, styles.emptySegmentImage]}>
+                        <ThemedText type="small" style={styles.emptySegmentText}>
+                          Yok
+                        </ThemedText>
+                      </View>
+                    )}
+                    <ThemedText type="small" style={styles.roiVariantLabel}>
+                      Opening
+                    </ThemedText>
+                  </View>
+
                   <View style={styles.roiImageColumn}>
                     <Pressable onPress={() => openInspection(fingerRoi, 'roi')}>
                       <Image
@@ -438,6 +678,68 @@ function CaptureCard({
         </View>
       </View>
 
+      {isEnrollmentSource ? (
+        <ThemedText
+          type="small"
+          themeColor="textSecondary"
+          style={styles.enrollmentSourceLabel}>
+          Enrollment kaynağı · giriş probe’u olarak etiketlenmez
+        </ThemedText>
+      ) : (
+        <View style={styles.probeControl}>
+          <View style={styles.probeControlHeader}>
+            <ThemedText type="small" themeColor="textSecondary">
+              Giriş çekiminin gerçeği
+            </ThemedText>
+            {sample.probeEvaluation ? (
+              <ThemedText type="small" themeColor="textSecondary">
+                Oturum {sample.probeEvaluation.evaluationSessionId.slice(-6)}
+              </ThemedText>
+            ) : null}
+          </View>
+          <View style={styles.probeSegments}>
+            <Pressable
+              style={[
+                styles.probeSegment,
+                !sample.probeEvaluation && styles.probeSegmentSelected,
+              ]}
+              onPress={() => onProbeEvaluation(sample.id, null)}>
+              <ThemedText type="small">Etiketsiz</ThemedText>
+            </Pressable>
+            {people.map((person) => (
+              <Pressable
+                key={person.id}
+                style={[
+                  styles.probeSegment,
+                  sample.probeEvaluation?.relation === 'genuine' &&
+                    sample.probeEvaluation.expectedPersonId === person.id &&
+                    styles.probeSegmentSelected,
+                ]}
+                onPress={() =>
+                  onProbeEvaluation(sample.id, {
+                    relation: 'genuine',
+                    personId: person.id,
+                  })
+                }>
+                <ThemedText type="small">{person.displayName}</ThemedText>
+              </Pressable>
+            ))}
+            <Pressable
+              style={[
+                styles.probeSegment,
+                styles.impostorProbeSegment,
+                sample.probeEvaluation?.relation === 'impostor' &&
+                  styles.impostorProbeSegmentSelected,
+              ]}
+              onPress={() =>
+                onProbeEvaluation(sample.id, { relation: 'impostor' })
+              }>
+              <ThemedText type="small">Kayıt dışı el</ThemedText>
+            </Pressable>
+          </View>
+        </View>
+      )}
+
       <View style={styles.cardFooter}>
         <ThemedText type="small" themeColor="textSecondary">
           {new Date(sample.createdAt).toLocaleString('tr-TR')}
@@ -454,7 +756,8 @@ function CaptureCard({
         animationType="fade"
         transparent
         onShow={alignInspectionOnOpen}
-        onRequestClose={() => setInspection(null)}>
+        onRequestClose={closeInspection}>
+        <GestureHandlerRootView style={styles.inspectionGestureRoot}>
         <View style={styles.inspectionBackdrop}>
           <View style={styles.inspectionHeader}>
             <ThemedText type="smallBold" style={styles.inspectionTitle}>
@@ -464,7 +767,7 @@ function CaptureCard({
             </ThemedText>
             <Pressable
               style={styles.closeInspectionButton}
-              onPress={() => setInspection(null)}>
+              onPress={closeInspection}>
               <ThemedText type="smallBold" style={styles.inspectionTitle}>
                 Kapat
               </ThemedText>
@@ -476,6 +779,7 @@ function CaptureCard({
             horizontal
             pagingEnabled
             bounces={false}
+            scrollEnabled={!inspectionImageZoomed}
             showsHorizontalScrollIndicator={false}
             style={styles.inspectionImageArea}
             onContentSizeChange={alignInspectionOnOpen}
@@ -496,10 +800,15 @@ function CaptureCard({
                         { width: inspectionPageWidth },
                       ]}>
                       {imageUri ? (
-                        <Image
-                          source={{ uri: imageUri }}
-                          style={styles.inspectionImage}
-                          contentFit="contain"
+                        <ZoomableInspectionImage
+                          key={`${option.value}-${inspectionZoomRevision}`}
+                          imageUri={imageUri}
+                          overlayImageUri={
+                            option.value === 'alignedCanonical'
+                              ? inspection.fingerRoi.minutiaeOverlayImageUri
+                              : undefined
+                          }
+                          onZoomStateChange={setInspectionImageZoomed}
                         />
                       ) : null}
                     </View>
@@ -519,6 +828,13 @@ function CaptureCard({
               Beyaz çizgi ridge iskeleti, turuncu işaret ridge sonu, mavi işaret çatallanmadır.
             </ThemedText>
           ) : null}
+          <ThemedText type="small" style={styles.inspectionGestureHint}>
+            {inspection?.variant === 'alignedCanonical'
+              ? inspection.fingerRoi.minutiaeOverlayImageUri
+                ? 'Tek dokun: iskeleti aç/kapat · İki parmak: yakınlaştır/uzaklaştır · Yakınken sürükle.'
+                : 'İskelet katmanı bu eski kayıtta yok · İki parmakla yakınlaştır/uzaklaştır.'
+              : 'İki parmakla yakınlaştır/uzaklaştır · Yakınken tek parmakla sürükle.'}
+          </ThemedText>
 
           <View style={styles.inspectionTabs}>
             {inspection
@@ -541,6 +857,7 @@ function CaptureCard({
               : null}
           </View>
         </View>
+        </GestureHandlerRootView>
       </Modal>
     </ThemedView>
   );
@@ -659,6 +976,11 @@ export default function RecordsScreen() {
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState('Kayıtlar yükleniyor...');
   const [isPickingImage, setIsPickingImage] = useState(false);
+  const [isCreatingBaseline, setIsCreatingBaseline] = useState(false);
+  const [isCreatingProbeReport, setIsCreatingProbeReport] = useState(false);
+  const [activeProbeSessionId, setActiveProbeSessionId] = useState(() =>
+    createId('probe-session')
+  );
   const safeAreaInsets = useSafeAreaInsets();
   const theme = useTheme();
   const insets = {
@@ -771,6 +1093,52 @@ export default function RecordsScreen() {
     }
   }
 
+  // Gerçek kişi/farklı el bilgisini aktif test oturumuyla capture metadata'sına yazar.
+  async function handleProbeEvaluation(
+    sampleId: string,
+    target:
+      | { relation: 'genuine'; personId: string }
+      | { relation: 'impostor' }
+      | null
+  ) {
+    try {
+      const probeEvaluation = target
+        ? target.relation === 'genuine'
+          ? {
+              version: 1 as const,
+              relation: 'genuine' as const,
+              expectedPersonId: target.personId,
+              evaluationSessionId: activeProbeSessionId,
+              labeledAt: new Date().toISOString(),
+            }
+          : {
+              version: 1 as const,
+              relation: 'impostor' as const,
+              evaluationSessionId: activeProbeSessionId,
+              labeledAt: new Date().toISOString(),
+            }
+        : null;
+      const nextSamples = await setCaptureProbeEvaluation(
+        sampleId,
+        probeEvaluation
+      );
+      setSamples(nextSamples);
+      setFeedback(
+        target
+          ? 'Probe etiketi değerlendirme için kaydedildi.'
+          : 'Probe etiketi kaldırıldı.'
+      );
+    } catch {
+      setFeedback('Probe etiketi kaydedilemedi.');
+    }
+  }
+
+  // Sonraki etiketlerin önceki tekrarlarla aynı bağımsız oturum sayılmasını önler.
+  function handleStartNewProbeSession() {
+    setActiveProbeSessionId(createId('probe-session'));
+    setFeedback('Yeni test oturumu başlatıldı. Bundan sonraki etiketler bu oturuma yazılır.');
+  }
+
   // Etiketli kayıtların fotoğraf içermeyen metrik özetini cihaz içinde oluşturur.
   async function handleExportCalibration() {
     try {
@@ -782,6 +1150,61 @@ export default function RecordsScreen() {
       );
     } catch {
       setFeedback('Kalibrasyon özeti oluşturulamadı.');
+    }
+  }
+
+  // Enrollment şablonlarını cihazdan çıkarmadan toplu genuine/impostor baseline metriklerini hesaplar.
+  async function handleCreateBaseline() {
+    if (isCreatingBaseline) return;
+    setIsCreatingBaseline(true);
+    setFeedback('Biyometrik baseline hesaplanıyor...');
+    try {
+      const { report } = await createFingerprintEnrollmentBaselineReport();
+      if (report.dataset.personCount === 0) {
+        setFeedback('Baseline için geçerli minutiae-v2 enrollment kaydı yok.');
+      } else if (report.dataset.personCount < 2) {
+        setFeedback(
+          'Genuine baseline hazır. Impostor ve FAR için en az iki kayıtlı kişi gerekir.'
+        );
+      } else {
+        const rank1 = report.identification.rank1Rate;
+        setFeedback(
+          `${report.dataset.personCount} kişilik baseline hazır · rank-1=${rank1 === null ? 'yok' : `${Math.round(rank1 * 100)}%`}`
+        );
+      }
+    } catch (error) {
+      console.warn('Biyometrik baseline raporu oluşturulamadı.', error);
+      setFeedback('Biyometrik baseline raporu oluşturulamadı.');
+    } finally {
+      setIsCreatingBaseline(false);
+    }
+  }
+
+  // Etiketli gerçek giriş çekimlerinde genuine kabul ve açık-küme yanlış kabul oranlarını ölçer.
+  async function handleCreateProbeReport() {
+    if (isCreatingProbeReport) return;
+    setIsCreatingProbeReport(true);
+    setFeedback('Etiketli giriş çekimleri ölçülüyor...');
+    try {
+      const { report } = await createFingerprintProbeBaselineReport();
+      if (report.dataset.labeledProbeCount === 0) {
+        setFeedback('Probe raporu için önce giriş çekimlerini etiketle.');
+      } else if (report.dataset.evaluatedProbeCount === 0) {
+        setFeedback(
+          `${report.dataset.labeledProbeCount} etiket var; geçerli minutiae-v2 probe veya enrollment bulunamadı.`
+        );
+      } else {
+        const trueIdentificationRate = report.identification.trueIdentificationRate;
+        const falseAcceptRate = report.identification.openSetFalseAcceptRate;
+        setFeedback(
+          `${report.dataset.evaluatedProbeCount} probe ölçüldü · doğru kabul=${formatRateForUi(trueIdentificationRate)} · FAR=${formatRateForUi(falseAcceptRate)}`
+        );
+      }
+    } catch (error) {
+      console.warn('Probe baseline raporu oluşturulamadı.', error);
+      setFeedback('Probe baseline raporu oluşturulamadı.');
+    } finally {
+      setIsCreatingProbeReport(false);
     }
   }
 
@@ -874,6 +1297,9 @@ export default function RecordsScreen() {
   });
 
   const selectedPerson = people.find((person) => person.id === selectedPersonId);
+  const enrollmentSourceCaptureIds = new Set(
+    enrollments.map((enrollment) => enrollment.sourceCaptureId)
+  );
   const selectedEnrollmentSamples = selectedPerson
     ? [...
         new Map(
@@ -895,8 +1321,11 @@ export default function RecordsScreen() {
       renderItem={({ item }) => (
         <CaptureCard
           sample={item}
+          people={people}
+          isEnrollmentSource={enrollmentSourceCaptureIds.has(item.id)}
           onDelete={handleDelete}
           onCalibrationLabel={handleCalibrationLabel}
+          onProbeEvaluation={handleProbeEvaluation}
         />
       )}
       style={[styles.list, { backgroundColor: theme.background }]}
@@ -927,8 +1356,11 @@ export default function RecordsScreen() {
                   <CaptureCard
                     key={`enrollment-${sample.id}`}
                     sample={sample}
+                    people={people}
+                    isEnrollmentSource
                     onDelete={handleDelete}
                     onCalibrationLabel={handleCalibrationLabel}
+                    onProbeEvaluation={handleProbeEvaluation}
                   />
                 ))
               ) : (
@@ -947,6 +1379,28 @@ export default function RecordsScreen() {
             </View>
 
             <View style={styles.headerActions}>
+              <Pressable
+                style={[
+                  styles.summaryButton,
+                  isCreatingProbeReport && styles.disabledButton,
+                ]}
+                disabled={isCreatingProbeReport}
+                onPress={handleCreateProbeReport}>
+                <ThemedText type="smallBold">
+                  {isCreatingProbeReport ? 'Ölçülüyor...' : 'Probe raporu'}
+                </ThemedText>
+              </Pressable>
+              <Pressable
+                style={[
+                  styles.summaryButton,
+                  isCreatingBaseline && styles.disabledButton,
+                ]}
+                disabled={isCreatingBaseline}
+                onPress={handleCreateBaseline}>
+                <ThemedText type="smallBold">
+                  {isCreatingBaseline ? 'Ölçülüyor...' : 'Baseline'}
+                </ThemedText>
+              </Pressable>
               <Pressable style={styles.summaryButton} onPress={handleExportCalibration}>
                 <ThemedText type="smallBold">Özet</ThemedText>
               </Pressable>
@@ -959,6 +1413,19 @@ export default function RecordsScreen() {
                 </ThemedText>
               </Pressable>
             </View>
+          </View>
+          <View style={styles.probeSessionBar}>
+            <View style={styles.headerText}>
+              <ThemedText type="smallBold">Aktif test oturumu</ThemedText>
+              <ThemedText type="small" themeColor="textSecondary">
+                {activeProbeSessionId.slice(-6)} · aynı koşuldaki tekrarları bu oturumda etiketle
+              </ThemedText>
+            </View>
+            <Pressable
+              style={styles.summaryButton}
+              onPress={handleStartNewProbeSession}>
+              <ThemedText type="smallBold">Yeni oturum</ThemedText>
+            </Pressable>
           </View>
         </>
       }
@@ -1025,18 +1492,30 @@ const styles = StyleSheet.create({
   },
   header: {
     minHeight: 52,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+    alignItems: 'stretch',
     gap: Spacing.three,
   },
   headerText: {
     flex: 1,
+    minWidth: 0,
     gap: Spacing.half,
   },
   headerActions: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'flex-start',
     gap: Spacing.one,
+  },
+  probeSessionBar: {
+    minHeight: 52,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+    borderRadius: 6,
+    backgroundColor: 'rgba(95, 168, 255, 0.10)',
+    padding: Spacing.two,
   },
   galleryButton: {
     minHeight: 40,
@@ -1094,6 +1573,11 @@ const styles = StyleSheet.create({
   segmentedRoiImage: {
     borderWidth: 1,
     borderColor: '#2FD16B',
+  },
+  binaryRoiImage: {
+    borderWidth: 1,
+    borderColor: '#FFFFFF',
+    backgroundColor: '#FFFFFF',
   },
   enhancedRoiImage: {
     borderWidth: 1,
@@ -1155,6 +1639,43 @@ const styles = StyleSheet.create({
   calibrationSegmentSelected: {
     backgroundColor: 'rgba(95, 168, 255, 0.25)',
   },
+  probeControl: {
+    gap: Spacing.one,
+    paddingHorizontal: Spacing.one,
+  },
+  probeControlHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
+  },
+  probeSegments: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: Spacing.one,
+  },
+  probeSegment: {
+    minHeight: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(127, 127, 127, 0.35)',
+    paddingHorizontal: Spacing.two,
+  },
+  probeSegmentSelected: {
+    borderColor: '#5FA8FF',
+    backgroundColor: 'rgba(95, 168, 255, 0.25)',
+  },
+  impostorProbeSegment: {
+    borderColor: 'rgba(229, 72, 77, 0.55)',
+  },
+  impostorProbeSegmentSelected: {
+    backgroundColor: 'rgba(229, 72, 77, 0.20)',
+  },
+  enrollmentSourceLabel: {
+    paddingHorizontal: Spacing.one,
+  },
   cardFooter: {
     minHeight: 36,
     flexDirection: 'row',
@@ -1175,6 +1696,9 @@ const styles = StyleSheet.create({
     paddingTop: 48,
     paddingBottom: 28,
     paddingHorizontal: Spacing.three,
+  },
+  inspectionGestureRoot: {
+    flex: 1,
   },
   inspectionHeader: {
     minHeight: 44,
@@ -1199,15 +1723,32 @@ const styles = StyleSheet.create({
   inspectionPage: {
     alignItems: 'center',
     justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  inspectionImageFrame: {
+    width: '100%',
+    height: '100%',
   },
   inspectionImage: {
     width: '100%',
     height: '100%',
   },
+  inspectionOverlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+  },
   inspectionLegend: {
     color: '#D1D5DB',
     textAlign: 'center',
     paddingVertical: Spacing.two,
+  },
+  inspectionGestureHint: {
+    color: '#9CA3AF',
+    textAlign: 'center',
+    paddingVertical: Spacing.one,
   },
   inspectionTabs: {
     minHeight: 44,

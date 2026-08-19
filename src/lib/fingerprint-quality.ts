@@ -167,6 +167,8 @@ export function analyzeFingerprintQualityDetailed({
       orientationPixels: orientationVisualization.pixels,
       minutiaeSupportMask: undefined,
       minutiaeOrientationMask: undefined,
+      minutiaeOrientationAngles: undefined,
+      minutiaeOrientationFieldMask: undefined,
     };
   }
 
@@ -255,6 +257,12 @@ export function analyzeFingerprintQualityDetailed({
     height,
     orientationBlocks,
   });
+  const minutiaeOrientationField = createMinutiaeOrientationField({
+    mask,
+    width,
+    height,
+    orientationBlocks: verifiedFineOrientationBlocks,
+  });
 
   const quality: FingerprintQuality = {
     globalScore: clampScore(globalScore),
@@ -310,7 +318,42 @@ export function analyzeFingerprintQualityDetailed({
     orientationPixels: orientationVisualization.pixels,
     minutiaeSupportMask: enhancement.minutiaeSupportMask,
     minutiaeOrientationMask,
+    minutiaeOrientationAngles: minutiaeOrientationField.angles,
+    minutiaeOrientationFieldMask: minutiaeOrientationField.mask,
   };
+}
+
+// Kaba alanla doğrulanmış 8 px yön bloklarını, yalnızca güvenilir oldukları piksellerde
+// ridge eksenini taşıyan sürekli bir alana dönüştürür. Doğrulanmamış boşluklar NaN kalır.
+function createMinutiaeOrientationField({
+  mask,
+  width,
+  height,
+  orientationBlocks,
+}: {
+  mask: Uint8Array;
+  width: number;
+  height: number;
+  orientationBlocks: OrientationBlock[];
+}) {
+  const angles = new Float32Array(mask.length);
+  angles.fill(Number.NaN);
+  const fieldMask = new Uint8Array(mask.length);
+
+  for (const block of orientationBlocks) {
+    const right = Math.min(width, block.left + block.size);
+    const bottom = Math.min(height, block.top + block.size);
+    for (let y = Math.max(0, block.top); y < bottom; y += 1) {
+      for (let x = Math.max(0, block.left); x < right; x += 1) {
+        const index = y * width + x;
+        if (!mask[index]) continue;
+        angles[index] = block.angleRadians;
+        fieldMask[index] = 1;
+      }
+    }
+  }
+
+  return { angles, mask: fieldMask };
 }
 
 // Minutiae aramasının Gabor adacıklarına hapsolmaması için güvenilir yön bloklarından sürekli bir izin alanı üretir.

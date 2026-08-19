@@ -24,6 +24,35 @@ export function encodeGrayscalePng(mask: Uint8Array, width: number, height: numb
   );
 }
 
+// Renkli teknik görselleri koordinat ve renk kaybı olmadan 8-bit RGBA PNG'ye çevirir.
+export function encodeRgbaPng(pixels: Uint8Array, width: number, height: number) {
+  if (pixels.length < width * height * 4 || width <= 0 || height <= 0) {
+    throw new Error('RGBA PNG için geçersiz boyut.');
+  }
+  const rowByteLength = width * 4;
+  const scanlines = new Uint8Array(height * (rowByteLength + 1));
+  for (let y = 0; y < height; y += 1) {
+    const rowStart = y * (rowByteLength + 1);
+    scanlines[rowStart] = 0;
+    scanlines.set(
+      pixels.subarray(y * rowByteLength, (y + 1) * rowByteLength),
+      rowStart + 1
+    );
+  }
+  const compressed = createStoredZlibStream(scanlines);
+  const header = new Uint8Array(13);
+  writeUint32(header, 0, width);
+  writeUint32(header, 4, height);
+  header[8] = 8;
+  header[9] = 6;
+  return concatBytes(
+    new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    createChunk('IHDR', header),
+    createChunk('IDAT', compressed),
+    createChunk('IEND', new Uint8Array())
+  );
+}
+
 function createStoredZlibStream(data: Uint8Array) {
   const chunks: Uint8Array[] = [new Uint8Array([0x78, 0x01])];
   let offset = 0;

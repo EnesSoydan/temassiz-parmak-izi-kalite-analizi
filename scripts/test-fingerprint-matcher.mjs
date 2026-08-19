@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import {
   assessPersonMatchEvidence,
+  DEFAULT_FINGERPRINT_MATCHER_CONFIG,
   identifyPersonFromFingerRois,
   matchFingerprintTemplates,
 } from '../src/lib/fingerprint-matcher.ts';
@@ -62,6 +63,14 @@ const identicalMatch = matchFingerprintTemplates(
 assert.equal(identicalMatch.status, 'matched');
 assert.ok(identicalMatch.score >= 90);
 assert.equal(identicalMatch.matchedMinutiae, basePoints.length);
+assert.equal(
+  identicalMatch.matchedEndingCount,
+  basePoints.filter((point) => point.type === 'ending').length
+);
+assert.equal(
+  identicalMatch.matchedBifurcationCount,
+  basePoints.filter((point) => point.type === 'bifurcation').length
+);
 assert.ok((identicalMatch.graphRelationScore ?? 0) > 0.5);
 
 const transformedProbe = inverseTransformTemplate(
@@ -76,6 +85,42 @@ const transformedMatch = matchFingerprintTemplates(
 );
 assert.equal(transformedMatch.status, 'matched');
 assert.ok(transformedMatch.matchedMinutiae >= 8);
+
+// Kanonik ROI'de fiziksel olmayan büyük dönüşler varsayılan güvenlik sınırından geçmez.
+const largeRotationDegrees = 65;
+const largeRotationRadians = (largeRotationDegrees * Math.PI) / 180;
+const largeRotationTranslationX =
+  0.5 -
+  (0.5 * Math.cos(largeRotationRadians) -
+    0.5 * Math.sin(largeRotationRadians));
+const largeRotationTranslationY =
+  0.5 -
+  (0.5 * Math.sin(largeRotationRadians) +
+    0.5 * Math.cos(largeRotationRadians));
+const largeRotationProbe = inverseTransformTemplate(
+  enrollmentTemplate,
+  largeRotationDegrees,
+  largeRotationTranslationX,
+  largeRotationTranslationY
+);
+const wideRotationMatch = matchFingerprintTemplates(
+  largeRotationProbe,
+  enrollmentTemplate,
+  {
+    ...DEFAULT_FINGERPRINT_MATCHER_CONFIG,
+    maximumTransformRotationDegrees: 80,
+  }
+);
+assert.equal(wideRotationMatch.status, 'matched');
+const rejectedLargeRotation = matchFingerprintTemplates(
+  largeRotationProbe,
+  enrollmentTemplate
+);
+assert.equal(rejectedLargeRotation.status, 'no-match');
+assert.ok(
+  Math.abs(rejectedLargeRotation.transform?.rotationDegrees ?? 0) <=
+    DEFAULT_FINGERPRINT_MATCHER_CONFIG.maximumTransformRotationDegrees
+);
 
 const insufficientTemplate = makeTemplate(basePoints.slice(0, 4));
 assert.equal(
@@ -143,6 +188,32 @@ assert.equal(identification.accepted, true);
 assert.equal(identification.personId, personA.id);
 assert.equal(identification.matchedFingerCount, 4);
 assert.equal(identification.totalMatchedMinutiae, basePoints.length * 4);
+
+const insufficientPinkyIdentification = identifyPersonFromFingerRois({
+  fingerRois: probeRois.map((fingerRoi) =>
+    fingerRoi.className === 'pinky'
+      ? {
+          ...fingerRoi,
+          quality: { biometricStatus: 'insufficient' },
+        }
+      : fingerRoi
+  ),
+  people: [personA],
+  enrollments,
+});
+const insufficientPinkyResult = insufficientPinkyIdentification.fingerResults.find(
+  (result) => result.fingerPosition === 'pinky'
+);
+assert.equal(
+  insufficientPinkyResult?.status,
+  'insufficient',
+  'ROI ve şablonu oluşan düşük kaliteli parmak eksik değil yetersiz raporlanmalı.'
+);
+assert.ok(
+  insufficientPinkyResult?.failureReasons.includes(
+    'probe-quality-insufficient'
+  )
+);
 
 const threeSampleIdentification = identifyPersonFromFingerRois({
   fingerRois: probeRois,

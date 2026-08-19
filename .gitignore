@@ -1,15 +1,19 @@
-# Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
-
-# dependencies
+# Dependencies and package-manager state
 node_modules/
+.pnp.*
+.yarn/
 
-# Expo
+# Expo / Metro generated state
 .expo/
 dist/
 web-build/
 expo-env.d.ts
+.metro-health-check*
 
-# Native
+# Generated native projects and build artifacts
+/android/
+/ios/
+.gradle/
 .kotlin/
 *.orig.*
 *.jks
@@ -18,65 +22,96 @@ expo-env.d.ts
 *.key
 *.mobileprovision
 
-# Metro
-.metro-health-check*
-
-# debug
-npm-debug.*
-yarn-debug.*
-yarn-error.*
-
-# macOS
-.DS_Store
-*.pem
-
-# local env files
-.env*.local
-
-# typescript
-*.tsbuildinfo
-
-example
-
-# generated native folders
-/ios
-/android
-
-# local assistant/tool files
-.codex-remote-attachments/
-.codex-ui-stage/
+# Local tools, IDEs and assistant workspaces
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
 .agents/
 .claude/
-CLAUDE.md
+.codex/
+.codex-remote-attachments/
+.codex-ui-stage/
+.ultralytics-config/
+.uv-cache-segmentation/
 
-# local research/source documents
-/*.pdf
-/AKADEMIK_MAKALE_TEKNIK_INCELEME.md
-
-# local Python environments
+# Local environment files and Python caches
+.env
+.env.*
+!.env.example
 .venv/
 .venv-*/
 venv/
 env/
-.uv-cache-segmentation/
-.ultralytics-config/
 __pycache__/
-*.pyc
+*.py[cod]
+*.tsbuildinfo
 
-# local datasets and training outputs
-/final_hands_yolo11n_obb/
+# Logs and temporary files
+npm-debug.*
+yarn-debug.*
+yarn-error.*
+*.log
+*.tmp
+*.temp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Local captures, API experiments, exported phone data and presentation builds
+/api-test/
+/device_exports/
+/evaluation_reports/
+/output/
+/tmp/
+/staj_defteri_calisma/
+/test_images/
+
+# Training datasets, masks, manifests and experiment outputs
 /runs/
-/YOLO/scripts/runs/
-/YOLO/test_images/
+/final_hands_yolo11n_obb/
 /YOLO/datasets/
 /YOLO/segmentation_data/
 /YOLO/segmentation_runs/
+/YOLO/test_images/
+/YOLO/scripts/runs/
+
+# Model/checkpoint and large scientific data files
+/assets/models/*
+!/assets/models/README.md
 /YOLO/scripts/*.pt
 *.pt
 *.pth
-*.weights
-
-# local mobile inference models
-/assets/models/
-/assets/models/*.onnx
 *.onnx
+*.weights
+*.safetensors
+*.ckpt
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Binary biometric database and local media samples
+*.enc
+*.sqlite
+*.sqlite3
+*.db
+*.jpg
+*.jpeg
+*.webp
+*.mp4
+*.mov
+
+# Local research/source documents and personal internship material
+/*.pdf
+/AKADEMIK_MAKALE_TEKNIK_INCELEME.md
+
+# Native signing/secrets files
+*.pem
+
+# Public documentation images (selected, non-debug examples)
+!/docs/
+!/docs/images/
+!/docs/images/*.jpg
+!/docs/images/*.png
