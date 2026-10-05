@@ -66,7 +66,7 @@ Hizalı ROI üzerinde uygulamadaki tek dokunuşla açılıp kapanan iskelet katm
 
 ![Hizalı ROI ve iskelet karşılaştırması](docs/images/skeleton-overlay-comparison.png)
 
-Bu görseller yalnızca yöntemi açıklayan örneklerdir; üretim veritabanı, kişisel kayıtlar ve gerçek test görüntüleri depoya eklenmez.
+Bu görseller proje sahibine ait, kamuya açık paylaşımı onaylanmış örneklerdir. Üretim veritabanı, kişi kayıtları ve başkalarına ait test görüntüleri depoya eklenmez.
 
 ## Teknik mimari
 
@@ -454,7 +454,7 @@ Bu proje parmak izi benzeri biyometrik veriler işlediği için aşağıdaki dos
 - `node_modules/`, Android build çıktıları ve sanal ortamlar
 - API anahtarları, sertifikalar ve yerel konfigürasyonlar
 
-README’deki görseller açıklama amaçlı seçilmiş örneklerdir. Gerçek kişilere ait görüntüler herkese açık bir repository’ye eklenmeden önce açık izin, anonimleştirme ve veri sahipliği kontrolü yapılmalıdır.
+README’deki görseller proje sahibine ait, paylaşımı onaylanmış örneklerdir. Başkalarına ait biyometrik görüntüler herkese açık bir repository’ye eklenmeden önce açık izin ve veri sahipliği kontrolü yapılmalıdır.
 
 ## Sınırlamalar ve sonraki çalışmalar
 
