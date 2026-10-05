@@ -57,6 +57,7 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint",
+    "test:roi": "node --experimental-strip-types scripts/test-roi-alignment.mjs",
     "test:ridge": "node --experimental-strip-types scripts/test-ridge-frequency.mjs",
     "test:minutiae": "node --experimental-strip-types scripts/test-minutiae.mjs",
     "test:ridge-scale": "node --experimental-strip-types scripts/test-ridge-scale.mjs",

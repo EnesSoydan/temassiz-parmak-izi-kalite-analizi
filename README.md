@@ -296,7 +296,6 @@ Görüntü işleme ve kalite testleri:
 
 ```powershell
 npm.cmd run test:roi
-npm.cmd run test:homography
 npm.cmd run test:ridge
 npm.cmd run test:ridge-scale
 npm.cmd run test:clahe
